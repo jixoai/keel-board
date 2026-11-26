@@ -23,7 +23,7 @@ worker daemon, and no live platform credential.
 | `sync/` core: `Provider`, `Registry`, normalized `Event`, `ThreadRef`, `OutboundMessage`, `SyncFunc`, `Call`, `Host`, `Runner` | Implemented and tested |
 | Dedupe keys and markers, retry policy, memory inbox (lanes, leases, dead letters), outbox (lane order, retries, dead letters) | Implemented and tested |
 | `sync/slack`: signature, webhook normalization (messages, edits, deletes, reactions, files, links), targets, post/edit/delete/react, files both ways, typing status, source read/join opt-in, channel lookup, permalink, root recovery | Implemented; Vercel deployment tables and full mrkdwn conversion are open |
-| `sync/github`: signature, repo allowlist, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, root recovery, PR/issue/comment links | Skeleton; reaction removal, review-thread URL variants, review-conversation resolution are open |
+| `sync/github`: signature, delivery ID, repo and installation allowlists, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, viewer detection, root recovery, PR/issue/comment links | Implemented; reaction removal, review-thread URL variants beyond `#discussion_r`/`#r`, and review-conversation resolution are open |
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery | Skeleton; comment payloads without an issue object, links, reaction removal are open |
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
@@ -428,7 +428,7 @@ Scope checklists, from the upstream platform pages:
 
 | Platform | Needed |
 | --- | --- |
-| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write`, `groups:read` for private names, `chat:write.customize` for sender names, `channels:join` only if on-demand join is enabled, `assistant:write` for assistant thread status |
+| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write` (files pending in the skeleton), `groups:read` for private names, `chat:write.customize` for sender names, `channels:join` only if on-demand join is enabled |
 | GitHub | Issues and Pull requests read/write, Actions read; webhooks for Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs |
 | Linear | `read`, `write`, `comments:create`, `issues:create`; webhooks for Issues and Comments; app actor |
 | Chat SDK adapter | Whatever the platform's adapter documents |
@@ -553,8 +553,7 @@ slack.New(slack.Config{
     Key: "slack",
     SigningSecret: secret, // required
     BotToken: token,       // required for API calls
-    BotUserID: "UAPP123",  // skip the app's own messages (BotID also accepted)
-    TeamID: "T0123ABC",    // optional: refuse another workspace's webhooks
+    BotUserID: "UAPP123",  // skip the app's own messages
     Now: time.Now, Tolerance: 5*time.Minute,
 })
 ```
@@ -583,37 +582,23 @@ Text conversion is deliberately small: HTML escapes, `<@U…>` →
 left as written; a full mrkdwn converter belongs in the adapter, not the
 board.
 
-Outbound: `chat.postMessage` with `channel`, optional `thread_ts`, one of
-`text` (external content, escaped) or `markdown_text` (board content, at most
-12000 Unicode characters), `username`/`icon_url` only for a verified sender, and
-unfurls off. A channel target starts a root; a thread target replies. `chat.update`,
+Outbound: `chat.postMessage` with `channel`, optional `thread_ts`, `text`,
+`markdown_text`, `username`/`icon_url` only for a verified sender, and unfurls
+off. A channel target starts a root; a thread target replies. `chat.update`,
 `chat.delete`, and `reactions.add/remove` cover changes. `#name` resolves
 through one cached `conversations.list`; IDs never wait. `Locate` reads
 permalinks; `Permalink` calls `chat.getPermalink`.
 
-Known limits:
+Known limits of the skeleton:
 
 * **Reaction thread**: Slack reaction webhooks don't carry `thread_ts`, so the
   native thread is `channel:item.ts`. A reaction on a reply needs the host to
   find the copy by channel + platform message ID, or a richer adapter that
   caches the message's thread. Upstream gets it from the Chat SDK message.
-* **Typing**: Slack has no public typing-indicator API. `Typing` sets
-  `assistant.threads.setStatus`, which needs `assistant:write` and the Agents
-  & AI Apps feature; a channel target is a no-op and an unsupported workspace
-  returns `ErrUnsupported`.
-* **Files**: the text always posts first and its real `ts` is the receipt;
-  files follow through `files.getUploadURLExternal` → the pre-signed URL →
-  `files.completeUploadExternal` in the same thread. The adapter never guesses
-  a file message ID, so a later edit/delete cannot hit the thread root or a
-  file ID. A failed upload is a note on the text, and uploaded-but-unshared
-  files are deleted best-effort. A message deletion does not cascade to
-  already-shared files.
-* **Links**: only Slack message permalinks plus the unfurl/forward snapshots
-  Slack includes in the webhook are imported. No URL is fetched; external
-  links are left to the board.
-* Vercel deployment tables and a full mrkdwn ↔ Markdown converter are open.
-* A message with no text and no files is dropped; a file-only message is
-  carried as its files.
+* Files, typing status, Vercel deployment tables, sender-name length rules,
+  `chat:write.customize` checks, and link unfurl reading are not implemented.
+* A message with no text and no files is dropped; file-only messages are
+  carried as files (their upload is pending).
 
 ### GitHub
 
@@ -626,6 +611,8 @@ github.New(github.Config{
     Token: token,          // installation token
     BotUserID: 4242,
     BotLogin: "keel-board[bot]",
+    InstallationID: 777,   // optional: drop events from any other installation
+    DetectViewer: true,    // optional: resolve the token's own user once
     Repos: []string{"acme/www"},          // required inbound allowlist
     WriteRepos: []string{"acme/www"},    // empty means read-only
     // AllowAllRepos / AllowAllWrites are explicit opt-outs.
@@ -637,7 +624,12 @@ issue `github:acme/www:issue:45`; review thread
 `github:acme/www:123:rc:345` grouped under its PR.
 
 Webhook: `X-GitHub-Event` + `X-GitHub-Delivery` + `X-Hub-Signature-256`.
-`ping` is acknowledged with no records. Handled events:
+The delivery ID is required and bounded; it is the replay identity. GitHub
+sends no timestamp, so there is no timestamp window to check: a duplicate
+delivery produces the same dedupe and the inbox keeps one event. `ping` is
+acknowledged with no records. An unlisted or malformed repo, a missing
+installation when `InstallationID` is set, and an installation that isn't the
+entry's are dropped before normalization: fail closed. Handled events:
 
 | Event | Mapping |
 | --- | --- |
@@ -650,7 +642,8 @@ Webhook: `X-GitHub-Event` + `X-GitHub-Delivery` + `X-Hub-Signature-256`.
 | `pull_request` synchronize | `pr.synchronized`, new `head`, owns `ci.<repo id>-<n>.` so stale CI labels unset |
 | `pull_request` closed | reply "merged by …" or "closed by …", `state=merged\|closed` |
 | `pull_request` labeled/unlabeled/assigned/unassigned | reconcile `tag.*` / `assignee.*`, no reply |
-| `issues` opened/edited/closed/reopened/labeled/… | same for an issue; a PR's issue view routes to the PR thread |
+| `issues` opened/edited/closed/reopened | lifecycle `issue.*` with `state`, `issue=owner/repo#n`, `tag.*`, `assignee.*` |
+| `issues` labeled/unlabeled/assigned/unassigned on a PR | reconcile `tag.*` / `assignee.*` on the PR thread; the `pull_request` event owns state and replies |
 | `pull_request_review` submitted approved/changes_requested | reply "approved by …" / "changes requested by …", label `review` |
 | `pull_request_review` dismissed | unset `review` |
 | `workflow_run` completed success/failure | `ci.passed` unsets, `ci.failed` replies from `github-actions[bot]` and sets `ci.<repo id>-<n>.<workflow file>=<conclusion>` |
@@ -658,27 +651,38 @@ Webhook: `X-GitHub-Event` + `X-GitHub-Delivery` + `X-Hub-Signature-256`.
 Tag and assignee keys are keyed by name, not platform: `good first issue` →
 `tag.good-first-issue=good first issue`, `grace` →
 `assignee.grace=grace`, accents dropped, other runs turned into `-`, at most
-64 characters. Every PR/issue event carries the full label and assignee
-arrays in GitHub's payload, so the mirror reconciles what it owns:
-`state`, `review`, `tag.*`, `assignee.*`. A label change that changes nothing
-writes nothing. Board labels never sync out.
+64 characters. A CI key longer than 64 characters keeps its owned prefix and
+ends in a short hash, so two workflow names can't collide. Every PR/issue
+event carries the full label and assignee arrays in GitHub's payload, so the
+mirror reconciles what it owns: `state`, `review`, `tag.*`, `assignee.*`. A
+label change that changes nothing writes nothing. Board labels never sync out.
+
+A PR's `issues` view is deliberately not a second lifecycle source: GitHub
+sends both events, and only `pull_request` knows whether a close was a merge.
+The issue view is used for label and assignee reconciliation on the PR thread.
 
 Outbound: issue comments and (with `ThreadRef.Subthread`) review-thread
-replies. `Post` appends a marker; `Edit`/`Delete` choose the issue-comment or
-review-comment endpoint from the sub-thread; `React` maps a small emoji table
-to GitHub's eight reactions. Roots never flow into GitHub: GitHub threads
-start on GitHub. `FetchRoot` recovers a PR/issue when a comment arrives on a
-thread the board hasn't seen.
+replies. `Post` appends a marker and bounds the body to GitHub's 65,536
+characters without cutting the marker; files are refused rather than silently
+dropped. `Edit`/`Delete` choose the issue-comment or review-comment endpoint
+from the sub-thread; a delete of an already-missing comment succeeds. `React`
+maps a small emoji table to GitHub's eight reactions. Roots never flow into
+GitHub: GitHub threads start on GitHub. `FetchRoot` recovers a PR/issue when a
+comment arrives on a thread the board hasn't seen. `Viewer` reads the token's
+own account; with `DetectViewer`, its comments are skipped even without
+`BotUserID` (a failed lookup is retried at most once a minute).
 
-Known limits of the skeleton:
+Known limits:
 
 * Reaction removal needs a reaction ID in the API; only adding is implemented.
-* `Locate`/`URL` cover PR, issue, and comment links; review-comment
-  `#discussion_r…` links are read as comments in the PR thread (as upstream
-  does), and a review thread is never a target.
+* `Locate`/`URL` cover PR, issue, and comment links; review comments are read
+  from `#discussion_r…` and the files-view `#r…` anchor, and a review thread is
+  never a target. Other review-thread URL shapes (for example a
+  `#pullrequestreview-…` link, which names a review, not a comment) are open.
 * Resolving review conversations is not synced.
-* File upload, deployment-specific formatting, and `botUserId` auto-detection
-  are pending. Bot identity is configuration here.
+* File upload and deployment-specific formatting are pending. Bot identity can
+  be configured (`BotUserID`/`BotLogin`) or detected (`Viewer`); when neither
+  is known, the hidden marker remains the echo guard.
 
 ### Linear
 
@@ -766,7 +770,7 @@ calls and need no credentials.
 | --- | --- |
 | `sync/*_test.go` | Event/ThreadRef validation, dedupe keys, markers, secret redaction, retry policy, outbox lane order/retries/dead letters, inbox dedupe/order/lease/retry/dead letters, `Runner.Inbound` once semantics, `Runner.Outbound` receipts, mirror start, origin refusal, registry gate/drop/failure statuses |
 | `sync/slack` | Signature vector, stale timestamp, challenge, message/reply/edit/delete/reaction/file/link fixtures, own-bot and marker skip, stable and distinct dedupe, store-before-ack, target parsing, `#name` lookup and cache, `chat.postMessage` form and customize fallback, edit/delete/react paths, file retry/refusal/partial success, typing status, source read/join, permalink, API error and Retry-After classification, fake Slack end-to-end |
-| `sync/github` | Signature vector, ping, issue/PR/review comments, PR opened/closed, review approval, workflow run, repo allowlist, marker echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, root recovery, links |
+| `sync/github` | Signature vector, delivery ID and duplicate-delivery dedupe, ping, issue/PR/review comments, PR/issue full lifecycle, review approval/dismissal, CI pass/fail, repo/installation allowlists, marker and bot/viewer echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, comment length and file limits, error classification, root recovery, links, fake-server end-to-end |
 | `sync/linear` | Signature and timestamp, issue created/updated, comment created/updated/removed, team allowlist, own comment skip, identifier/native target resolution, comment/issue creation, edit/delete/react, root recovery |
 | `sync/chatsdk` | HMAC verifier, decode/send delegation, target hook, optional operations |
 
@@ -895,8 +899,8 @@ Recorded in `docs/PORTING.md` as well:
   integration work.
 * A full sync engine: subscription, target backfill, `undelivered`
   projection, key ownership, and `syncedHere`.
-* Slack files, typing status, and on-demand source reads/joins are
-  implemented; GitHub asset upload and Linear attachments remain open.
+* Files both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
+  attachments), typing, and on-demand source reads/joins.
 * Full Slack mrkdwn ↔ Markdown conversion and sender/avatar/scope checks.
 * GitHub reaction removal (needs a reaction ID lookup), review-thread
   conversation resolution, and review-comment URLs from the board.
