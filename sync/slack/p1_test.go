@@ -329,8 +329,8 @@ func TestFileCompleteFailureDegrades(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
-		t.Fatalf("posts=%d updates=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), posted)
+	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || cap.deletes.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
+		t.Fatalf("posts=%d updates=%d deletes=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), cap.deletes.Load(), posted)
 	}
 	if !strings.Contains(cap.update.Get("text"), "📎 a.png") {
 		t.Fatalf("text = %q", cap.update.Get("text"))

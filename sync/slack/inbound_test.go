@@ -335,23 +335,44 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
+// routeGate scopes a two-argument RouteFunc to the tenant and key the
+// registry hands to a Gate. It is not a GateFuncs: those take four
+// arguments and a RouteFunc cannot be used directly for them.
+type routeGate struct {
+	routes boardsync.RouteFunc
+}
+
+func (g routeGate) Routes(ctx context.Context, tenant string, key boardsync.Key, channel string) (bool, error) {
+	if tenant != "tenant-a" || key != "slack" {
+		return false, nil
+	}
+	return g.routes(ctx, channel)
+}
+
+func (g routeGate) ThreadSynced(context.Context, string, boardsync.Key, string) (bool, error) {
+	return false, nil
+}
+
+const testTenant = "tenant-a"
+
+func testEntry(p *slack.Provider, routes boardsync.RouteFunc) boardsync.Entry {
+	return boardsync.Entry{
+		Tenant: testTenant, Key: "slack", Platform: "slack",
+		Provider: p, Sync: boardsync.Noop, Routes: routes,
+	}
+}
+
 func TestWebhookStoresBeforeAnswering(t *testing.T) {
 	p := provider(t)
 	registry := boardsync.NewRegistry()
-	entry := boardsync.Entry{
-		Key:      "slack",
-		Provider: p,
-		Sync:     boardsync.Noop,
-		Routes: func(context.Context, string) (bool, error) {
-			return true, nil
-		},
-	}
+	entry := testEntry(p, func(context.Context, string) (bool, error) { return true, nil })
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
 	}
+	gate := routeGate{routes: entry.Routes}
 	body := fixture(t, "message.json")
 	inbox := &recordingInbox{}
-	response, err := registry.HandleWebhook(context.Background(), "slack", signedRequest(t, body), boardsync.GateFuncs{RoutesFunc: entry.Routes}, inbox)
+	response, err := registry.HandleWebhook(context.Background(), testTenant, "slack", signedRequest(t, body), gate, inbox)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,7 +383,7 @@ func TestWebhookStoresBeforeAnswering(t *testing.T) {
 		t.Fatalf("inbox = %+v", inbox)
 	}
 	// A redelivery is stored before the same 200 is answered, and deduped.
-	response, err = registry.HandleWebhook(context.Background(), "slack", signedRequest(t, body), boardsync.GateFuncs{RoutesFunc: entry.Routes}, inbox)
+	response, err = registry.HandleWebhook(context.Background(), testTenant, "slack", signedRequest(t, body), gate, inbox)
 	if err != nil || response.Status != 200 {
 		t.Fatalf("redelivery = %d, %v", response.Status, err)
 	}
@@ -371,23 +392,20 @@ func TestWebhookStoresBeforeAnswering(t *testing.T) {
 	}
 	// A storage failure must answer 500 so Slack sends the event again.
 	failing := &failingInbox{}
-	response, err = registry.HandleWebhook(context.Background(), "slack", signedRequest(t, body), boardsync.GateFuncs{RoutesFunc: entry.Routes}, failing)
+	response, err = registry.HandleWebhook(context.Background(), testTenant, "slack", signedRequest(t, body), gate, failing)
 	if err == nil || response.Status != 500 {
 		t.Fatalf("failing store = %d, %v", response.Status, err)
 	}
 }
 
 func TestWebhookDropsUnmappedChannel(t *testing.T) {
-	entry := boardsync.Entry{
-		Key: "slack", Provider: provider(t), Sync: boardsync.Noop,
-		Routes: func(context.Context, string) (bool, error) { return false, nil },
-	}
+	entry := testEntry(provider(t), func(context.Context, string) (bool, error) { return false, nil })
 	registry := boardsync.NewRegistry()
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
 	}
 	inbox := &recordingInbox{}
-	response, err := registry.HandleWebhook(context.Background(), "slack", signedRequest(t, fixture(t, "message.json")), boardsync.GateFuncs{RoutesFunc: entry.Routes}, inbox)
+	response, err := registry.HandleWebhook(context.Background(), testTenant, "slack", signedRequest(t, fixture(t, "message.json")), routeGate{routes: entry.Routes}, inbox)
 	if err != nil || response.Status != 200 {
 		t.Fatalf("response = %d, %v", response.Status, err)
 	}

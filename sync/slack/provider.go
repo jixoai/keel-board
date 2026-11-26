@@ -45,7 +45,7 @@ func (p *Provider) Capabilities() boardsync.Capabilities {
 	return boardsync.Capabilities{
 		StartThreads:           true,
 		UploadsFiles:           true,
-		StartsThreadsWithFiles: true,
+		StartsThreadsWithFiles: false,
 		Edits:                  true,
 		Deletes:                true,
 		Reactions:              true,
