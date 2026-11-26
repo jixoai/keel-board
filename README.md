@@ -46,6 +46,19 @@ direct-upload URL when the configured store implements `blob.UploadSigner`.
 Reading a file needs its uploader's principal or a readable message carrying
 it; deleting a message hides its files.
 
+## Testing
+
+```sh
+go test ./...
+go test -race ./...
+```
+
+PostgreSQL tests run only when `KEEL_BOARD_TEST_DSN` (or `TEST_DSN`) names a
+local server; each test creates and drops its own schema. CI must set it:
+with `CI` set and no DSN the PostgreSQL tests fail instead of skipping. The
+sync tables enable and force row-level security; the store sets
+`keel.tenant_id` transaction-locally, and an unset setting matches no rows.
+
 ## Layout
 
 | Path | Contents |
@@ -57,6 +70,8 @@ it; deleting a message hides its files.
 | `store/` | `EventStore` seam, in-memory and PostgreSQL stores, migrations |
 | `access/` | Per-channel permissions, grants, patterns and the authorizer |
 | `server/` | HTTP API, SSE feed, authorizer and tenant seams |
+| `sync/` | Provider registry (tenant-qualified), normalized events, runners and adapters |
+| `syncstore/` | Durable sync inbox/outbox, copies and threads, webhook handler, workers |
 | `cmd/board/` | Standalone dev server (`board serve`, memory or `--dsn`, `--blobs`) |
 
 The translation is faithful in semantics, not a line-by-line copy. Every

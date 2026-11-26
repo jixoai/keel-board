@@ -27,7 +27,7 @@ worker daemon, and no live platform credential.
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery | Skeleton; comment payloads without an issue object, links, reaction removal are open |
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
-| `syncstore`: PostgreSQL/memory durable inbox and outbox, leases, dedupe, lane order, copies, failure receipts, webhook handler, inbound/outbound workers | Implemented and tested; server route wiring and board-event subscription are pending |
+| `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies, failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested; server route wiring and board-event subscription are pending |
 | Production engine: subscription, backfill, files, typing, permissions, key ownership | Not in this phase; the seams are defined below |
 
 The upstream pin keeps all sync code in `packages/board/src/sync/`; the
@@ -98,7 +98,9 @@ A sync entry is one platform account plus one function:
 
 ```go
 entry := boardsync.Entry{
+    Tenant:   "tenant-a",          // the board that owns this connection
     Key:      "slack",             // chooses external IDs and the webhook path
+    Platform: "slack",             // must match Provider.Platform()
     Provider: slackProvider,        // the platform
     Sync:     boardsync.Mirror("support"),
     Routes:   routeFunc,            // optional: which platform channels this entry maps
@@ -531,9 +533,10 @@ subscription:
 ```
 
 Multi-process ownership: one process (deployment, worker) holds each key, so a
-message is never delivered twice. The full service needs a lease or
-registration for that, as upstream's deployment ownership does; the registry
-in this package only guarantees one entry per key in one process.
+message is never delivered twice. The registry is keyed by `(tenant, key)`: two
+tenants may both run `slack` with different providers and credentials. The full
+service still needs a lease or registration for cross-process ownership, as
+upstream's deployment ownership does.
 
 ## Adapters
 
@@ -769,9 +772,11 @@ Recommended shape, matching the repository layout:
 1. **Package.** Keep `sync/` independent of `log/`, `server/`, and `store/`.
    The server imports `sync` and implements `Host`; adapters import only
    `sync`. No adapter imports another adapter.
-2. **Routes.** `POST /webhooks/{key}` → build a `WebhookRequest` with a body
-   cap → `Registry.HandleWebhook(ctx, key, req, gate, inbox)` → write the
-   returned `WebhookResponse`. Add `GET` only where a platform requires it.
+2. **Routes.** `POST /webhooks/{key}` → resolve the tenant → build a
+   `WebhookRequest` with a body cap → `Registry.HandleWebhook(ctx, tenant, key,
+   req, gate, inbox)` → write the returned `WebhookResponse`. Add `GET` only
+   where a platform requires it. `syncstore.WebhookHandler` implements the
+   tenant/entry checks and store-before-ack path.
 3. **Gate.** `Routes` consults the entry's `RouteFunc` (from `Channels` /
    `Repos`-style mappings) against native channel IDs. `ThreadSynced` asks the
    server's sync records whether the external thread is already attached.
@@ -836,10 +841,11 @@ Recorded in `docs/PORTING.md` as well:
 * **Slack reaction threads.** Upstream's Chat SDK message carries the parent
   thread; the raw Slack webhook doesn't, so the skeleton anchors a reaction at
   `channel:item.ts` and leaves parent lookup to the host.
-* **The engine is a seam, not a daemon.** The memory inbox/outbox, `Runner`,
-  and `Registry` are executable; the durable store, subscription, backfill,
-  files, typing, access checks, and per-key ownership are the server's work.
-  This phase intentionally stops before them.
+* **The engine is a seam plus a durable store.** The memory inbox/outbox,
+  `Runner`, and tenant-qualified `Registry` are executable; `syncstore` adds
+  the durable PostgreSQL/memory inbox and outbox, copies, workers, webhook
+  handler and RLS. Subscription, backfill, files, typing, access checks, and
+  cross-process key ownership remain the server's work.
 * **The Chat SDK bridge is a Go interface.** `chatsdk.Adapter` is a Go
   contract; it does not load `chat` or call a JavaScript adapter. A platform
   client implements it directly.

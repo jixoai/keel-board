@@ -299,8 +299,10 @@ Slack, GitHub, Linear, and a generic Chat SDK bridge. The complete design is in
 [`SYNC.md`](SYNC.md). Deliberate differences from upstream:
 
 - `SyncProvider` becomes a Go `Provider`; the engine's `board-sync` consumer
-  becomes the `Host`/`Runner` seam. The durable inbox/outbox, subscription,
-  backfill, files, typing, and per-key ownership are the server's next phase.
+  becomes the `Host`/`Runner` seam. `syncstore` implements the durable,
+  tenant-qualified inbox/outbox, copies, RLS, webhook handler, and workers;
+  subscription, backfill, files, typing, and cross-process ownership remain
+  the server's next phase.
 - Vercel Connect, OIDC, and deployment identity are replaced by adapter-owned
   secrets and platform webhook verification.
 - The upstream pin keeps every adapter in `src/sync/`; here they are Go
