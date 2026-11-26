@@ -40,6 +40,18 @@ func New(cfg Config) (*Provider, error) {
 // Platform implements boardsync.Provider.
 func (p *Provider) Platform() boardsync.Platform { return "slack" }
 
+// SelfIDs lists the app's own author IDs, with and without the platform
+// prefix, so the registry can drop its own posts without configuration.
+func (p *Provider) SelfIDs() []string {
+	var ids []string
+	for _, id := range []string{p.cfg.BotUserID, p.cfg.BotID} {
+		if id != "" {
+			ids = append(ids, "slack:user:"+id, id)
+		}
+	}
+	return ids
+}
+
 // Capabilities implements boardsync.Provider.
 func (p *Provider) Capabilities() boardsync.Capabilities {
 	return boardsync.Capabilities{

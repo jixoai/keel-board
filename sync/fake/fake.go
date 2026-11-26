@@ -18,6 +18,8 @@ import (
 type Provider struct {
 	PlatformName string
 	Caps         boardsync.Capabilities
+	// SelfIDsValue is what SelfIDs returns; empty means no identity.
+	SelfIDsValue []string
 
 	ReceiveFunc        func(ctx context.Context, key boardsync.Key, req *boardsync.WebhookRequest) (boardsync.Intake, error)
 	ResolveChannelFunc func(ctx context.Context, key boardsync.Key, name string) (string, error)
@@ -114,6 +116,9 @@ func (p *Provider) Platform() boardsync.Platform { return boardsync.Platform(p.P
 
 // Capabilities implements boardsync.Provider.
 func (p *Provider) Capabilities() boardsync.Capabilities { return p.Caps }
+
+// SelfIDs implements boardsync.SelfIdentifier.
+func (p *Provider) SelfIDs() []string { return append([]string(nil), p.SelfIDsValue...) }
 
 // Receive implements boardsync.Provider.
 func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsync.WebhookRequest) (boardsync.Intake, error) {

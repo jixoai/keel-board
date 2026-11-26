@@ -165,9 +165,14 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 		return response, nil
 	}
 	kept := make([]Record, 0, len(intake.Records))
+	self, _ := entry.Provider.(SelfIdentifier)
 	for _, record := range intake.Records {
 		if err := record.Validate(); err != nil {
 			return WebhookResponse{Status: StatusCode(err)}, err
+		}
+		if self != nil && record.Event.Author.ID != "" && containsID(self.SelfIDs(), record.Event.Author.ID) {
+			// The connection's own post: never import it back.
+			continue
 		}
 		mapped := false
 		if entry.Routes != nil {
@@ -202,6 +207,16 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 		}
 	}
 	return response, nil
+}
+
+// containsID reports whether ids names want.
+func containsID(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveChannel delegates to a tenant's entry provider.

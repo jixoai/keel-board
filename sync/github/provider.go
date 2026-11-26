@@ -45,6 +45,20 @@ func New(cfg Config) (*Provider, error) {
 // Platform implements boardsync.Provider.
 func (p *Provider) Platform() boardsync.Platform { return "github" }
 
+// SelfIDs lists the app's own author IDs.
+func (p *Provider) SelfIDs() []string {
+	var ids []string
+	if p.cfg.BotUserID != 0 {
+		id := strconv.FormatInt(p.cfg.BotUserID, 10)
+		ids = append(ids, "github:user:"+id, id)
+	}
+	if p.cfg.BotLogin != "" {
+		login := strings.ToLower(p.cfg.BotLogin)
+		ids = append(ids, "github:user:"+login, login)
+	}
+	return ids
+}
+
 // Capabilities implements boardsync.Provider: GitHub can edit, delete, and
 // react, but a board root never opens an issue or PR.
 func (p *Provider) Capabilities() boardsync.Capabilities {

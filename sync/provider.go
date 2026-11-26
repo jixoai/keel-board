@@ -33,6 +33,15 @@ type Provider interface {
 	Post(ctx context.Context, key Key, target ResolvedTarget, msg OutboundMessage) (Posted, error)
 }
 
+// SelfIdentifier is an optional Provider capability: the platform author IDs
+// that belong to the connection itself. The registry drops a record whose
+// author is one of them before it reaches the inbox, as defence in depth
+// beside each adapter's own check. An adapter without it relies on markers
+// and must not mirror a channel where its own posts are indistinguishable.
+type SelfIdentifier interface {
+	SelfIDs() []string
+}
+
 // Capabilities are what a provider supports.
 type Capabilities struct {
 	// StartThreads: a board root in a mapped channel can start a platform

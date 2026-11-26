@@ -333,8 +333,8 @@ func (e *Event) Validate() error {
 		if e.Author.ID == "" {
 			return fmt.Errorf("%w: lifecycle event has no author", ErrBadRequest)
 		}
-		if e.Lifecycle.Title == "" && len(e.Lifecycle.Labels) == 0 {
-			return fmt.Errorf("%w: lifecycle event has no title and no labels", ErrBadRequest)
+		if e.Lifecycle.Title == "" && len(e.Lifecycle.Labels) == 0 && e.Lifecycle.Body == "" {
+			return fmt.Errorf("%w: lifecycle event has no title, body, or labels", ErrBadRequest)
 		}
 	}
 	return nil
@@ -510,7 +510,8 @@ type Receipt struct {
 	FilesSet bool           `json:"filesSet,omitempty"`
 }
 
-// Origin is where a board message came from: a platform's own IDs.
+// Origin is where a board message came from: key-prefixed platform IDs, so a
+// reader can tell two connections' native IDs apart.
 type Origin struct {
 	Channel   string `json:"channel,omitempty"`
 	Thread    string `json:"thread"`

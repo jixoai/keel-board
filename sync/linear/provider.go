@@ -31,6 +31,14 @@ func New(cfg Config) (*Provider, error) {
 // Platform implements boardsync.Provider.
 func (p *Provider) Platform() boardsync.Platform { return "linear" }
 
+// SelfIDs lists the app actor's author IDs.
+func (p *Provider) SelfIDs() []string {
+	if p.cfg.BotUserID == "" {
+		return nil
+	}
+	return []string{"linear:user:" + p.cfg.BotUserID, p.cfg.BotUserID}
+}
+
 // Capabilities implements boardsync.Provider.
 func (p *Provider) Capabilities() boardsync.Capabilities {
 	return boardsync.Capabilities{StartThreads: true, Edits: true, Deletes: true, Reactions: true}
