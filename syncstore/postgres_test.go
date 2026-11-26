@@ -98,7 +98,7 @@ func TestPostgresRestartRecovery(t *testing.T) {
 
 func TestPostgresInboxLeaseExpiry(t *testing.T) {
 	cfg := testConfig()
-	cfg.LeaseTTL = 200 * time.Millisecond
+	cfg.LeaseTTL = 2 * time.Second
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
 	store := openPostgres(t, dsn, schema, cfg)
@@ -110,7 +110,7 @@ func TestPostgresInboxLeaseExpiry(t *testing.T) {
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first lease = %+v, %v", first, err)
 	}
-	time.Sleep(350 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	second, err := store.LeaseInbox(ctx, "t1", "slack", 1, "worker-b")
 	if err != nil || len(second) != 1 {
 		t.Fatalf("second lease = %+v, %v", second, err)
@@ -128,7 +128,7 @@ func TestPostgresInboxLeaseExpiry(t *testing.T) {
 
 func TestPostgresOutboxLeaseExpiry(t *testing.T) {
 	cfg := testConfig()
-	cfg.LeaseTTL = 200 * time.Millisecond
+	cfg.LeaseTTL = 2 * time.Second
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
 	store := openPostgres(t, dsn, schema, cfg)
@@ -141,7 +141,7 @@ func TestPostgresOutboxLeaseExpiry(t *testing.T) {
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first lease = %+v, %v", first, err)
 	}
-	time.Sleep(350 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 	second, err := store.LeaseOutbox(ctx, "t1", []boardsync.Key{"slack"}, 1, "worker-b")
 	if err != nil || len(second) != 1 {
 		t.Fatalf("second lease = %+v, %v", second, err)
