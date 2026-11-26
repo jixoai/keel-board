@@ -231,7 +231,7 @@ func TestBatchTasksRefusals(t *testing.T) {
 	}
 
 	t.Run("post and label permissions", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			switch {
 			case actor.ID == bob && channel == "work" && permission == protocol.PermissionPost:
 				return protocol.Forbidden("no post")

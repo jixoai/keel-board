@@ -11,8 +11,10 @@ import (
 	"testing"
 
 	"github.com/jixoai/keel-board/blob"
+	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
+	"github.com/jixoai/keel-board/store"
 )
 
 func TestOpenBlobs(t *testing.T) {
@@ -36,12 +38,13 @@ func TestOpenBlobs(t *testing.T) {
 // TestDevServerSmoke runs the same handler `board serve` runs over an FS blob
 // store and walks a file through upload, read, and delete.
 func TestDevServerSmoke(t *testing.T) {
-	store, err := openBlobs(t.TempDir())
+	blobs, err := openBlobs(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	httpServer := httptest.NewServer(devHandler(logger, store))
+	board := log.New(log.Options{Store: store.NewMemory()})
+	httpServer := httptest.NewServer(devHandler(logger, board, blobs))
 	defer httpServer.Close()
 
 	upload, err := http.NewRequest(http.MethodPost, httpServer.URL+server.APIPrefix+"/attachments", bytes.NewReader([]byte("smoke")))

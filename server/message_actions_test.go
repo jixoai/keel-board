@@ -109,7 +109,7 @@ func TestMessageEdit(t *testing.T) {
 	})
 
 	t.Run("an unreadable message is not found", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == bob && channel == "secret" && permission == protocol.PermissionRead {
 				return protocol.Forbidden("no read")
 			}
@@ -122,7 +122,7 @@ func TestMessageEdit(t *testing.T) {
 	})
 
 	t.Run("a write-only author edits its blind post", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == alice && channel == "writeonly" && permission == protocol.PermissionRead {
 				return protocol.Forbidden("no read")
 			}
@@ -160,7 +160,7 @@ func TestMessageEdit(t *testing.T) {
 	})
 
 	t.Run("the channel must allow post", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == bob && channel == "locked" && permission == protocol.PermissionPost {
 				return protocol.Forbidden("no post")
 			}
@@ -411,7 +411,7 @@ func TestReactions(t *testing.T) {
 	})
 
 	t.Run("a reaction needs read", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == bob && channel == "hidden" && permission == protocol.PermissionRead {
 				return protocol.Forbidden("no read")
 			}
@@ -427,7 +427,7 @@ func TestReactions(t *testing.T) {
 	})
 
 	t.Run("react is its own permission", func(t *testing.T) {
-		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == bob && channel == "quiet" && permission == protocol.PermissionReact {
 				return protocol.Forbidden("no react")
 			}
@@ -487,7 +487,7 @@ func TestLabelsListAndIdempotency(t *testing.T) {
 	}
 
 	// A label write needs `label`.
-	policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+	policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 		if actor.ID == bob && channel == "work" && permission == protocol.PermissionLabel {
 			return protocol.Forbidden("no label")
 		}
@@ -636,5 +636,40 @@ func TestMessageActionEvents(t *testing.T) {
 	}
 	if deleted := seen["message.deleted"]; deleted.Message == nil || !deleted.Message.Deleted || deleted.Message.Text != "" {
 		t.Fatalf("unexpected delete event: %+v", deleted)
+	}
+}
+
+func TestBlindTaskWriteResponses(t *testing.T) {
+	policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
+		if actor.ID == "local:user:alice" && channel == "blind" && permission == protocol.PermissionRead {
+			return protocol.Forbidden("no read")
+		}
+		return nil
+	})
+	h := newHarness(t, server.Options{Authorize: policy})
+	const alice = "local:user:alice"
+
+	status, data := h.request(http.MethodPost, "/tasks", map[string]any{
+		"channel": "blind", "text": "blind task", "labels": map[string]string{"status": "open"},
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	created := decode[taskBody](t, data).Task
+	if created.ID == "" || !created.Blind || len(created.Labels) != 0 || created.Task != nil || created.By != nil {
+		t.Fatalf("a blind task's create response carries only its text: %+v", created)
+	}
+	for _, call := range []struct {
+		path string
+		body any
+	}{
+		{"/tasks/" + created.ID + "/assign", map[string]any{"for": nil}},
+		{"/tasks/" + created.ID + "/needs", map[string]any{"needs": []string{}}},
+		{"/tasks/" + created.ID + "/cancel", map[string]any{"reason": "changed my mind"}},
+	} {
+		status, data := h.request(http.MethodPost, call.path, call.body, alice, "", nil)
+		h.expect(status, data, http.StatusOK)
+		view := decode[taskBody](t, data).Task
+		if len(view.Labels) != 0 || len(view.Reactions) != 0 || view.Task != nil || view.By != nil {
+			t.Fatalf("%s leaked a blind task: %+v", call.path, view)
+		}
 	}
 }

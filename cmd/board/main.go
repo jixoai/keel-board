@@ -88,11 +88,11 @@ func openBlobs(dir string) (blob.Store, error) {
 	if dir == "" {
 		return blob.NewMemory(), nil
 	}
-	store, err := blob.NewFS(dir)
+	files, err := blob.NewFS(dir)
 	if err != nil {
 		return nil, fmt.Errorf("blobs: %w", err)
 	}
-	return store, nil
+	return files, nil
 }
 
 // devHandler is the development server's handler over the board and blob store
@@ -100,7 +100,6 @@ func openBlobs(dir string) (blob.Store, error) {
 // test drives.
 func devHandler(logger *slog.Logger, board *log.Board, blobs blob.Store) http.Handler {
 	return server.New(server.Options{Board: board, Logger: logger, Blobs: blobs})
-
 }
 
 // serve runs the HTTP server until it's interrupted.

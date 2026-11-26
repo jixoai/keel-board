@@ -459,6 +459,7 @@ func replayOf(entry idemEntry) *AppendResult {
 		FirstSeq:   entry.first,
 		LastSeq:    entry.last,
 		Replayed:   true,
+		Digest:     entry.digest,
 		MessageIDs: append([]uint64(nil), entry.messageIDs...),
 	}
 }
@@ -605,27 +606,68 @@ func (b *Board) Head(tenantName string) (uint64, error) {
 	return current.state.Head, nil
 }
 
-// ReplayKey answers what an idempotent write under key landed, for a read that
-// tells a retry from a new write without writing. It reports false when no
-// write used the key.
-func (b *Board) ReplayKey(tenantName, key string) (AppendResult, bool, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	current, err := b.ensure(tenantName)
+// ReplayKey answers what an idempotent write under key landed, for an early
+// read that tells a retry from a new write without writing. It refreshes the
+// tenant from the store and asks a store that remembers requests, so a cold
+// cache or another process's write answers the same result; it is not a map
+// lookup alone.
+func (b *Board) ReplayKey(ctx context.Context, tenantName, key string) (AppendResult, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, storeTimeout)
+		defer cancel()
+	}
+	current, err := b.ensure(ctx, tenantName)
 	if err != nil {
 		return AppendResult{}, false, err
 	}
-	entry, ok := current.idem[key]
-	if !ok {
-		return AppendResult{}, false, nil
+	tenant := normalizeTenant(tenantName)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.refreshNowLocked(ctx, tenant, current); err != nil {
+		return AppendResult{}, false, err
 	}
+	entry, entryFound := current.idem[key]
+	if entryFound && len(entry.messageIDs) > 0 {
+		return appendResultOf(entry), true, nil
+	}
+	// A cache entry may lack its answer; so may a cache that predates the
+	// write. The store remembers both.
+	if looker, ok := b.store.(store.RequestStore); ok {
+		stored, found, err := looker.Request(ctx, tenant, key)
+		if err != nil {
+			return AppendResult{}, false, err
+		}
+		if found {
+			if !entryFound {
+				entry = idemEntry{digest: stored.Digest}
+			}
+			if entry.digest == "" {
+				entry.digest = stored.Digest
+			}
+			mergeBatch(&entry, stored.Result)
+			current.idem[key] = entry
+			return appendResultOf(entry), true, nil
+		}
+	}
+	if entryFound {
+		return appendResultOf(entry), true, nil
+	}
+	return AppendResult{}, false, nil
+}
+
+// appendResultOf turns a cache entry into the answer a retry gets.
+func appendResultOf(entry idemEntry) AppendResult {
 	return AppendResult{
 		FirstSeq:   entry.first,
 		LastSeq:    entry.last,
 		Replayed:   true,
 		Digest:     entry.digest,
 		MessageIDs: append([]uint64(nil), entry.messageIDs...),
-	}, true, nil
+	}
 }
 
 // History returns events with FirstSeq <= Seq <= LastSeq, in order.

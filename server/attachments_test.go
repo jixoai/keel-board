@@ -130,7 +130,7 @@ func TestAttachmentsNeedAStore(t *testing.T) {
 
 func TestAttachmentLifecycle(t *testing.T) {
 	store := blob.NewMemory()
-	policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+	policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 		if actor.ID == "local:user:bob" && channel == "private" && permission == protocol.PermissionRead {
 			return protocol.Forbidden("no private")
 		}
@@ -390,11 +390,11 @@ type uploadGate struct {
 	sync bool
 }
 
-func (g uploadGate) Authorize(context.Context, protocol.Actor, string, protocol.Permission) error {
+func (g uploadGate) Authorize(context.Context, string, protocol.Actor, string, protocol.Permission) error {
 	return nil
 }
 
-func (g uploadGate) AuthorizeAnywhere(_ context.Context, _ protocol.Actor, permission protocol.Permission) error {
+func (g uploadGate) AuthorizeAnywhere(_ context.Context, _ string, _ protocol.Actor, permission protocol.Permission) error {
 	switch permission {
 	case protocol.PermissionPost:
 		if g.post {
@@ -511,12 +511,54 @@ func TestAttachmentDeleteCanBeRetried(t *testing.T) {
 
 	status, data = h.request(http.MethodDelete, "/attachments/"+file.ID, nil, alice, "", nil)
 	h.expect(status, data, http.StatusInternalServerError)
-	// The record survives a failed data delete, so the retry succeeds.
+	// Data is deleted before the record, so a failed data delete leaves the
+	// record and the bytes: the file still reads, and a retry can finish.
+	status, body, _ := h.attachment(alice, file.ID)
+	h.expect(status, body, http.StatusOK)
+	if string(body) != "x" {
+		t.Fatalf("failed delete changed the bytes: %q", body)
+	}
 	store.fail = false
 	status, data = h.request(http.MethodDelete, "/attachments/"+file.ID, nil, alice, "", nil)
 	h.expect(status, data, http.StatusNoContent)
 	status, _, _ = h.attachment(alice, file.ID)
 	if status != http.StatusNotFound {
 		t.Fatalf("deleted file still reads: %d", status)
+	}
+	for _, key := range store.Keys() {
+		if strings.Contains(key, file.ID) {
+			t.Fatalf("delete left %s behind", key)
+		}
+	}
+}
+
+func TestTenantEmptyIsDefault(t *testing.T) {
+	blobs := blob.NewMemory()
+	h := newHarness(t, server.Options{
+		Blobs: blobs,
+		Tenant: func(r *http.Request) (string, error) {
+			return r.Header.Get("X-Board-Tenant"), nil
+		},
+	})
+	const alice = "local:user:alice"
+
+	status, data := h.upload(alice, "a.txt", "text/plain", []byte("default board"))
+	h.expect(status, data, http.StatusCreated)
+	file := decodeAttachment(t, data)
+	status, body, _ := h.attachmentInTenant(alice, "default", file.ID)
+	h.expect(status, body, http.StatusOK)
+	if string(body) != "default board" {
+		t.Fatalf("unexpected bytes: %q", body)
+	}
+
+	status, data = h.request(http.MethodPost, "/messages", map[string]any{
+		"channel": "work", "text": "on the default board",
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	message := decode[postBody](t, data).Message
+	status, data = h.request(http.MethodGet, "/messages/"+message.ID, nil, alice, "default", nil)
+	h.expect(status, data, http.StatusOK)
+	if got := decode[protocol.ThreadView](t, data).Message; got.ID != message.ID {
+		t.Fatalf("the default board didn't see the post: %+v", got)
 	}
 }

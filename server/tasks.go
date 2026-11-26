@@ -354,7 +354,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	// A retry answers what it landed before anything else is checked: its
 	// caller may have lost post or read since, and its files may be gone.
 	if clientID != "" {
-		result, found, err := s.board.ReplayKey(req.tenant, idemKey("task", req.actor.ID, clientID))
+		result, found, err := s.board.ReplayKey(req.ctx, req.tenant, idemKey("task", req.actor.ID, clientID))
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -525,12 +525,13 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var claim *protocol.TaskClaim
 	var preview *log.Message
+	replayID := uint64(0)
 	err := s.board.Update(req.ctx, req.tenant, opts, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
 			if len(replay.MessageIDs) == 0 {
 				return protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write")
 			}
-			preview = log.CloneMessage(tx.Message(replay.MessageIDs[0]))
+			replayID = replay.MessageIDs[0]
 			claim = nil
 			return nil
 		}
@@ -623,6 +624,22 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	if replayID != 0 {
+		sent := ""
+		if body.Text != nil {
+			sent = *body.Text
+		}
+		view, perr := s.replayMessage(req, replayID, sent)
+		if perr != nil {
+			writeError(w, perr)
+			return
+		}
+		writeJSON(w, http.StatusCreated, struct {
+			Task  protocol.MessageView `json:"task"`
+			Claim *protocol.TaskClaim  `json:"claim,omitempty"`
+		}{Task: view})
 		return
 	}
 	if preview == nil {
@@ -1549,7 +1566,7 @@ func (s *Server) respondTask(w http.ResponseWriter, r *http.Request, req *reques
 	}
 	var view protocol.MessageView
 	err := s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
-		view = messageView(snapshot, preview, &req.actor)
+		view = s.viewForCaller(req, snapshot, preview, preview.Text)
 		return nil
 	})
 	if err != nil {

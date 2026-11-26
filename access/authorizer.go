@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/jixoai/keel-board/protocol"
@@ -57,6 +58,7 @@ type Authorizer struct {
 
 var _ server.Authorizer = (*Authorizer)(nil)
 var _ server.RequestValidator = (*Authorizer)(nil)
+var _ server.AnywhereAuthorizer = (*Authorizer)(nil)
 
 // ActorPrincipal is the default mapping from a verified actor to the
 // principal grants name: a person (or agent) is a user by its principal ID, a
@@ -131,12 +133,39 @@ func (a *Authorizer) ValidateRequest(ctx context.Context, tenant string, actor p
 
 // Explain returns what decides the actor's access in channel on tenant.
 func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.Actor, channel string) (Explanation, error) {
+	facts, err := a.facts(ctx, tenant, actor)
+	if err != nil {
+		return Explanation{}, err
+	}
+	return Evaluate(facts, channel), nil
+}
+
+// AuthorizeAnywhere answers whether the caller may do permission in at least
+// one channel of the board: the seam an upload uses before a message names
+// its channel. It is fail-closed: a store error is returned, and a caller
+// with no grant that gives the permission is refused.
+func (a *Authorizer) AuthorizeAnywhere(ctx context.Context, tenant string, actor protocol.Actor, permission protocol.Permission) error {
+	facts, err := a.facts(ctx, tenant, actor)
+	if err != nil {
+		return err
+	}
+	for _, channel := range anywhereChannels(facts) {
+		if Evaluate(facts, channel).Allows(permission) {
+			return nil
+		}
+	}
+	return protocol.Forbidden("no grant lets this caller " + string(permission) + " anywhere")
+}
+
+// facts resolves a caller and tenant's grants once, as Explain and
+// AuthorizeAnywhere read them.
+func (a *Authorizer) facts(ctx context.Context, tenant string, actor protocol.Actor) (Facts, error) {
 	if a == nil || a.Store == nil {
-		return Explanation{}, protocol.NewError(protocol.CodeInternal, "access: no grant store")
+		return Facts{}, protocol.NewError(protocol.CodeInternal, "access: no grant store")
 	}
 	tenant, err := a.tenant(ctx, tenant, actor)
 	if err != nil {
-		return Explanation{}, err
+		return Facts{}, err
 	}
 	resolve := a.Principal
 	var principal Principal
@@ -146,15 +175,15 @@ func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.
 		principal, err = ActorPrincipal(actor)
 	}
 	if err != nil {
-		return Explanation{}, protocol.NewError(protocol.CodeUnauthorized, err.Error())
+		return Facts{}, protocol.NewError(protocol.CodeUnauthorized, err.Error())
 	}
 	scope, err := a.scopes(ctx, tenant, actor)
 	if err != nil {
-		return Explanation{}, err
+		return Facts{}, err
 	}
 	grants, err := a.Store.List(ctx, tenant)
 	if err != nil {
-		return Explanation{}, storeAccessError(err)
+		return Facts{}, storeAccessError(err)
 	}
 	caller := Caller{Principal: principal, Scope: scope}
 	if a.Team != nil {
@@ -174,7 +203,69 @@ func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.
 	if a.Cap != nil {
 		caller.Cap = a.Cap(ctx, tenant, principal)
 	}
-	return Evaluate(caller.facts(tenant, grants), channel), nil
+	return caller.facts(tenant, grants), nil
+}
+
+// anywhereChannels returns representative channels for every pattern a grant
+// or token scope names. Access only changes at pattern boundaries, so testing
+// one channel per pattern (and one channel under a subtree that no finer
+// pattern names) is enough to decide whether a permission holds anywhere.
+func anywhereChannels(facts Facts) []string {
+	patterns := make(map[string]ChannelPattern)
+	collect := func(can Can) {
+		for raw := range can {
+			pattern, err := ParsePattern(raw)
+			if err == nil {
+				patterns[pattern.String()] = pattern
+			}
+		}
+	}
+	for _, grant := range facts.Grants {
+		collect(grant.Can)
+	}
+	if facts.Scope != nil {
+		collect(*facts.Scope)
+	}
+	taken := make(map[string]bool, len(patterns))
+	for _, pattern := range patterns {
+		if pattern.Kind != PatternAll {
+			taken[pattern.Path] = true
+		}
+	}
+	free := func(prefix string) string {
+		for index := 0; ; index++ {
+			name := "anywhere"
+			if index > 0 {
+				name = fmt.Sprintf("anywhere%d", index)
+			}
+			channel := name
+			if prefix != "" {
+				channel = prefix + "/" + name
+			}
+			if !taken[channel] {
+				taken[channel] = true
+				return channel
+			}
+		}
+	}
+	channels := make(map[string]bool, len(patterns))
+	for _, pattern := range patterns {
+		switch pattern.Kind {
+		case PatternExact:
+			channels[pattern.Path] = true
+		case PatternSubtree:
+			channels[pattern.Path] = true
+			channels[free(pattern.Path)] = true
+		case PatternAll:
+			channels[free("")] = true
+		}
+	}
+	out := make([]string, 0, len(channels))
+	for channel := range channels {
+		out = append(out, channel)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // tenant resolves the tenant the server named. A Tenant hook may confirm it

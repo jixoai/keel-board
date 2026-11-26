@@ -61,8 +61,8 @@ Implemented, end to end:
 
 Grant and access HTTP routes are not in phase 1, but the policy is a Go package
 now (`access/`): grants, channel patterns, principal matching, reach,
-admission and lockout checks, and a tenant-aware authorizer. Sync and its
-receipts, reactions, files and attachments, schedules, schemas and blocks, and
+admission and lockout checks, a tenant-aware authorizer, and the anywhere seam
+uploads use. Sync and its receipts, schedules, a writable schema registry, and
 watchers remain outside phase 1; their wire types are not served, and requests
 that name them are refused rather than half-accepted.
 
@@ -102,7 +102,16 @@ that name them are refused rather than half-accepted.
   isn't the caller's or isn't readable.
 - `GET /tasks/batch/{id}` and a batch's POST replay reuse the landed roots;
   neither re-checks `post`, re-binds files, nor needs the current request body
-  to validate.
+  to validate. A tx-level replay (another process landed the key between the
+  early lookup and the append) goes through the same `replayMessage` /
+  `replayBatch` author and read checks.
+- An empty tenant from a custom `TenantFunc` becomes `default` before the log,
+  the authorizer, or a blob key sees it, so a board can't write under `""` and
+  read under `default`.
+- PostgreSQL and a shared store: `ReplayKey` refreshes the tenant and asks
+  `store.RequestStore`, so a cold cache or another process's write still
+  answers a retry; a fresh cache isn't assumed. Writes keep main's
+  freshness/RequestResult behavior and the store's head/request races.
 
 ### Deliberate simplifications
 
@@ -114,8 +123,10 @@ that name them are refused rather than half-accepted.
   text holds an invalid block simply shows none, the write-time invariant is
   the only guarantee.
 - **Mentions are parsed, not settled.** `@[actor-id]` is validated as an actor
-  ID; `@handle` stays as typed. A `mentions` filter matches an exact term or a
-  profile under it (`alice` matches `@alice/claude`, never `@alicebob`).
+  ID; `@handle` stays as typed. A `mentions` filter matches an exact term, an
+  actor ID's `+` profiles (`local:user:alice` matches
+  `@[local:user:alice+claude]`), or a handle's `/` profiles (`alice` matches
+  `@alice/claude`, never `@alicebob`); `me` matches exactly, never a profile.
   Upstream also rewrites a unique `@handle` to `@[actor-id]` and accepts email
   mentions from sync.
 - **Emoji normalization is a small table.** Short names and common Slack
@@ -133,20 +144,23 @@ that name them are refused rather than half-accepted.
   record.
 - **Upload permission is an optional seam.** When the configured
   `server.Authorizer` also implements `server.AnywhereAuthorizer`, uploads and
-  direct-upload starts need `post` or `sync` anywhere. A policy that only
+  direct-upload starts need `post` or `sync` anywhere. `access.Authorizer`
+  implements it over the tenant's grants, fail-closed, and a policy that only
   implements the per-channel seam keeps the old behavior: uploads are
   authenticated only, and binding a file to a message still requires `post`
-  there. The access package will implement the seam later.
+  there.
 - **Two blob reads stay under the board's lock.** Binding re-reads the records
   inside the write transaction (so a delete that won the race can't leave a
   dangling reference), and `DELETE /attachments/{id}` checks live references
   and deletes under the lock (so a concurrent post can't bind what it removes).
   The first read that resolves attachment metadata happens outside the lock.
 - **Thread filters are computed over the folded log.** There's no search
-  index; `from` matches only `board` (nothing records sync origins yet). Each
-  predicate is met by the root or any reply: a root label and a reply's text
-  can satisfy one read together. A `by` handle that names a person covers that
-  person's profiles; a handle that names one profile covers only that profile.
+  index; `from` matches only `board` (nothing records sync origins yet). One
+  message must satisfy every predicate: channel is the root's, and a reply may
+  fall back to the root's labels (labels are thread state), but a root's text
+  and a reply's label or author don't combine. A `by` handle that names a
+  person covers that person's profiles; a handle that names one profile covers
+  only that profile.
 - **Batch is the plan.** Upstream has no separate plan entry; a batch whose
   tasks wait on each other by `key` is that plan. The batch `request` digest is
   trusted as a fronting board's, as upstream does.
@@ -156,8 +170,9 @@ that name them are refused rather than half-accepted.
 - **`message.by` is an ActorView here.** Upstream's `MessageView.by` is the
   author record (`actor`, `principal`, `profile`) and `author` is the
   ActorView; this port has `by` and `author` both as ActorView.
-- **No migration change.** Every new fact rides the existing `payload jsonb`
-  column; `store/migrations/0001_board_log.sql` is unchanged.
+- **No message-surface migration.** Every new fact rides the existing
+  `payload jsonb` column; the PostgreSQL migration is main's, with no column
+  added for reactions, files, edits, or blocks.
 
 ### Known deferred
 
@@ -215,7 +230,10 @@ Replaced or simplified:
   directly through the store (or with an unrestricted owner), since no caller
   can have manage before a grant gives it.
 - The server's `Authorize` seam now passes the tenant the server resolved, so a
-  multi-tenant board can't authorize against another tenant's grants. A
+  multi-tenant board can't authorize against another tenant's grants.
+  `Authorizer.AuthorizeAnywhere` answers the upload seam: it asks whether the
+  caller may `post` or `sync` in any pattern the tenant's grants or the token
+  scope names (one representative channel per pattern), and fails closed. A
   `Tenant` hook may confirm the name but not replace it: returning a different
   tenant is an error, since only the server decides which board a request is
   on. `BoardTeam`/`TeamFunc` must be set before the service serves writes;

@@ -94,7 +94,7 @@ func TestThreadsListAndPaging(t *testing.T) {
 		{"mentions handle", "?channel=dev&mentions=alice", []string{b.ID}},
 		{"label", "?label=status%3Dopen", []string{a.ID}},
 		{"root label and reply text", "?channel=dev&label=status%3Dopen&text=first", []string{a.ID}},
-		{"root text and reply label", "?channel=dev&text=deploy&label=kind%3Dreply", []string{a.ID}},
+		{"root text and reply label", "?channel=dev&text=deploy&label=kind%3Dreply", []string{}},
 		{"text", "?text=review", []string{b.ID}},
 		{"from the board", "?channel=dev&from=board", []string{b.ID, a.ID}},
 		{"from nowhere", "?channel=dev&from=slack", []string{}},
@@ -166,7 +166,7 @@ func TestActorsAndActorSnapshots(t *testing.T) {
 	const alice = "local:user:alice"
 	const bob = "local:user:bob"
 	const carol = "local:user:carol"
-	policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+	policy := server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
 		if actor.ID == bob && channel == "secret" && permission == protocol.PermissionRead {
 			return protocol.Forbidden("no secret")
 		}
@@ -296,5 +296,38 @@ func TestThreadsByPersonAndAgent(t *testing.T) {
 	prefixed := h.threads(alice, "?channel=work&mentions=alice")
 	if len(prefixed.Threads) != 1 || prefixed.Threads[0].Message.ID != byProfile.Threads[0].Message.ID {
 		t.Fatalf("mentions=alice should match @alice/claude: %+v", prefixed)
+	}
+}
+
+func TestThreadsMentionPrefixes(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+
+	actorPost := h.postMessage(alice, "work", "id @[local:user:alice+claude]")
+	handlePost := h.postMessage(alice, "work", "handle @alice/claude")
+
+	tests := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{"an actor ID matches its + profile", "?mentions=" + url.QueryEscape("local:user:alice"), []string{actorPost.ID}},
+		{"an actor ID matches exactly", "?mentions=" + url.QueryEscape("local:user:alice+claude"), []string{actorPost.ID}},
+		{"a handle matches its / profile", "?mentions=alice", []string{handlePost.ID}},
+		{"a handle matches exactly", "?mentions=" + url.QueryEscape("alice/claude"), []string{handlePost.ID}},
+		{"me is exact only", "?mentions=me", []string{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			page := h.threads(alice, "?channel=work&"+strings.TrimPrefix(test.query, "?"))
+			if len(page.Threads) != len(test.want) {
+				t.Fatalf("got %+v, want %v", page, test.want)
+			}
+			for at, id := range test.want {
+				if page.Threads[at].Message.ID != id {
+					t.Fatalf("thread %d is %s, want %s", at, page.Threads[at].Message.ID, id)
+				}
+			}
+		})
 	}
 }

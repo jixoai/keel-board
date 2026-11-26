@@ -13,65 +13,70 @@ import (
 // threadFilter is what a `/threads` read narrows its threads by. A thread
 // matches when any of its messages does, as upstream's table query does.
 type threadFilter struct {
-	channel    string
-	hasChannel bool
-	re         *uint64
-	by         string
-	hasBy      bool
-	mentions   []string
-	hasMention bool
-	labels     []labelFilter
-	from       *string
-	text       string
+	channel       string
+	hasChannel    bool
+	re            *uint64
+	by            string
+	hasBy         bool
+	mentions      []string
+	hasMention    bool
+	mentionsExact bool
+	labels        []labelFilter
+	from          *string
+	text          string
 }
 
-// threadMatches reports whether the thread satisfies every filter predicate.
-// Each predicate may be met by the root or by any reply: a root label and a
-// reply's text both count, as a single message needn't carry everything a
-// filter names.
+// threadMatches reports whether one message in the thread matches every
+// predicate. The channel is the root's (every message of a thread is in it);
+// a reply may use its root's labels when it carries none of its own that
+// match, since labels are thread state. Text, by, mentions, and from are the
+// message's own: a root's text and a reply's label don't combine.
 func (s *Server) threadMatches(req *request, snapshot *log.Snapshot, root *log.Message, filter threadFilter) bool {
+	if filter.hasChannel && !channelMatches(root.Channel, filter.channel) {
+		return false
+	}
 	messages := make([]*log.Message, 0, 1+len(snapshot.AllReplies(root.ID)))
 	messages = append(messages, root)
 	messages = append(messages, snapshot.AllReplies(root.ID)...)
-	any := func(matches func(*log.Message) bool) bool {
-		for _, message := range messages {
-			if matches(message) {
-				return true
-			}
+	for _, message := range messages {
+		if s.messageMatchesThreadFilter(req, snapshot, root, message, filter) {
+			return true
 		}
+	}
+	return false
+}
+
+// messageMatchesThreadFilter applies every non-channel predicate to one
+// message. A reply's labels fall back to the root's: a label is thread state,
+// so a root label and a reply's text can satisfy a filter together.
+func (s *Server) messageMatchesThreadFilter(req *request, snapshot *log.Snapshot, root, message *log.Message, filter threadFilter) bool {
+	if filter.hasBy && !matchesWho(snapshot, req, filter.by, message.By.Actor, message.By.Principal) {
 		return false
 	}
-	if filter.hasChannel && !any(func(message *log.Message) bool {
-		return channelMatches(message.Channel, filter.channel)
-	}) {
-		return false
+	if filter.hasMention {
+		matched := protocol.MentionsMatch(message.Text, filter.mentions)
+		if filter.mentionsExact {
+			matched = protocol.MentionsMatchExact(message.Text, filter.mentions)
+		}
+		if !matched {
+			return false
+		}
 	}
-	if filter.hasBy && !any(func(message *log.Message) bool {
-		return matchesWho(snapshot, req, filter.by, message.By.Actor, message.By.Principal)
-	}) {
-		return false
+	if len(filter.labels) > 0 {
+		if !labelsMatch(message.Labels, filter.labels) && (message == root || !labelsMatch(root.Labels, filter.labels)) {
+			return false
+		}
 	}
-	if filter.hasMention && !any(func(message *log.Message) bool {
-		return protocol.MentionsMatch(message.Text, filter.mentions)
-	}) {
-		return false
-	}
-	if len(filter.labels) > 0 && !any(func(message *log.Message) bool {
-		return labelsMatch(message.Labels, filter.labels)
-	}) {
-		return false
-	}
-	if filter.from != nil && !any(func(message *log.Message) bool {
+	if filter.from != nil {
 		if *filter.from == "board" {
-			return message.From == nil
+			if message.From != nil {
+				return false
+			}
+		} else if message.From == nil || *message.From != *filter.from {
+			return false
 		}
-		return message.From != nil && *message.From == *filter.from
-	}) {
-		return false
 	}
-	if filter.text != "" && !any(func(message *log.Message) bool {
-		return strings.Contains(strings.ToLower(message.Text), strings.ToLower(filter.text))
-	}) {
+	if filter.text != "" && !strings.Contains(strings.ToLower(message.Text), strings.ToLower(filter.text)) {
 		return false
 	}
 	return true
@@ -125,7 +130,7 @@ func (s *Server) handleThreads(w http.ResponseWriter, r *http.Request) {
 	}
 	if mentions, hasMentions := queryString(r, "mentions"); hasMentions {
 		filter.hasMention = true
-		filter.mentions = mentionTermsFor(req, mentions)
+		filter.mentions, filter.mentionsExact = mentionTermsFor(req, mentions)
 	}
 	filter.labels, perr = parseLabels(queryRepeated(r, "label"))
 	if perr != nil {
@@ -267,20 +272,20 @@ func (s *Server) handleThreads(w http.ResponseWriter, r *http.Request) {
 }
 
 // mentionTermsFor turns a `mentions` value into what it matches: `me` is the
-// caller and its handle, an actor ID is itself, and a handle also names the
-// actors that go by it.
-func mentionTermsFor(req *request, value string) []string {
+// caller and its handle exactly, an actor ID is its own plus `+` profiles, and
+// a handle is its own plus `/` profiles.
+func mentionTermsFor(req *request, value string) ([]string, bool) {
 	if value == "me" {
 		terms := []string{req.actor.ID}
 		if req.actor.Handle != "" {
 			terms = append(terms, strings.ToLower(req.actor.Handle))
 		}
-		return terms
+		return terms, true
 	}
 	if strings.Contains(value, ":") {
-		return []string{value}
+		return []string{value}, false
 	}
-	return []string{strings.ToLower(value)}
+	return []string{strings.ToLower(value)}, false
 }
 
 // handleActors answers GET /actors: who wrote, was mentioned, or reacted in

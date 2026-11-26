@@ -96,11 +96,21 @@ func (s *Server) permitUpload(req *request) *protocol.Error {
 	if !ok {
 		return nil
 	}
-	if gate.AuthorizeAnywhere(req.ctx, req.actor, protocol.PermissionPost) == nil {
+	postErr := gate.AuthorizeAnywhere(req.ctx, req.tenant, req.actor, protocol.PermissionPost)
+	if postErr == nil {
 		return nil
 	}
-	if gate.AuthorizeAnywhere(req.ctx, req.actor, protocol.PermissionSync) == nil {
+	syncErr := gate.AuthorizeAnywhere(req.ctx, req.tenant, req.actor, protocol.PermissionSync)
+	if syncErr == nil {
 		return nil
+	}
+	// A refusal is the answer; a bad scope, a canceled request, or a store
+	// failure isn't hidden as a 403.
+	for _, err := range []error{postErr, syncErr} {
+		boardErr := asProtocol(err)
+		if boardErr.Status != http.StatusForbidden && boardErr.Status != http.StatusNotFound {
+			return boardErr
+		}
 	}
 	return protocol.Forbidden("this token can't post or sync anywhere, so it can't upload")
 }

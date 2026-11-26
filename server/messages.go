@@ -268,7 +268,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	// caller may have lost post or read since, and its files may be gone.
 	// What it gets is its own message, and only what it may read.
 	if clientID != "" {
-		result, found, err := s.board.ReplayKey(req.tenant, idemKey("post", req.actor.ID, clientID))
+		result, found, err := s.board.ReplayKey(req.ctx, req.tenant, idemKey("post", req.actor.ID, clientID))
 		if err != nil {
 			s.fail(w, r, err)
 			return
@@ -400,12 +400,14 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		opts.Idempotency = &log.Idempotency{Key: idemKey("post", req.actor.ID, clientID), Digest: digest}
 	}
 	postID := uint64(0)
+	replayed := false
 	err := s.board.Update(req.ctx, req.tenant, opts, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
 			if len(replay.MessageIDs) == 0 {
 				return protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write")
 			}
 			postID = replay.MessageIDs[0]
+			replayed = true
 			return nil
 		}
 		if perr := s.verifyAttachments(req, attachments); perr != nil {
@@ -457,6 +459,15 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	if replayed {
+		view, perr := s.replayMessage(req, postID, body.Text)
+		if perr != nil {
+			writeError(w, perr)
+			return
+		}
+		writeJSON(w, http.StatusCreated, postResponse{Message: view})
 		return
 	}
 	var view protocol.MessageView

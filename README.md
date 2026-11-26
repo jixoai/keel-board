@@ -57,7 +57,7 @@ it; deleting a message hides its files.
 | `store/` | `EventStore` seam, in-memory and PostgreSQL stores, migrations |
 | `access/` | Per-channel permissions, grants, patterns and the authorizer |
 | `server/` | HTTP API, SSE feed, authorizer and tenant seams |
-| `cmd/board/` | Standalone dev server (`board serve`, memory/`--dsn`, `--blobs`) |
+| `cmd/board/` | Standalone dev server (`board serve`, memory or `--dsn`, `--blobs`) |
 
 The translation is faithful in semantics, not a line-by-line copy. Every
 difference from upstream is recorded in `docs/PORTING.md`.

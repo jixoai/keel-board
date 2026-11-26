@@ -19,7 +19,7 @@ type toggleAuthorizer struct {
 	denyLabel bool
 }
 
-func (p *toggleAuthorizer) Authorize(_ context.Context, _ protocol.Actor, _ string, permission protocol.Permission) error {
+func (p *toggleAuthorizer) Authorize(_ context.Context, _ string, _ protocol.Actor, _ string, permission protocol.Permission) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	switch permission {

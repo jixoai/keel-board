@@ -202,13 +202,17 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 	// A retry answers what it landed before anything else is checked: its
 	// caller may have lost post or read since, and its files may be gone.
 	if body.ID != "" {
-		result, found, err := s.board.ReplayKey(req.tenant, batchKey(req.actor.ID, body.ID))
+		result, found, err := s.board.ReplayKey(req.ctx, req.tenant, batchKey(req.actor.ID, body.ID))
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
 		if found {
 			if result.Digest != digest {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			if len(result.MessageIDs) == 0 {
 				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
 				return
 			}
@@ -311,9 +315,14 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 		opts.Idempotency = &log.Idempotency{Key: batchKey(req.actor.ID, body.ID), Digest: digest}
 	}
 	var rootIDs []uint64
+	replayed := false
 	err := s.board.Update(req.ctx, req.tenant, opts, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
+			if len(replay.MessageIDs) == 0 {
+				return protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write")
+			}
 			rootIDs = append([]uint64(nil), replay.MessageIDs...)
+			replayed = true
 			return nil
 		}
 		rootIDs = make([]uint64, len(body.Tasks))
@@ -385,6 +394,15 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	if replayed {
+		page, perr := s.replayBatch(req, rootIDs)
+		if perr != nil {
+			writeError(w, perr)
+			return
+		}
+		writeJSON(w, http.StatusCreated, page)
+		return
+	}
 	tasks := make([]protocol.MessageView, 0, len(rootIDs))
 	err = s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
 		for at, id := range rootIDs {
@@ -424,7 +442,7 @@ func (s *Server) handleCreatedTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	result, found, err := s.board.ReplayKey(req.tenant, batchKey(req.actor.ID, id))
+	result, found, err := s.board.ReplayKey(req.ctx, req.tenant, batchKey(req.actor.ID, id))
 	if err != nil {
 		s.fail(w, r, err)
 		return

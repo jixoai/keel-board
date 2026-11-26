@@ -176,16 +176,28 @@ func TestMentions(t *testing.T) {
 		t.Fatal("expected a match")
 	}
 	if !protocol.MentionsMatch("hi @alice/claude", []string{"alice"}) {
-		t.Fatal("a profile's mention should match its person prefix")
+		t.Fatal("a handle profile should match its handle prefix")
 	}
 	if !protocol.MentionsMatch("hi @alice/claude", []string{"alice/claude"}) {
 		t.Fatal("an exact handle should match")
+	}
+	if !protocol.MentionsMatch("hi @[local:user:alice+claude]", []string{"local:user:alice"}) {
+		t.Fatal("an actor profile should match its actor ID prefix")
+	}
+	if protocol.MentionsMatch("hi @[local:user:alice+claude]", []string{"alice"}) {
+		t.Fatal("a handle prefix must not match an actor ID")
 	}
 	if protocol.MentionsMatch("hi @alice", []string{"bob"}) {
 		t.Fatal("unexpected match")
 	}
 	if protocol.MentionsMatch("hi @alicebob", []string{"alice"}) {
 		t.Fatal("a prefix must end at a segment boundary")
+	}
+	if protocol.MentionsMatchExact("hi @alice/claude", []string{"alice"}) {
+		t.Fatal("an exact match must not take a profile")
+	}
+	if !protocol.MentionsMatchExact("hi @alice/claude", []string{"alice/claude"}) {
+		t.Fatal("an exact handle should match exactly")
 	}
 }
 

@@ -186,6 +186,9 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (*request, bool
 		writeError(w, asProtocol(err))
 		return nil, false
 	}
+	if tenant == "" {
+		tenant = "default"
+	}
 	actor, err := s.actorFn(r)
 	if err != nil {
 		writeError(w, asProtocol(err))

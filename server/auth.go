@@ -42,7 +42,7 @@ type RequestValidator interface {
 // that implements this doesn't have to answer "does this actor have post in at
 // least one channel?" from the per-channel Authorizer.
 type AnywhereAuthorizer interface {
-	AuthorizeAnywhere(ctx context.Context, actor protocol.Actor, permission protocol.Permission) error
+	AuthorizeAnywhere(ctx context.Context, tenant string, actor protocol.Actor, permission protocol.Permission) error
 }
 
 // AllowAll allows every caller every permission. It is for development and
