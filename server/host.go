@@ -899,6 +899,16 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 	if target.Thread == "" {
 		kind = boardsync.TargetChannel
 	}
+	if kind == boardsync.TargetThread {
+		resolved := resolvedTarget(target, kind)
+		existing, found, err := h.store.ThreadByTarget(ctx, event.Tenant, boardsync.Key(target.Key), resolved)
+		if err != nil {
+			return err
+		}
+		if found && existing.BoardThread != root.ID {
+			return boardsync.Permanent(fmt.Errorf("sync: platform thread %s is already attached to board thread %d", target.External(), existing.BoardThread))
+		}
+	}
 	if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
 		Tenant: event.Tenant, BoardThread: root.ID, Key: boardsync.Key(target.Key),
 		Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
