@@ -14,6 +14,11 @@ import (
 // platform's payload or a header by itself.
 type TenantFunc func(*http.Request) (string, error)
 
+// GateFactory builds the gate for one resolved connection. A handler must not
+// share a static gate across tenants: the factory's tenant/key are the scope
+// the gate must answer for. Return an error to make the webhook answer 500.
+type GateFactory func(tenant string, key boardsync.Key) (boardsync.Gate, error)
+
 // WebhookConfig configure a webhook handler.
 type WebhookConfig struct {
 	// Registry holds the sync entries and their providers. Required.
@@ -22,9 +27,10 @@ type WebhookConfig struct {
 	Store Store
 	// Tenant resolves the board a request is on. Required.
 	Tenant TenantFunc
-	// Gate decides which channels and threads a webhook keeps. nil keeps every
-	// record the provider emits.
-	Gate boardsync.Gate
+	// GateFactory builds the gate per (tenant, key). A nil factory leaves the
+	// gate nil: only a record whose channel the entry's own Routes names is
+	// kept (fail closed for thread matching).
+	GateFactory GateFactory
 	// MaxBodyBytes caps the request body before a provider parses it. Zero
 	// means one MiB.
 	MaxBodyBytes int64
@@ -35,20 +41,22 @@ type WebhookConfig struct {
 // WebhookHandler serves POST /webhooks/{key}. It is independent of the board
 // server's route table: the server mounts it when it is ready.
 //
-// The handler resolves the tenant and the persisted entry first, so a key that
-// belongs to another tenant (or is disabled) is a 404 before the body is read.
-// A deployment must UpsertEntry for a tenant before serving its webhooks.
+// The handler resolves the tenant and the persisted entry first. A key this
+// tenant doesn't own, or a disabled entry, is a silent 200 with no body read;
+// an owned enabled entry this process hasn't registered is a 503; a platform
+// mismatch is a 500. A deployment must UpsertEntry for a tenant before serving
+// its webhooks.
 // It then delegates to Registry.HandleWebhook, which verifies and normalizes
 // through the provider, gates the records, and stores them before the handler
 // answers. A store failure becomes a 500 and the platform retries; the handler
 // never answers 2xx before the inbox commit.
 type WebhookHandler struct {
-	registry *boardsync.Registry
-	store    Store
-	tenant   TenantFunc
-	gate     boardsync.Gate
-	maxBody  int64
-	logger   *slog.Logger
+	registry    *boardsync.Registry
+	store       Store
+	tenant      TenantFunc
+	gateFactory GateFactory
+	maxBody     int64
+	logger      *slog.Logger
 }
 
 // NewWebhookHandler validates cfg and returns a handler.
@@ -69,12 +77,12 @@ func NewWebhookHandler(cfg WebhookConfig) (*WebhookHandler, error) {
 		cfg.Logger = slog.Default()
 	}
 	return &WebhookHandler{
-		registry: cfg.Registry,
-		store:    cfg.Store,
-		tenant:   cfg.Tenant,
-		gate:     cfg.Gate,
-		maxBody:  cfg.MaxBodyBytes,
-		logger:   cfg.Logger,
+		registry:    cfg.Registry,
+		store:       cfg.Store,
+		tenant:      cfg.Tenant,
+		gateFactory: cfg.GateFactory,
+		maxBody:     cfg.MaxBodyBytes,
+		logger:      cfg.Logger,
 	}, nil
 }
 
@@ -130,12 +138,21 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, http.StatusInternalServerError)
 		return
 	}
+	var gate boardsync.Gate
+	if h.gateFactory != nil {
+		gate, err = h.gateFactory(tenant, key)
+		if err != nil {
+			h.logger.Error("sync webhook gate failed", "tenant", tenant, "key", key, "error", ErrorCode(err))
+			writeStatus(w, http.StatusInternalServerError)
+			return
+		}
+	}
 	request, err := boardsync.NewWebhookRequest(r, h.maxBody)
 	if err != nil {
 		writeStatus(w, http.StatusRequestEntityTooLarge)
 		return
 	}
-	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, h.gate,
+	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, gate,
 		NewTenantInbox(h.store, tenant, "webhook"))
 	if err != nil {
 		status := response.Status

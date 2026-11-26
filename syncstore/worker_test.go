@@ -94,6 +94,116 @@ func TestInboundWorkerDefersUnregisteredKey(t *testing.T) {
 	})
 }
 
+func TestInboundDeferredDoesNotCountAttempts(t *testing.T) {
+	cfg := testConfig()
+	cfg.InboundRetry = boardsync.RetryPolicy{MaxAttempts: 1, BaseDelay: 0, MaxDelay: 0, Jitter: 0}
+	memory, err := syncstore.NewMemory(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	memory.WithClock(func() time.Time { return now })
+	ctx := t.Context()
+	if _, err := memory.PushInbox(ctx, "t1", "slack", []boardsync.Record{testRecord("m1", "C:T1")}); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	registry := boardsync.NewRegistry()
+	worker, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
+		Store: memory, Registry: registry, Runner: boardsync.NewRunner(fake.NewHost()),
+		Tenant: "t1", Key: "slack", Owner: "worker", Limit: 1, Defer: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		result, err := worker.Process(ctx)
+		if err != nil || result.Deferred != 1 || result.Dead != 0 {
+			t.Fatalf("defer pass %d = %+v, %v", i, result, err)
+		}
+		now = now.Add(time.Millisecond)
+		items, err := memory.LeaseInbox(ctx, "t1", "slack", 1, "probe")
+		if err != nil || len(items) != 1 {
+			t.Fatalf("probe lease %d = %+v, %v", i, items, err)
+		}
+		if items[0].Attempts != 0 {
+			t.Fatalf("defer counted an attempt: %+v", items[0])
+		}
+		if err := memory.ReleaseInbox(ctx, "t1", "slack", items[0].ID, items[0].Lease, 0); err != nil {
+			t.Fatalf("release probe %d: %v", i, err)
+		}
+	}
+	depth, err := memory.InboxDepth(ctx, "t1", "slack")
+	if err != nil || depth.Pending != 1 || depth.Dead != 0 {
+		t.Fatalf("depth after defers = %+v, %v", depth, err)
+	}
+	provider := fake.New("slack", boardsync.Capabilities{})
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	result, err := worker.Process(ctx)
+	if err != nil || result.Acked != 1 {
+		t.Fatalf("ready pass = %+v, %v", result, err)
+	}
+}
+
+func TestOutboundDeferredDoesNotCountAttempts(t *testing.T) {
+	cfg := testConfig()
+	cfg.OutboundRetry = boardsync.RetryPolicy{MaxAttempts: 1, BaseDelay: 0, MaxDelay: 0, Jitter: 0}
+	memory, err := syncstore.NewMemory(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	memory.WithClock(func() time.Time { return now })
+	ctx := t.Context()
+	target := threadTarget("C0123", "C0123:T1")
+	if _, err := memory.EnqueueOutbox(ctx, "t1", "slack", postedEvent(10, 100, 101),
+		boardMessage(101, 100, "root"), []boardsync.ResolvedTarget{target}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	registry := boardsync.NewRegistry()
+	host := fake.NewHost()
+	worker, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
+		Store: memory, Registry: registry, Runner: boardsync.NewRunner(host), Host: host,
+		Tenant: "t1", Keys: []boardsync.Key{"slack"}, Owner: "worker", Limit: 1, Defer: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("new worker: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		result, err := worker.Process(ctx)
+		if err != nil || result.Deferred != 1 || result.Dead != 0 {
+			t.Fatalf("defer pass %d = %+v, %v", i, result, err)
+		}
+		now = now.Add(time.Millisecond)
+		jobs, err := memory.LeaseOutbox(ctx, "t1", []boardsync.Key{"slack"}, 1, "probe")
+		if err != nil || len(jobs) != 1 {
+			t.Fatalf("probe lease %d = %+v, %v", i, jobs, err)
+		}
+		if jobs[0].Attempts != 0 {
+			t.Fatalf("defer counted an attempt: %+v", jobs[0])
+		}
+		if err := memory.ReleaseOutbox(ctx, "t1", jobs[0].ID, jobs[0].Lease, 0); err != nil {
+			t.Fatalf("release probe %d: %v", i, err)
+		}
+	}
+	depth, err := memory.OutboxDepth(ctx, "t1")
+	if err != nil || depth.Pending != 1 || depth.Dead != 0 {
+		t.Fatalf("depth after defers = %+v, %v", depth, err)
+	}
+	provider := fake.New("slack", boardsync.Capabilities{})
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	result, err := worker.Process(ctx)
+	if err != nil || result.Acked != 1 {
+		t.Fatalf("ready pass = %+v, %v", result, err)
+	}
+	if posts := provider.Posts(); len(posts) != 1 {
+		t.Fatalf("posts after readiness = %d", len(posts))
+	}
+}
+
 func TestWorkerRunStopsOnContext(t *testing.T) {
 	memory, err := syncstore.NewMemory(testConfig())
 	if err != nil {

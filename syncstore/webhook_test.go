@@ -17,7 +17,11 @@ import (
 func testWebhookProvider(t *testing.T, registry *boardsync.Registry) *fake.Provider {
 	t.Helper()
 	provider := fake.New("slack", boardsync.Capabilities{})
-	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+	if err := registry.Add(boardsync.Entry{
+		Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider,
+		Sync:   boardsync.Mirror("support"),
+		Routes: func(context.Context, string) (bool, error) { return true, nil },
+	}); err != nil {
 		t.Fatalf("register entry: %v", err)
 	}
 	return provider
@@ -25,8 +29,16 @@ func testWebhookProvider(t *testing.T, registry *boardsync.Registry) *fake.Provi
 
 func newWebhookHandler(t *testing.T, store syncstore.Store, registry *boardsync.Registry, tenant syncstore.TenantFunc, maxBody int64) *syncstore.WebhookHandler {
 	t.Helper()
+	return newWebhookHandlerWithGate(t, store, registry, tenant, maxBody, func(string, boardsync.Key) (boardsync.Gate, error) {
+		return syncstore.StoreGate{Store: store}, nil
+	})
+}
+
+func newWebhookHandlerWithGate(t *testing.T, store syncstore.Store, registry *boardsync.Registry, tenant syncstore.TenantFunc, maxBody int64, factory syncstore.GateFactory) *syncstore.WebhookHandler {
+	t.Helper()
 	handler, err := syncstore.NewWebhookHandler(syncstore.WebhookConfig{
 		Registry: registry, Store: store, Tenant: tenant, MaxBodyBytes: maxBody,
+		GateFactory: factory,
 	})
 	if err != nil {
 		t.Fatalf("new webhook handler: %v", err)
@@ -212,6 +224,154 @@ func TestWebhookChallengePassesThrough(t *testing.T) {
 		handler.ServeHTTP(recorder, webhookRequest("slack", `{"type":"url_verification"}`))
 		if recorder.Code != http.StatusOK || recorder.Body.String() != "challenge-token" {
 			t.Fatalf("challenge = %d %q", recorder.Code, recorder.Body.String())
+		}
+	})
+}
+
+func TestWebhookNilGateFailsClosed(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		seedEntry(t, store, "t1", "slack", true)
+		seedEntry(t, store, "t1", "routed", true)
+		registry := boardsync.NewRegistry()
+		provider := fake.New("slack", boardsync.Capabilities{})
+		if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		routed := fake.New("slack", boardsync.Capabilities{})
+		if err := registry.Add(boardsync.Entry{
+			Tenant: "t1", Key: "routed", Platform: "slack", Provider: routed,
+			Sync: boardsync.Mirror("support"),
+			Routes: func(context.Context, string) (bool, error) {
+				return true, nil
+			},
+		}); err != nil {
+			t.Fatalf("register routed: %v", err)
+		}
+		provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{testRecord("m1", "C1:T1")}}, nil
+		}
+		routed.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			record := testRecord("m2", "C1:T1")
+			record.Event.Key = "routed"
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{record}}, nil
+		}
+		handler := newWebhookHandlerWithGate(t, store, registry,
+			func(*http.Request) (string, error) { return "t1", nil }, 1<<20, nil)
+		for _, key := range []string{"slack", "routed"} {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, webhookRequest(key, "{}"))
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("%s webhook = %d", key, recorder.Code)
+			}
+		}
+		// No gate and no Routes: fail closed. Routes: the channel is kept.
+		depth, err := store.InboxDepth(ctx, "t1", "slack")
+		if err != nil || depth.Pending != 0 {
+			t.Fatalf("nil gate without Routes stored rows: %+v, %v", depth, err)
+		}
+		depth, err = store.InboxDepth(ctx, "t1", "routed")
+		if err != nil || depth.Pending != 1 {
+			t.Fatalf("entry Routes under a nil gate = %+v, %v", depth, err)
+		}
+	})
+}
+
+func TestWebhookEntryRoutesPrecedeGate(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		seedEntry(t, store, "t1", "slack", true)
+		registry := boardsync.NewRegistry()
+		provider := fake.New("slack", boardsync.Capabilities{})
+		if err := registry.Add(boardsync.Entry{
+			Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider,
+			Sync: boardsync.Mirror("support"),
+			Routes: func(_ context.Context, channel string) (bool, error) {
+				return channel == "C1", nil
+			},
+		}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+		first := testRecord("m1", "C1:T1")
+		first.Event.Channel = "C1"
+		second := testRecord("m2", "C2:T2")
+		second.Event.Channel = "C2"
+		provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{first, second}}, nil
+		}
+		handler := newWebhookHandlerWithGate(t, store, registry,
+			func(*http.Request) (string, error) { return "t1", nil }, 1<<20,
+			func(string, boardsync.Key) (boardsync.Gate, error) {
+				return fake.NewGate([]string{"C2"}, nil), nil
+			})
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, webhookRequest("slack", "{}"))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("webhook = %d", recorder.Code)
+		}
+		items, err := store.LeaseInbox(ctx, "t1", "slack", 10, "test")
+		if err != nil || len(items) != 1 || items[0].ID != "m1" {
+			t.Fatalf("entry Routes did not decide: %+v, %v", items, err)
+		}
+	})
+}
+
+func TestWebhookGateFactoryIsTenantScoped(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		seedEntry(t, store, "tenant-a", "slack", true)
+		seedEntry(t, store, "tenant-b", "slack", true)
+		registry := boardsync.NewRegistry()
+		providerA := fake.New("slack", boardsync.Capabilities{})
+		providerB := fake.New("slack", boardsync.Capabilities{})
+		for tenant, provider := range map[string]*fake.Provider{"tenant-a": providerA, "tenant-b": providerB} {
+			if err := registry.Add(boardsync.Entry{
+				Tenant: tenant, Key: "slack", Platform: "slack", Provider: provider,
+				Sync: boardsync.Mirror("support"),
+			}); err != nil {
+				t.Fatalf("register %s: %v", tenant, err)
+			}
+		}
+		newIntake := func(prefix string) boardsync.Intake {
+			first := testRecord(prefix+"-C1", "C1:T1")
+			first.Event.Channel = "C1"
+			second := testRecord(prefix+"-C2", "C2:T2")
+			second.Event.Channel = "C2"
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{first, second}}
+		}
+		providerA.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			return newIntake("a"), nil
+		}
+		providerB.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			return newIntake("b"), nil
+		}
+		handler := newWebhookHandlerWithGate(t, store, registry,
+			func(r *http.Request) (string, error) { return r.Header.Get("X-Test-Tenant"), nil }, 1<<20,
+			func(tenant string, key boardsync.Key) (boardsync.Gate, error) {
+				if key != "slack" {
+					t.Fatalf("gate factory key = %q", key)
+				}
+				if tenant == "tenant-a" {
+					return fake.NewGate([]string{"C1"}, nil), nil
+				}
+				return fake.NewGate([]string{"C2"}, nil), nil
+			})
+		for _, tenant := range []string{"tenant-a", "tenant-b"} {
+			request := webhookRequest("slack", "{}")
+			request.Header.Set("X-Test-Tenant", tenant)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("%s webhook = %d", tenant, recorder.Code)
+			}
+		}
+		a, err := store.LeaseInbox(ctx, "tenant-a", "slack", 10, "test")
+		if err != nil || len(a) != 1 || a[0].ID != "a-C1" {
+			t.Fatalf("tenant-a kept %+v, %v", a, err)
+		}
+		b, err := store.LeaseInbox(ctx, "tenant-b", "slack", 10, "test")
+		if err != nil || len(b) != 1 || b[0].ID != "b-C2" {
+			t.Fatalf("tenant-b kept %+v, %v", b, err)
 		}
 	})
 }

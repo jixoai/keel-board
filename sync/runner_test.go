@@ -15,6 +15,40 @@ func testEntry(t *testing.T, syncFn boardsync.SyncFunc) (boardsync.Entry, *fake.
 	return boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: syncFn}, provider, fake.NewHost()
 }
 
+func TestEntryValidateChecksPlatform(t *testing.T) {
+	provider := fake.New("slack", boardsync.Capabilities{})
+	entry := boardsync.Entry{
+		Tenant: "t1", Key: "slack", Platform: "github", Provider: provider, Sync: boardsync.Noop,
+	}
+	if err := entry.Validate(); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("platform mismatch = %v, want ErrBadRequest", err)
+	}
+	entry.Platform = "slack"
+	if err := entry.Validate(); err != nil {
+		t.Fatalf("matching platform = %v", err)
+	}
+}
+
+func TestRunnerOutboundRefusesForeignTarget(t *testing.T) {
+	entry, provider, _ := testEntry(t, func(ctx context.Context, call *boardsync.Call) error {
+		_, err := call.Deliver(ctx, boardsync.DeliverOptions{})
+		return err
+	})
+	message := boardsync.Message{ID: 812, Thread: 812, Channel: "support", Text: "hello"}
+	target := boardsync.ResolvedTarget{
+		Key: "github", Platform: "github", Channel: "acme/www:pulls",
+		Thread: "acme/www:123", Kind: boardsync.TargetThread,
+	}
+	if _, err := boardsync.NewRunner(fake.NewHost()).Outbound(context.Background(), entry,
+		boardsync.BoardEvent{Type: boardsync.BoardMessagePosted, Thread: 812},
+		message, &target, ""); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("foreign target = %v, want ErrBadRequest", err)
+	}
+	if posts := provider.Posts(); len(posts) != 0 {
+		t.Fatalf("foreign target reached the provider: %+v", posts)
+	}
+}
+
 func TestRunnerInboundImportsOnce(t *testing.T) {
 	var call *boardsync.Call
 	entry, provider, host := testEntry(t, func(ctx context.Context, c *boardsync.Call) error {

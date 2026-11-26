@@ -133,10 +133,15 @@ func (r *Registry) Len() int {
 // the gate accepts, and stores them in inbox before returning. The provider
 // answers a platform challenge even when it carries no records.
 //
-// A record whose channel the entry routes is kept; otherwise it is kept only
-// when the board already syncs its thread. Everything else is dropped. A gate
-// that can't answer fails the webhook, so the platform retries rather than the
-// event being lost.
+// A record whose channel the entry's Routes names is kept; when the entry has
+// no Routes, the gate's tenant/key-scoped Routes answers. Otherwise it is kept
+// only when the board already syncs its thread. Everything else is dropped. A
+// gate that can't answer fails the webhook, so the platform retries rather
+// than the event being lost.
+//
+// A nil gate is fail-closed for thread matching: only a record whose channel
+// the entry's own Routes explicitly names is kept. With neither an entry
+// Routes nor a gate, nothing is stored.
 func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, req *WebhookRequest, gate Gate, inbox Inbox) (WebhookResponse, error) {
 	entry, ok := r.Get(tenant, key)
 	if !ok {
@@ -164,16 +169,20 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 		if err := record.Validate(); err != nil {
 			return WebhookResponse{Status: StatusCode(err)}, err
 		}
-		if gate == nil {
-			kept = append(kept, record)
-			continue
+		mapped := false
+		if entry.Routes != nil {
+			mapped, err = entry.Routes(ctx, record.Event.Channel)
+		} else if gate != nil {
+			mapped, err = gate.Routes(ctx, tenant, key, record.Event.Channel)
 		}
-		mapped, gateErr := gate.Routes(ctx, record.Event.Channel)
-		if gateErr != nil {
-			return WebhookResponse{Status: 500}, gateErr
+		if err != nil {
+			return WebhookResponse{Status: 500}, err
 		}
 		if !mapped {
-			synced, gateErr := gate.ThreadSynced(ctx, record.Event.ThreadRef().External())
+			if gate == nil {
+				continue
+			}
+			synced, gateErr := gate.ThreadSynced(ctx, tenant, key, record.Event.ThreadRef().External())
 			if gateErr != nil {
 				return WebhookResponse{Status: 500}, gateErr
 			}

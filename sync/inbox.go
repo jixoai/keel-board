@@ -27,6 +27,10 @@ type InboxItem struct {
 // Inbox is the durable queue of platform events. The board keeps it beside the
 // log, not in it: raw platform events never appear in a tail.
 //
+// This seam has no tenant argument: MemoryInbox is a single-connection
+// development store. A multi-tenant deployment uses syncstore.Store, whose
+// inbox is keyed by tenant and key.
+//
 // Push dedupes by the record's Dedupe. Lease hands out the oldest available
 // event of each external thread, one at a time per thread, so a thread's
 // imports stay in order while other threads proceed in parallel. Ack removes
@@ -54,8 +58,9 @@ func newInboxLane() *inboxLane {
 	return &inboxLane{items: make(map[string][]*inboxItem), seen: make(map[string]struct{})}
 }
 
-// MemoryInbox is an in-process Inbox. It is the executable form of the inbox
-// semantics; a deployment replaces it with a store shared by its workers.
+// MemoryInbox is an in-process, single-tenant Inbox. It is the executable form
+// of the inbox semantics for development and tests; a deployment replaces it
+// with syncstore.Store's durable, tenant-scoped inbox shared by its workers.
 type MemoryInbox struct {
 	mu       sync.Mutex
 	lanes    map[Key]*inboxLane

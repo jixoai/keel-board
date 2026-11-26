@@ -360,8 +360,9 @@ func (h *Host) Records() []boardsync.BoardEvent {
 	return append([]boardsync.BoardEvent(nil), h.records...)
 }
 
-// Gate is a static Gate: channels in RoutesFunc's set are mapped, threads in
-// SyncedFunc's set are synced.
+// Gate is a static test Gate: channels in Mapped are mapped, threads in Synced
+// are synced. It deliberately ignores tenant and key; production code must
+// build a gate per (tenant, key) instead of sharing one.
 type Gate struct {
 	Mapped map[string]bool
 	Synced map[string]bool
@@ -381,7 +382,7 @@ func NewGate(mapped, synced []string) *Gate {
 }
 
 // Routes implements boardsync.Gate.
-func (g *Gate) Routes(_ context.Context, channel string) (bool, error) {
+func (g *Gate) Routes(_ context.Context, _ string, _ boardsync.Key, channel string) (bool, error) {
 	if g.Err != nil {
 		return false, g.Err
 	}
@@ -389,7 +390,7 @@ func (g *Gate) Routes(_ context.Context, channel string) (bool, error) {
 }
 
 // ThreadSynced implements boardsync.Gate.
-func (g *Gate) ThreadSynced(_ context.Context, thread string) (bool, error) {
+func (g *Gate) ThreadSynced(_ context.Context, _ string, _ boardsync.Key, thread string) (bool, error) {
 	if g.Err != nil {
 		return false, g.Err
 	}

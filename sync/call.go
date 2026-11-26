@@ -225,6 +225,10 @@ type Host interface {
 	// call order: a retry that writes in the same order returns the same IDs.
 	Import(ctx context.Context, req ImportRequest) (ImportResult, error)
 	// Record appends a board event sync produces: a receipt or thread.synced.
+	// It must be idempotent for one (message, target) pair: a retried
+	// message.synced may repeat after a copy was saved, and it must preserve
+	// Files/FilesSet rather than dropping a file receipt. The sync-server Host
+	// implements this; fake.Host records calls for tests.
 	Record(ctx context.Context, event BoardEvent) error
 }
 
@@ -284,6 +288,14 @@ func (r *Runner) OutboundWithOptions(ctx context.Context, entry Entry, event Boa
 	}
 	if event.Message == nil {
 		event.Message = &message
+	}
+	if target != nil {
+		if err := target.Validate(); err != nil {
+			return Receipt{}, err
+		}
+		if target.Key != entry.Key {
+			return Receipt{}, fmt.Errorf("%w: target key %q isn't entry %q", ErrBadRequest, target.Key, entry.Key)
+		}
 	}
 	call := newCall(&Call{
 		Tenant:    entry.Tenant,
@@ -385,6 +397,9 @@ func (o *outboundOps) Import(context.Context, ImportRequest) (ImportResult, erro
 func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt, error) {
 	if err := req.Target.Validate(); err != nil {
 		return Receipt{}, err
+	}
+	if req.Target.Key != req.Key {
+		return Receipt{}, fmt.Errorf("%w: target key %q isn't call key %q", ErrBadRequest, req.Target.Key, req.Key)
 	}
 	msg := OutboundMessage{
 		Markdown:     req.Message.Text,

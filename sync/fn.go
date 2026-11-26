@@ -10,39 +10,44 @@ import (
 // never seen the event's thread.
 type RouteFunc func(ctx context.Context, channel string) (bool, error)
 
-// Gate decides what a webhook keeps. An event is kept when its channel is one
-// the entry routes, or when the board already syncs its thread. Everything
-// else is dropped at the webhook, even in channels the app is in.
+// Gate decides what a webhook keeps. An event is kept when the entry's own
+// RouteFunc maps its channel, or when the board already syncs its thread.
+// Everything else is dropped at the webhook, even in channels the app is in.
+//
+// Tenant and key are explicit: one process may run the same key for more than
+// one tenant, and a gate's answer must be scoped to the connection that
+// received the webhook. A handler must not share one static gate across
+// tenants; a factory that builds one per (tenant, key) is the intended shape.
 //
 // ThreadSynced takes the key-prefixed external thread ID
 // ("slack:C0123:1727.9"). A router that can't tell yet returns an error: the
 // webhook answers 500 so the platform sends the event again, rather than
 // storing every channel's events while a name is unknown.
 type Gate interface {
-	Routes(ctx context.Context, channel string) (bool, error)
-	ThreadSynced(ctx context.Context, thread string) (bool, error)
+	Routes(ctx context.Context, tenant string, key Key, channel string) (bool, error)
+	ThreadSynced(ctx context.Context, tenant string, key Key, thread string) (bool, error)
 }
 
 // GateFuncs adapts functions to a Gate.
 type GateFuncs struct {
-	RoutesFunc func(ctx context.Context, channel string) (bool, error)
-	SyncedFunc func(ctx context.Context, thread string) (bool, error)
+	RoutesFunc func(ctx context.Context, tenant string, key Key, channel string) (bool, error)
+	SyncedFunc func(ctx context.Context, tenant string, key Key, thread string) (bool, error)
 }
 
 // Routes calls RoutesFunc, or keeps nothing when it is nil.
-func (g GateFuncs) Routes(ctx context.Context, channel string) (bool, error) {
+func (g GateFuncs) Routes(ctx context.Context, tenant string, key Key, channel string) (bool, error) {
 	if g.RoutesFunc == nil {
 		return false, nil
 	}
-	return g.RoutesFunc(ctx, channel)
+	return g.RoutesFunc(ctx, tenant, key, channel)
 }
 
 // ThreadSynced calls SyncedFunc, or reports nothing when it is nil.
-func (g GateFuncs) ThreadSynced(ctx context.Context, thread string) (bool, error) {
+func (g GateFuncs) ThreadSynced(ctx context.Context, tenant string, key Key, thread string) (bool, error) {
 	if g.SyncedFunc == nil {
 		return false, nil
 	}
-	return g.SyncedFunc(ctx, thread)
+	return g.SyncedFunc(ctx, tenant, key, thread)
 }
 
 // Mirror is a two-way mirror of one board channel. An inbound event lands in

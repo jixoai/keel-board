@@ -26,16 +26,31 @@ func TestWebhookTenantIsolationSameKey(t *testing.T) {
 		registry := boardsync.NewRegistry()
 		providerA := fake.New("slack", boardsync.Capabilities{})
 		providerB := fake.New("slack", boardsync.Capabilities{})
+		routes := map[string]func(context.Context, string) (bool, error){
+			"tenant-a": func(_ context.Context, channel string) (bool, error) { return channel == "CA", nil },
+			"tenant-b": func(_ context.Context, channel string) (bool, error) { return channel == "CB", nil },
+		}
 		for tenant, provider := range map[string]*fake.Provider{"tenant-a": providerA, "tenant-b": providerB} {
-			if err := registry.Add(boardsync.Entry{Tenant: tenant, Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+			if err := registry.Add(boardsync.Entry{
+				Tenant: tenant, Key: "slack", Platform: "slack", Provider: provider,
+				Sync: boardsync.Mirror("support"), Routes: routes[tenant],
+			}); err != nil {
 				t.Fatalf("register %s: %v", tenant, err)
 			}
 		}
+		channelA := testRecord("a1", "CA:T1")
+		channelA.Event.Channel = "CA"
+		channelACross := testRecord("a2", "CB:T1")
+		channelACross.Event.Channel = "CB"
+		channelB := testRecord("b1", "CB:T1")
+		channelB.Event.Channel = "CB"
+		channelBCross := testRecord("b2", "CA:T1")
+		channelBCross.Event.Channel = "CA"
 		providerA.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
-			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{testRecord("a1", "CA:T1")}}, nil
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{channelA, channelACross}}, nil
 		}
 		providerB.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
-			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{testRecord("b1", "CB:T1")}}, nil
+			return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{channelB, channelBCross}}, nil
 		}
 		tenant := func(r *http.Request) (string, error) { return r.Header.Get("X-Test-Tenant"), nil }
 		handler := newWebhookHandler(t, store, registry, tenant, 1<<20)
