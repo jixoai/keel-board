@@ -86,9 +86,18 @@ func StripMarker(text string) string {
 
 // IsOwnMarker reports whether text carries a marker for key, which means the
 // comment was written by this entry and must not be imported back.
-func IsOwnMarker(text string, key Key) bool {
-	marker, ok := ParseMarker(text)
-	return ok && marker.Key == key
+func IsOwnMarker(text string, key Key) bool { return HasOwnMarker(text, key) }
+
+// HasOwnMarker scans every marker in text, not just the first one. A payload
+// can put a foreign marker before ours; only checking the first would let that
+// comment through and echo the board's own post.
+func HasOwnMarker(text string, key Key) bool {
+	for _, match := range markerPattern.FindAllStringSubmatch(text, -1) {
+		if marker, ok := parseMarkerFields(match[1]); ok && marker.Key == key {
+			return true
+		}
+	}
+	return false
 }
 
 func parseMarkerFields(fields string) (Marker, bool) {

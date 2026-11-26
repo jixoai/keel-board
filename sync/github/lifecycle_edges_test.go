@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	boardsync "github.com/jixoai/keel-board/sync"
 )
 
 // mutateFixture decodes a JSON fixture, lets the test change it, and encodes it
@@ -109,6 +111,57 @@ func TestReviewChangesRequested(t *testing.T) {
 	}
 	if !strings.HasPrefix(event.Lifecycle.Reply, "changes requested by julian") || !strings.Contains(event.Lifecycle.Reply, "regression test") {
 		t.Fatalf("reply = %q", event.Lifecycle.Reply)
+	}
+}
+
+// applyLifecycle mirrors the host's label reconciliation: write Labels, unset
+// keys under Owns that Labels doesn't carry, then apply explicit Unset.
+func applyLifecycle(labels map[string]string, lifecycle *boardsync.Lifecycle) {
+	for key, value := range lifecycle.Labels {
+		labels[key] = value
+	}
+	for _, prefix := range lifecycle.Owns {
+		for key := range labels {
+			if strings.HasPrefix(key, prefix) {
+				if _, kept := lifecycle.Labels[key]; !kept {
+					delete(labels, key)
+				}
+			}
+		}
+	}
+	for _, key := range lifecycle.Unset {
+		delete(labels, key)
+	}
+}
+
+func workflowEvent(t *testing.T, file, path string) *boardsync.Lifecycle {
+	t.Helper()
+	body := mutateFixture(t, file, func(payload map[string]any) {
+		payload["workflow_run"].(map[string]any)["path"] = path
+	})
+	return receive(t, newProvider(t, false), "workflow_run", body)[0].Event.Lifecycle
+}
+
+func TestWorkflowRunsOwnOnlyTheirExactKey(t *testing.T) {
+	labels := map[string]string{}
+	applyLifecycle(labels, workflowEvent(t, "workflow_run.json", ".github/workflows/lint.yml"))
+	applyLifecycle(labels, workflowEvent(t, "workflow_success.json", ".github/workflows/check.yml"))
+	// check passing must not clear lint's failure.
+	if labels["ci.1001-123.lint"] != "failure" {
+		t.Fatalf("lint failure was cleared by check success: %+v", labels)
+	}
+	if _, exists := labels["ci.1001-123.check"]; exists {
+		t.Fatalf("check success didn't clear check: %+v", labels)
+	}
+
+	labels = map[string]string{}
+	applyLifecycle(labels, workflowEvent(t, "workflow_run.json", ".github/workflows/check.yml"))
+	applyLifecycle(labels, workflowEvent(t, "workflow_success.json", ".github/workflows/lint.yml"))
+	if labels["ci.1001-123.check"] != "failure" {
+		t.Fatalf("check failure was cleared by lint success: %+v", labels)
+	}
+	if _, exists := labels["ci.1001-123.lint"]; exists {
+		t.Fatalf("lint success didn't clear lint: %+v", labels)
 	}
 }
 

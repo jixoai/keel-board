@@ -588,10 +588,11 @@ func targetRef(target ResolvedTarget) ThreadRef { return target.Ref() }
 
 func postedThread(target ResolvedTarget, nativeThread string) ThreadRef {
 	return ThreadRef{
-		Key:      target.Key,
-		Platform: target.Platform,
-		Channel:  target.Channel,
-		Thread:   nativeThread,
+		Key:       target.Key,
+		Platform:  target.Platform,
+		Channel:   target.Channel,
+		Thread:    nativeThread,
+		Subthread: target.Subthread,
 	}
 }
 

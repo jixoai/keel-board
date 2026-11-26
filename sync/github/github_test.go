@@ -53,6 +53,9 @@ func newProvider(t *testing.T, write bool) *github.Provider {
 		BotUserID:     4242,
 		BotLogin:      "keel-board[bot]",
 		Repos:         []string{"acme/www"},
+		// Tests never reach the real api.github.com; any unexpected call
+		// fails against a closed loopback port instead.
+		APIBaseURL: "http://127.0.0.1:9",
 	}
 	if write {
 		cfg.WriteRepos = []string{"acme/www"}

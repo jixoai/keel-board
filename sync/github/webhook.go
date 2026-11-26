@@ -337,7 +337,9 @@ func (p *Provider) normalizeWorkflowRun(key boardsync.Key, delivery string, body
 			Type:  "ci.passed",
 			Title: storableTitle("PR #%d", pr.Number),
 			URL:   run.HTMLURL,
-			Owns:  []string{prefix},
+			// Own no prefix: one workflow's completion must never unset
+			// another workflow's label. pr.synchronize owns the prefix and
+			// clears the whole CI set when the head changes.
 		}
 		if failed {
 			lifecycle.Type = "ci.failed"
@@ -390,8 +392,9 @@ func (p *Provider) isOwnComment(key boardsync.Key, comment *comment) bool {
 	}
 	if !p.cfg.DisableMarker {
 		// A marker for this entry is fail-closed: a copied marker loses one
-		// genuine comment, an echoed one would loop forever.
-		if boardsync.IsOwnMarker(comment.Body, key) {
+		// genuine comment, an echoed one would loop forever. Scan every
+		// marker: a foreign marker before ours must not hide ours.
+		if boardsync.HasOwnMarker(comment.Body, key) {
 			return true
 		}
 	}

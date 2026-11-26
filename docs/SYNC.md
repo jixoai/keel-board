@@ -646,7 +646,11 @@ entry's are dropped before normalization: fail closed. Handled events:
 | `issues` labeled/unlabeled/assigned/unassigned on a PR | reconcile `tag.*` / `assignee.*` on the PR thread; the `pull_request` event owns state and replies |
 | `pull_request_review` submitted approved/changes_requested | reply "approved by …" / "changes requested by …", label `review` |
 | `pull_request_review` dismissed | unset `review` |
-| `workflow_run` completed success/failure | `ci.passed` unsets, `ci.failed` replies from `github-actions[bot]` and sets `ci.<repo id>-<n>.<workflow file>=<conclusion>` |
+| `workflow_run` completed success/failure | `ci.passed` unsets only its exact key, `ci.failed` replies from `github-actions[bot]` and sets only `ci.<repo id>-<n>.<workflow file>=<conclusion>` |
+
+A `workflow_run` owns no label prefix. One workflow finishing must never unset
+another workflow's failure; only `pr.synchronize` owns the whole
+`ci.<repo id>-<n>.` prefix and clears it when the head changes.
 
 Tag and assignee keys are keyed by name, not platform: `good first issue` →
 `tag.good-first-issue=good first issue`, `grace` →
@@ -664,17 +668,38 @@ The issue view is used for label and assignee reconciliation on the PR thread.
 Outbound: issue comments and (with `ThreadRef.Subthread`) review-thread
 replies. `Post` appends a marker and bounds the body to GitHub's 65,536
 characters without cutting the marker; files are refused rather than silently
-dropped. `Edit`/`Delete` choose the issue-comment or review-comment endpoint
-from the sub-thread; a delete of an already-missing comment succeeds. `React`
-maps a small emoji table to GitHub's eight reactions. Roots never flow into
-GitHub: GitHub threads start on GitHub. `FetchRoot` recovers a PR/issue when a
-comment arrives on a thread the board hasn't seen. `Viewer` reads the token's
-own account; with `DetectViewer`, its comments are skipped even without
-`BotUserID` (a failed lookup is retried at most once a minute).
+dropped. A successful post's receipt keeps the sub-thread, so a host can build
+the copy target for edits, deletes, and reactions from `message.synced`.
+`Edit`/`Delete` choose the issue-comment or review-comment endpoint from the
+sub-thread; a missing review comment is idempotent, while a missing comment on
+a bare thread is an error (the endpoint is ambiguous if a receipt lost its
+sub-thread). `React` maps a small emoji table to GitHub's eight reactions.
+Roots never flow into GitHub: GitHub threads start on GitHub. `FetchRoot`
+recovers a PR/issue when a comment arrives on a thread the board hasn't seen.
+`Viewer` reads the token's own account; with `DetectViewer`, its comments are
+skipped even without `BotUserID` (a failed lookup is retried at most once a
+minute).
+
+Echo suppression fails closed. With `DisableMarker` set, an entry that has
+neither `BotUserID`/`BotLogin` nor a resolvable `Viewer` refuses `Post` and
+`Edit` instead of writing a comment it cannot recognise on the way back.
+Marker detection scans every marker in a comment, so a foreign marker placed
+before ours cannot hide ours.
+
+Rate-limit errors expose `RateLimitError.RetryAfter` (from `Retry-After` or
+`X-RateLimit-Reset`). The in-memory outbox still uses its generic backoff; a
+deployment that runs its own retry loop should honour that field or treat
+`ErrRateLimited` as retryable. GitHub's comment POST has no idempotency key:
+if a post succeeds and the host's `Record` call fails, a retry can post a
+second copy carrying a new marker. `Host.Record` must be durable before the
+outbox job is acked, or the deployment must dedupe on that failure boundary.
 
 Known limits:
 
 * Reaction removal needs a reaction ID in the API; only adding is implemented.
+* `check_run`/`check_suite` and `pull_request_review` body edits are not
+  normalized; CI status comes from `workflow_run`. A `workflow_run` whose
+  payload lists no pull request produces no record.
 * `Locate`/`URL` cover PR, issue, and comment links; review comments are read
   from `#discussion_r…` and the files-view `#r…` anchor, and a review thread is
   never a target. Other review-thread URL shapes (for example a

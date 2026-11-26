@@ -139,6 +139,43 @@ func TestPostRejectsFilesEmptyTextAndForeignSubthread(t *testing.T) {
 	}
 }
 
+func TestDisabledMarkerWithoutIdentityRefusesToSend(t *testing.T) {
+	p := writeProvider(t, "http://127.0.0.1:1", func(c *github.Config) {
+		c.DisableMarker = true
+	})
+	if _, err := p.Post(context.Background(), "github", prTarget(), boardsync.OutboundMessage{Markdown: "x"}); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("Post without any echo guard = %v", err)
+	}
+	thread := boardsync.ThreadRef{Key: "github", Platform: "github", Channel: "acme/www:pulls", Thread: "acme/www:123"}
+	if err := p.Edit(context.Background(), "github", thread, "9001", boardsync.OutboundMessage{Markdown: "x"}); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("Edit without any echo guard = %v", err)
+	}
+}
+
+func TestDisabledMarkerRefusesWhenViewerCannotBeResolved(t *testing.T) {
+	comments := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		comments++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":9500}`))
+	}))
+	defer server.Close()
+	p := writeProvider(t, server.URL, func(c *github.Config) {
+		c.DisableMarker = true
+		c.DetectViewer = true
+	})
+	if _, err := p.Post(context.Background(), "github", prTarget(), boardsync.OutboundMessage{Markdown: "x"}); err == nil {
+		t.Fatal("Post succeeded without a resolved viewer and without a marker")
+	}
+	if comments != 0 {
+		t.Fatalf("comment endpoint reached %d times", comments)
+	}
+}
+
 func TestViewerFailureIsNotRetriedOnEveryWebhook(t *testing.T) {
 	calls := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -163,18 +200,25 @@ func TestViewerFailureIsNotRetriedOnEveryWebhook(t *testing.T) {
 	}
 }
 
-func TestDeleteAlreadyGoneSucceeds(t *testing.T) {
+func TestDeleteNotFoundDependsOnEndpoint(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
 	}))
 	defer server.Close()
 	p := writeProvider(t, server.URL, nil)
-	thread := boardsync.ThreadRef{Key: "github", Platform: "github", Channel: "acme/www:pulls", Thread: "acme/www:123"}
-	if err := p.Delete(context.Background(), "github", thread, "9001"); err != nil {
-		t.Fatalf("Delete already gone = %v", err)
+	review := boardsync.ThreadRef{
+		Key: "github", Platform: "github", Channel: "acme/www:pulls",
+		Thread: "acme/www:123", Subthread: "acme/www:123:rc:300",
 	}
-	if err := p.Edit(context.Background(), "github", thread, "9001", boardsync.OutboundMessage{Markdown: "new"}); !errors.Is(err, boardsync.ErrNotFound) {
+	if err := p.Delete(context.Background(), "github", review, "9001"); err != nil {
+		t.Fatalf("review comment already gone = %v", err)
+	}
+	issue := boardsync.ThreadRef{Key: "github", Platform: "github", Channel: "acme/www:pulls", Thread: "acme/www:123"}
+	if err := p.Delete(context.Background(), "github", issue, "9001"); !errors.Is(err, boardsync.ErrNotFound) {
+		t.Fatalf("bare thread delete = %v, want ErrNotFound (endpoint is ambiguous)", err)
+	}
+	if err := p.Edit(context.Background(), "github", issue, "9001", boardsync.OutboundMessage{Markdown: "new"}); !errors.Is(err, boardsync.ErrNotFound) {
 		t.Fatalf("Edit missing comment = %v", err)
 	}
 }

@@ -19,6 +19,8 @@ func providerWith(t *testing.T, mutate func(*github.Config)) *github.Provider {
 		WebhookSecret: testSecret,
 		Token:         "ghs_test_token",
 		Repos:         []string{"acme/www"},
+		// A closed loopback port: no test may reach the real api.github.com.
+		APIBaseURL: "http://127.0.0.1:9",
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -332,8 +334,9 @@ func TestWorkflowRunLongNameKeepsBoundedUniqueKey(t *testing.T) {
 			t.Fatalf("label = %s=%s", key, value)
 		}
 	}
-	if len(event.Lifecycle.Owns) != 1 || event.Lifecycle.Owns[0] != "ci.1001-123." {
-		t.Fatalf("owns = %v", event.Lifecycle.Owns)
+	// A CI run owns no prefix: the exact key above is all it may reconcile.
+	if len(event.Lifecycle.Owns) != 0 {
+		t.Fatalf("owns = %v, want none", event.Lifecycle.Owns)
 	}
 }
 
@@ -391,6 +394,16 @@ func TestOwnCommentByBotIdentity(t *testing.T) {
 	loginOnly := providerWith(t, func(c *github.Config) { c.BotLogin = "keel-board[bot]" })
 	if records := receive(t, loginOnly, "issue_comment", body); len(records) != 0 {
 		t.Fatalf("bot-login comment imported: %+v", records)
+	}
+}
+
+func TestOwnMarkerIsFoundAfterForeignMarker(t *testing.T) {
+	body := mutateFixture(t, "pr_comment.json", func(payload map[string]any) {
+		payload["comment"].(map[string]any)["body"] = "<!-- keel-board:sync key=slack message=1 -->\n\n" +
+			"real text\n\n<!-- keel-board:sync key=github message=812 thread=github:acme/www:123 -->"
+	})
+	if records := receive(t, newProvider(t, false), "issue_comment", body); len(records) != 0 {
+		t.Fatalf("foreign-marker prefix bypassed echo detection: %+v", records)
 	}
 }
 

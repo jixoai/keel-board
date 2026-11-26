@@ -22,11 +22,14 @@ import (
 type fakeGitHub struct {
 	server *httptest.Server
 
-	mu        sync.Mutex
-	nextID    int64
-	bodies    map[int64]string
-	comments  int
-	reactions int
+	mu              sync.Mutex
+	nextID          int64
+	bodies          map[int64]string
+	comments        int
+	reactions       int
+	reviewEdits     int
+	reviewDeletes   int
+	reviewReactions int
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -86,6 +89,9 @@ func (f *fakeGitHub) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && len(parts) >= 6 && parts[len(parts)-1] == "reactions":
 		f.mu.Lock()
 		f.reactions++
+		if kind == "pulls" && len(parts) >= 6 && parts[4] == "comments" {
+			f.reviewReactions++
+		}
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"id":1,"content":"+1"}`))
@@ -128,11 +134,17 @@ func (f *fakeGitHub) changeComment(w http.ResponseWriter, r *http.Request, revie
 		_ = json.Unmarshal(data, &body)
 		f.mu.Lock()
 		f.bodies[id] = body.Body
+		if review {
+			f.reviewEdits++
+		}
 		f.mu.Unlock()
 		_, _ = fmt.Fprintf(w, `{"id":%d}`, id)
 	case http.MethodDelete:
 		f.mu.Lock()
 		delete(f.bodies, id)
+		if review {
+			f.reviewDeletes++
+		}
 		f.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -148,6 +160,12 @@ func (f *fakeGitHub) counts() (comments, reactions int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.comments, f.reactions
+}
+
+func (f *fakeGitHub) reviewChanges() (edits, deletes, reactions int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reviewEdits, f.reviewDeletes, f.reviewReactions
 }
 
 func contractProvider(t *testing.T, serverURL string) *github.Provider {
@@ -374,7 +392,8 @@ func TestEndToEndIssueReviewAndCI(t *testing.T) {
 	reviewTarget := prTarget()
 	reviewTarget.Subthread = "acme/www:123:rc:300"
 	message = boardsync.Message{ID: 901, Thread: 901, Channel: "board", Text: "fixed", Actor: "local:user:ada", ActorName: "Ada"}
-	if _, err := runner.Outbound(ctx, entry, boardsync.BoardEvent{Type: boardsync.BoardMessagePosted, Thread: 901}, message, &reviewTarget, ""); err != nil {
+	receipt, err := runner.Outbound(ctx, entry, boardsync.BoardEvent{Type: boardsync.BoardMessagePosted, Thread: 901}, message, &reviewTarget, "")
+	if err != nil {
 		t.Fatalf("review reply: %v", err)
 	}
 	comments, _ := f.counts()
@@ -386,6 +405,29 @@ func TestEndToEndIssueReviewAndCI(t *testing.T) {
 	}
 	if body := f.bodyOf(9301); !strings.Contains(body, "fixed") || !strings.Contains(body, "thread=github:acme/www:123") {
 		t.Fatalf("review reply body = %q", body)
+	}
+	// A host rebuilds the copy target from the receipt. The sub-thread must
+	// survive, or edit/delete/react would hit the issue-comment endpoints.
+	if receipt.Thread.Thread != "acme/www:123" || receipt.Thread.Subthread != "acme/www:123:rc:300" {
+		t.Fatalf("review receipt lost its sub-thread: %+v", receipt.Thread)
+	}
+	copyTarget := boardsync.ResolvedTarget{
+		Key: receipt.Thread.Key, Platform: receipt.Thread.Platform, Channel: receipt.Thread.Channel,
+		Thread: receipt.Thread.Thread, Subthread: receipt.Thread.Subthread, Kind: boardsync.TargetThread,
+	}
+	edited := boardsync.Message{ID: 901, Thread: 901, Channel: "board", Text: "fixed again", Actor: "local:user:ada", ActorName: "Ada"}
+	if _, err := runner.Outbound(ctx, entry, boardsync.BoardEvent{Type: boardsync.BoardMessageEdited, Thread: 901}, edited, &copyTarget, receipt.Message); err != nil {
+		t.Fatalf("review edit: %v", err)
+	}
+	if _, err := runner.Outbound(ctx, entry, boardsync.BoardEvent{Type: boardsync.BoardReactionAdded, Thread: 901, Emoji: "rocket"}, edited, &copyTarget, receipt.Message); err != nil {
+		t.Fatalf("review reaction: %v", err)
+	}
+	if _, err := runner.Outbound(ctx, entry, boardsync.BoardEvent{Type: boardsync.BoardMessageDeleted, Thread: 901}, edited, &copyTarget, receipt.Message); err != nil {
+		t.Fatalf("review delete: %v", err)
+	}
+	edits, deletes, reactions := f.reviewChanges()
+	if edits != 1 || deletes != 1 || reactions != 1 {
+		t.Fatalf("review endpoints = edit %d, delete %d, reaction %d; want 1/1/1", edits, deletes, reactions)
 	}
 }
 

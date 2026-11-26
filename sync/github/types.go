@@ -351,6 +351,13 @@ func parseThread(native string) (threadInfo, error) {
 	}
 	if match[5] != "" {
 		info.ReviewID, _ = strconv.ParseInt(match[5], 10, 64)
+		if info.ReviewID <= 0 {
+			return threadInfo{}, fmt.Errorf("%w: github review comment ID: %s", boardsync.ErrBadRequest, match[5])
+		}
+		// Issues have no review threads; only a pull request does.
+		if info.Issue {
+			return threadInfo{}, fmt.Errorf("%w: an issue has no review sub-thread: %s", boardsync.ErrBadRequest, native)
+		}
 	}
 	return info, nil
 }
@@ -539,13 +546,15 @@ func boundedKey(prefix, slug string) string {
 
 // Client is GitHub's REST client. It is the only place the token is revealed.
 type Client struct {
-	baseURL string
-	doer    Doer
-	token   boardsync.Secret
+	baseURL  string
+	doer     Doer
+	token    boardsync.Secret
+	setupErr error
 }
 
 // NewClient returns a REST client. baseURL may be empty; a nil doer uses a
-// default http.Client.
+// default http.Client. A direct caller gets a base-URL validation error on its
+// first call, matching Provider.New's configuration checks.
 func NewClient(baseURL string, doer Doer, token boardsync.Secret) *Client {
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
@@ -553,7 +562,11 @@ func NewClient(baseURL string, doer Doer, token boardsync.Secret) *Client {
 	if doer == nil {
 		doer = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), doer: doer, token: token}
+	client := &Client{baseURL: strings.TrimRight(baseURL, "/"), doer: doer, token: token}
+	if err := validateAPIBaseURL(baseURL); err != nil {
+		client.setupErr = err
+	}
+	return client
 }
 
 type commentResponse struct {
@@ -581,6 +594,9 @@ func (e *RateLimitError) Error() string {
 func (e *RateLimitError) Unwrap() error { return boardsync.ErrRateLimited }
 
 func (c *Client) call(ctx context.Context, method, path string, input, output any) error {
+	if c.setupErr != nil {
+		return c.setupErr
+	}
 	if c.token.Empty() {
 		return fmt.Errorf("%w: github token is unset", boardsync.ErrUnauthorized)
 	}

@@ -79,6 +79,19 @@ func TestMarkerRoundTrip(t *testing.T) {
 	if _, ok := boardsync.ParseMarker("<!-- keel-board:sync key= -->"); ok {
 		t.Fatal("parsed a marker with no key")
 	}
+	// A foreign marker before ours must not hide ours: echo detection scans
+	// every marker, not just the first valid one.
+	trap := "<!-- keel-board:sync key=slack message=1 -->\n\n" +
+		"real text\n\n<!-- keel-board:sync key=github message=2 -->"
+	if !boardsync.HasOwnMarker(trap, "github") {
+		t.Fatal("HasOwnMarker missed a later own marker")
+	}
+	if !boardsync.IsOwnMarker(trap, "github") {
+		t.Fatal("IsOwnMarker missed a later own marker")
+	}
+	if boardsync.HasOwnMarker(trap, "linear") {
+		t.Fatal("HasOwnMarker matched a key that isn't there")
+	}
 }
 
 func TestMemoryDedupe(t *testing.T) {

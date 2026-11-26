@@ -124,6 +124,26 @@ func (p *Provider) viewer() (id int64, login string, known bool) {
 	return p.viewerUser.ID, p.viewerUser.Login, p.viewerKnown
 }
 
+// requireEchoGuard refuses to write when neither the hidden marker nor a bot
+// identity can suppress the platform echo. A deployment that disables markers
+// must configure BotUserID/BotLogin or DetectViewer; if viewer detection fails,
+// sending is refused rather than risking an import loop.
+func (p *Provider) requireEchoGuard(ctx context.Context) error {
+	if !p.cfg.DisableMarker {
+		return nil
+	}
+	if p.cfg.BotUserID != 0 || p.cfg.BotLogin != "" {
+		return nil
+	}
+	if !p.cfg.DetectViewer {
+		return fmt.Errorf("%w: github outbound needs a marker or a bot identity", boardsync.ErrUnsupported)
+	}
+	if _, err := p.Viewer(ctx); err != nil {
+		return fmt.Errorf("github can't establish its own identity and the marker is disabled: %w", err)
+	}
+	return nil
+}
+
 // ResolveChannel accepts "owner/repo", "owner/repo:pulls", or
 // "owner/repo:issues". A bare repo resolves to its pulls channel, which is
 // only useful for routing; GitHub can't start a thread there.
@@ -196,6 +216,9 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	}
 	if target.Key != key {
 		return boardsync.Posted{}, fmt.Errorf("%w: target belongs to %q", boardsync.ErrBadRequest, target.Key)
+	}
+	if err := p.requireEchoGuard(ctx); err != nil {
+		return boardsync.Posted{}, err
 	}
 	if len(msg.Files) > 0 {
 		return boardsync.Posted{}, fmt.Errorf("%w: github comment files are not implemented", boardsync.ErrUnsupported)
@@ -274,6 +297,9 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 	if err != nil {
 		return err
 	}
+	if err := p.requireEchoGuard(ctx); err != nil {
+		return err
+	}
 	if len(msg.Files) > 0 {
 		return fmt.Errorf("%w: github comments carry no files", boardsync.ErrUnsupported)
 	}
@@ -287,8 +313,11 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 	return p.client.UpdateIssueComment(ctx, info.Full, commentID, body)
 }
 
-// Delete deletes a delivered comment. A comment that is already gone is a
-// success: the board's goal is that it no longer exists.
+// Delete deletes a delivered comment. A review comment that is already gone is
+// a success: the explicit sub-thread says which endpoint owns it. A bare thread
+// is ambiguous when a receipt lost its sub-thread (an issue comment and a
+// review comment both look like `repo:number`), so a 404 there is returned
+// instead of being recorded as a false success.
 func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string) error {
 	info, commentID, err := p.commentWhere(key, thread, message)
 	if err != nil {
@@ -299,7 +328,7 @@ func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsy
 	} else {
 		err = p.client.DeleteIssueComment(ctx, info.Full, commentID)
 	}
-	if errors.Is(err, boardsync.ErrNotFound) {
+	if errors.Is(err, boardsync.ErrNotFound) && info.ReviewID != 0 {
 		return nil
 	}
 	return err
