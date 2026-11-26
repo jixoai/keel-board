@@ -846,7 +846,8 @@ Recommended shape, matching the repository layout:
    `OutboundWorker` drains it and calls `Runner.OutboundWithOptions` with a
    `CopySink` that persists the copy after the provider succeeds and before
    `Host.Record`. A receipt retry therefore finds the copy and doesn't post
-   again. A `SaveCopy` failure still leaves the narrow provider-success-to-
+   again; it rebuilds the copy target from the stored copy, including a review
+   sub-thread. A `SaveCopy` failure still leaves the narrow provider-success-to-
    copy-commit window in which a retry can duplicate a platform post; a host
    that needs exactness must make its platform call idempotent or persist the
    copy in the same durable step. Record receipts and failures through
