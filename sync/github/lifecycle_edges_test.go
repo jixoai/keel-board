@@ -112,6 +112,20 @@ func TestReviewChangesRequested(t *testing.T) {
 	}
 }
 
+func TestLabelValuesAreSanitized(t *testing.T) {
+	body := mutateFixture(t, "pr_opened.json", func(payload map[string]any) {
+		payload["pull_request"].(map[string]any)["labels"] = []any{map[string]any{"name": "bad\nlabel\x00"}}
+	})
+	event := receive(t, newProvider(t, false), "pull_request", body)[0].Event
+	value, ok := event.Lifecycle.Labels["tag.bad-label"]
+	if !ok {
+		t.Fatalf("labels = %+v", event.Lifecycle.Labels)
+	}
+	if strings.ContainsRune(value, 0) || strings.ContainsAny(value, "\n\r\t") {
+		t.Fatalf("label value still has control characters: %q", value)
+	}
+}
+
 func TestCommentReviewDoesNotChangeReviewLabel(t *testing.T) {
 	body := mutateFixture(t, "review_approved.json", func(payload map[string]any) {
 		payload["review"].(map[string]any)["state"] = "commented"

@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -434,16 +435,32 @@ func tagLabels(labels []label, assignees []user) map[string]string {
 	for _, l := range labels {
 		key := slug(l.Name)
 		if key != "" {
-			out["tag."+key] = l.Name
+			out["tag."+key] = labelValue(l.Name)
 		}
 	}
 	for _, a := range assignees {
 		key := slug(a.Login)
 		if key != "" {
-			out["assignee."+key] = a.Login
+			out["assignee."+key] = labelValue(a.Login)
 		}
 	}
 	return out
+}
+
+// labelValue keeps a platform label or login inside the board's label rules:
+// valid UTF-8, no NUL, no control characters, at most 256 characters.
+func labelValue(name string) string {
+	name = boardsync.StorableText(name, 1024)
+	name = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, name)
+	if runes := []rune(name); len(runes) > 256 {
+		name = string(runes[:256])
+	}
+	return strings.TrimSpace(name)
 }
 
 func ownedBy(labels []label, assignees []user) []string {
