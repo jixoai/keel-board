@@ -984,6 +984,12 @@ Recorded in `docs/PORTING.md` as well:
   not).
 * Cross-process key ownership: `Owned` is explicit configuration, not a lease.
   A second process must not be configured with the same key.
+* Platform root recovery: a reply on a thread the board hasn't mapped is a
+  new root built from the reply when an import channel is given, rather than a
+  `RootFetcher` read of the platform's real root. `FetchRoot` is not called.
+* Chat SDK identity: the bridge defines no bot identity, so echo suppression
+  there relies on the marker. A platform that strips HTML comments should not
+  mirror a channel through the generic bridge without an identity hook.
 * Full lifecycle reconciliation: labels and a reply are imported, and a root
   can be created, but `Owns` prefixes, review conversations, and issue moves
   are not reconciled.
