@@ -29,6 +29,9 @@ type Config struct {
 	// imported back. Either is enough; both are safest.
 	BotUserID string
 	BotID     string
+	// TeamID pins this entry to one Slack workspace. A webhook carrying
+	// another team is refused even if the signing secret verifies.
+	TeamID string
 	// APIBaseURL defaults to https://slack.com/api; tests point it at httptest.
 	APIBaseURL string
 	HTTPClient *http.Client
@@ -64,6 +67,9 @@ func (c Config) Validate() error {
 	}
 	if c.BotUserID != "" && !isUserID(c.BotUserID) {
 		return fmt.Errorf("%w: slack bot user ID %q isn't a user ID", boardsync.ErrBadRequest, c.BotUserID)
+	}
+	if c.BotUserID == "" && c.BotID == "" {
+		return fmt.Errorf("%w: slack needs BotUserID or BotID to skip its own posts", boardsync.ErrBadRequest)
 	}
 	if c.APIBaseURL != "" {
 		parsed, err := url.Parse(c.APIBaseURL)
@@ -205,6 +211,26 @@ func (e *APIError) Error() string {
 
 func (e *APIError) Unwrap() error { return e.Err }
 
+// RateLimitError is a Slack rate-limit answer with its Retry-After, kept
+// structured so a caller can wait before asking again.
+type RateLimitError struct {
+	Method     string
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("%s: slack %s rate-limited (retry after %s)", boardsync.ErrRateLimited, e.Method, e.RetryAfter)
+	}
+	return fmt.Sprintf("%s: slack %s rate-limited", boardsync.ErrRateLimited, e.Method)
+}
+
+func (e *RateLimitError) Unwrap() error { return boardsync.ErrRateLimited }
+
+func rateLimitError(method string, header http.Header) *RateLimitError {
+	return &RateLimitError{Method: method, RetryAfter: time.Duration(boardsync.RetryAfter(header)) * time.Second}
+}
+
 // fileRefusals are Slack's answers that mean "no files from this app", not
 // "try again". They differ from a transport failure, where the app may have
 // shared the file already.
@@ -277,10 +303,7 @@ func (c *Client) apiClient() *http.Client {
 func httpStatusError(method string, response *http.Response) error {
 	switch {
 	case response.StatusCode == http.StatusTooManyRequests:
-		if after := boardsync.RetryAfter(response.Header); after > 0 {
-			return fmt.Errorf("%w: slack %s rate-limited (retry after %ds)", boardsync.ErrRateLimited, method, after)
-		}
-		return fmt.Errorf("%w: slack %s rate-limited", boardsync.ErrRateLimited, method)
+		return rateLimitError(method, response.Header)
 	case response.StatusCode == http.StatusUnauthorized:
 		return fmt.Errorf("%w: slack %s answered HTTP 401", boardsync.ErrUnauthorized, method)
 	case response.StatusCode == http.StatusForbidden:
@@ -314,7 +337,7 @@ func slackAPIError(method, code string) error {
 	case code == "channel_not_found" || code == "message_not_found" || code == "thread_not_found" || code == "user_not_found" || code == "file_not_found":
 		apiErr.Err = boardsync.ErrNotFound
 	case code == "ratelimited":
-		apiErr.Err = boardsync.ErrRateLimited
+		apiErr.Err = &RateLimitError{Method: method}
 	case fileRefusals[code] && strings.HasPrefix(method, "files."):
 		apiErr.Err = fmt.Errorf("%w: %w", boardsync.ErrUnsupported, ErrFileRefused)
 	case code == "not_in_channel" || code == "is_archived" || code == "restricted_action" || code == "cannot_reply_to_message" ||
@@ -364,10 +387,15 @@ func (c *Client) ListChannels(ctx context.Context) ([]Channel, error) {
 	return c.listChannels(ctx, "public_channel")
 }
 
+const maxListPages = 64
+
 func (c *Client) listChannels(ctx context.Context, types string) ([]Channel, error) {
 	var channels []Channel
 	cursor := ""
-	for {
+	for page := 0; ; page++ {
+		if page >= maxListPages {
+			return nil, fmt.Errorf("slack conversations.list didn't finish after %d pages", maxListPages)
+		}
 		form := url.Values{"types": {types}, "exclude_archived": {"true"}, "limit": {"1000"}}
 		if cursor != "" {
 			form.Set("cursor", cursor)

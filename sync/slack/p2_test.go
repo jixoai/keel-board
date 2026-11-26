@@ -1,0 +1,248 @@
+package slack_test
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	boardsync "github.com/jixoai/keel-board/sync"
+	"github.com/jixoai/keel-board/sync/slack"
+)
+
+func TestReceiveTeamAllowlist(t *testing.T) {
+	p, err := slack.New(slack.Config{
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
+		BotUserID: "UAPP123", TeamID: "T0123ABC", Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fixture(t, "message.json")
+	if intake := receive(t, p, body); len(intake.Records) != 1 {
+		t.Fatalf("records = %+v", intake.Records)
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	envelope["team_id"] = "T999XYZ"
+	mutated, _ := json.Marshal(envelope)
+	if _, err := p.Receive(context.Background(), "slack", signedRequest(t, mutated)); !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("other team = %v", err)
+	}
+	delete(envelope, "team_id")
+	mutated, _ = json.Marshal(envelope)
+	if _, err := p.Receive(context.Background(), "slack", signedRequest(t, mutated)); !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("missing team = %v", err)
+	}
+}
+
+func TestReceiveKeyMismatch(t *testing.T) {
+	if _, err := provider(t).Receive(context.Background(), "other", signedRequest(t, fixture(t, "message.json"))); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("Receive = %v", err)
+	}
+}
+
+func TestBotIdentityRequired(t *testing.T) {
+	if _, err := slack.New(slack.Config{
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, Now: now,
+	}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("New = %v", err)
+	}
+}
+
+func TestReceiveEditWithoutIdentity(t *testing.T) {
+	var body map[string]any
+	if err := json.Unmarshal(fixture(t, "message_changed.json"), &body); err != nil {
+		t.Fatal(err)
+	}
+	delete(body, "event_id")
+	message := body["event"].(map[string]any)["message"].(map[string]any)
+	delete(message, "edited")
+	event := body["event"].(map[string]any)
+	delete(event, "event_ts")
+	data, _ := json.Marshal(body)
+	if _, err := provider(t).Receive(context.Background(), "slack", signedRequest(t, data)); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("Receive = %v", err)
+	}
+}
+
+func TestChannelListPageCap(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"ok":true,"channels":[],"response_metadata":{"next_cursor":"more"}}`))
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	if _, err := p.ResolveChannel(context.Background(), "slack", "#general"); err == nil {
+		t.Fatal("a never-ending listing was accepted")
+	}
+	if calls.Load() != 64 {
+		t.Fatalf("calls = %d, want 64", calls.Load())
+	}
+}
+
+func TestResolveTargetRejectsDM(t *testing.T) {
+	p := newProvider(t, "http://127.0.0.1:1", nil, nil)
+	if _, err := p.ResolveTarget(context.Background(), "slack", "D0123ABC"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("DM target = %v", err)
+	}
+}
+
+func TestReadSourceRejectsMPIM(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"channel":{"id":"G0123ABC","name":"group","is_member":true,"is_mpim":true}}`))
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 10); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("ReadSource = %v", err)
+	}
+}
+
+func TestResolveTargetUsesNameCache(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"ok":true,"channels":[{"id":"C0123ABC","name":"general","is_member":true}]}`))
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	for i := 0; i < 2; i++ {
+		target, err := p.ResolveTarget(context.Background(), "slack", "#general")
+		if err != nil || target.Channel != "C0123ABC" || target.Kind != boardsync.TargetChannel {
+			t.Fatalf("ResolveTarget = %+v, %v", target, err)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("list calls = %d, want the cached first listing", calls.Load())
+	}
+}
+
+func TestFetchRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.replies":
+			_ = r.ParseForm()
+			if r.PostForm.Get("ts") != "1727000000.123456" {
+				t.Fatalf("ts = %q", r.PostForm.Get("ts"))
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1727000000.123456","user":"U0456ABC","text":"root <@U0999XYZ>"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	root, err := p.FetchRoot(context.Background(), "slack", "C0123ABC:1727000000.123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Text != "root @[slack:user:U0999XYZ]" || root.Author.ID != "slack:user:U0456ABC" {
+		t.Fatalf("root = %+v", root)
+	}
+	if _, err := p.FetchRoot(context.Background(), "slack", "C0123ABC:bad"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("bad root = %v", err)
+	}
+}
+
+func TestAPIRejectsRedirect(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{Markdown: "x"}); err == nil {
+		t.Fatal("a redirect was followed")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d", calls.Load())
+	}
+}
+
+func TestRetryAfterIsStructured(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	_, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{Markdown: "x"})
+	var rate *slack.RateLimitError
+	if !errors.As(err, &rate) || rate.RetryAfter != 7*time.Second || !errors.Is(err, boardsync.ErrRateLimited) {
+		t.Fatalf("err = %v, rate = %+v", err, rate)
+	}
+}
+
+func TestEditRejectsEmptyText(t *testing.T) {
+	p := newProvider(t, "http://127.0.0.1:1", nil, nil)
+	thread := boardsync.ThreadRef{Key: "slack", Platform: "slack", Channel: "C0123ABC", Thread: "C0123ABC:1727000000.123456"}
+	if err := p.Edit(context.Background(), "slack", thread, "1727000000.123456", boardsync.OutboundMessage{Markdown: "   "}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("Edit = %v", err)
+	}
+}
+
+func TestFilesReadMissingPostsTextFirst(t *testing.T) {
+	var order []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/auth.test":
+			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["chat:write"]}}`))
+		case "/chat.postMessage":
+			order = append(order, "post")
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
+		case "/files.getUploadURLExternal":
+			order = append(order, "url")
+			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
+		case "/upload/v1/abc":
+			order = append(order, "upload")
+			_, _ = w.Write([]byte(`OK`))
+		case "/files.completeUploadExternal":
+			order = append(order, "complete")
+			_ = r.ParseForm()
+			if r.PostForm.Get("thread_ts") != "1727000009.000100" {
+				t.Fatalf("thread_ts = %q", r.PostForm.Get("thread_ts"))
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, nil)
+	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Markdown: "see attached",
+		Files:    []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(order, ",") != "post,url,upload,complete" {
+		t.Fatalf("order = %v", order)
+	}
+	if posted.Message != "1727000009.000100" || len(posted.Files) != 1 {
+		t.Fatalf("posted = %+v", posted)
+	}
+}
+
+func TestReceiveCleansFormatCharacters(t *testing.T) {
+	var body map[string]any
+	if err := json.Unmarshal(fixture(t, "message.json"), &body); err != nil {
+		t.Fatal(err)
+	}
+	body["event"].(map[string]any)["text"] = "a\u200bb\u202ec\u200dd"
+	data, _ := json.Marshal(body)
+	text := receive(t, provider(t), data).Records[0].Event.Text
+	if text != "abc\u200dd" {
+		t.Fatalf("text = %q", text)
+	}
+}

@@ -41,6 +41,8 @@ type fakeSlack struct {
 	statuses []string
 	next     int
 	fileNext int
+	eventSeq int
+	webhooks [][]byte
 	joined   map[string]bool
 	member   map[string]bool
 }
@@ -76,6 +78,37 @@ func (f *fakeSlack) add(message *fakeMessage) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.messages[message.Channel] = append(f.messages[message.Channel], message)
+}
+
+// emit queues the signed webhook Slack would send for an outbound change.
+// Drain feeds them back through Receive, proving the echo path end to end.
+func (f *fakeSlack) emit(event map[string]any) {
+	f.eventSeq++
+	body, err := json.Marshal(map[string]any{
+		"type": "event_callback", "team_id": "T0123ABC", "api_app_id": "A0123ABC",
+		"event_id": fmt.Sprintf("EvFake%d", f.eventSeq), "event_time": 1727001000,
+		"event": event,
+	})
+	if err == nil {
+		f.webhooks = append(f.webhooks, body)
+	}
+}
+
+func (f *fakeSlack) drainWebhooks(t *testing.T, p *slack.Provider) []boardsync.Record {
+	t.Helper()
+	f.mu.Lock()
+	bodies := f.webhooks
+	f.webhooks = nil
+	f.mu.Unlock()
+	var records []boardsync.Record
+	for _, body := range bodies {
+		intake, err := p.Receive(context.Background(), "slack", signedRequest(t, body))
+		if err != nil {
+			t.Fatalf("loopback Receive: %v", err)
+		}
+		records = append(records, intake.Records...)
+	}
+	return records
 }
 
 func (f *fakeSlack) find(channel, ts string) *fakeMessage {
@@ -141,10 +174,15 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		channel := r.PostForm.Get("channel")
 		ts := f.nextTS()
 		threadTS := r.PostForm.Get("thread_ts")
-		f.messages[channel] = append(f.messages[channel], &fakeMessage{
+		posted := &fakeMessage{
 			TS: ts, Channel: channel, ThreadTS: threadTS, User: "UAPP123",
 			Text: r.PostForm.Get("text"), Username: r.PostForm.Get("username"),
 			Reactions: map[string]bool{},
+		}
+		f.messages[channel] = append(f.messages[channel], posted)
+		f.emit(map[string]any{
+			"type": "message", "channel": channel, "user": "UAPP123", "text": posted.Text,
+			"ts": ts, "thread_ts": threadTS, "event_ts": ts,
 		})
 		_, _ = w.Write([]byte(`{"ok":true,"ts":"` + ts + `"}`))
 	case "/chat.update":
@@ -153,7 +191,16 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"ok":false,"error":"message_not_found"}`))
 			return
 		}
+		previous := message.Text
 		message.Text = r.PostForm.Get("text")
+		f.emit(map[string]any{
+			"type": "message", "subtype": "message_changed", "channel": message.Channel,
+			"message": map[string]any{
+				"type": "message", "user": "UAPP123", "text": message.Text, "ts": message.TS,
+				"thread_ts": message.ThreadTS, "edited": map[string]any{"user": "UAPP123", "ts": "1727002000.000000"},
+			},
+			"previous_message": map[string]any{"type": "message", "user": "UAPP123", "text": previous, "ts": message.TS},
+		})
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case "/chat.delete":
 		message := f.find(r.PostForm.Get("channel"), r.PostForm.Get("ts"))
@@ -162,6 +209,10 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		message.Deleted = true
+		f.emit(map[string]any{
+			"type": "message", "subtype": "message_deleted", "channel": message.Channel, "deleted_ts": message.TS,
+			"previous_message": map[string]any{"type": "message", "user": "UAPP123", "text": message.Text, "ts": message.TS, "thread_ts": message.ThreadTS},
+		})
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case "/reactions.add", "/reactions.remove":
 		message := f.find(r.PostForm.Get("channel"), r.PostForm.Get("timestamp"))
@@ -173,6 +224,15 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 			message.Reactions = map[string]bool{}
 		}
 		message.Reactions[r.PostForm.Get("name")] = r.URL.Path == "/reactions.add"
+		kind := "reaction_removed"
+		if r.URL.Path == "/reactions.add" {
+			kind = "reaction_added"
+		}
+		f.emit(map[string]any{
+			"type": kind, "user": "UAPP123", "reaction": r.PostForm.Get("name"),
+			"item":     map[string]any{"type": "message", "channel": message.Channel, "ts": message.TS},
+			"event_ts": "1727002001.000000",
+		})
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	case "/files.getUploadURLExternal":
 		f.fileNext++
@@ -191,6 +251,11 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		f.messages[channel] = append(f.messages[channel], &fakeMessage{
 			TS: ts, Channel: channel, ThreadTS: r.PostForm.Get("thread_ts"), User: "UAPP123",
 			Text: r.PostForm.Get("initial_comment"), Reactions: map[string]bool{},
+		})
+		f.emit(map[string]any{
+			"type": "message", "subtype": "file_share", "channel": channel, "user": "UAPP123",
+			"text": r.PostForm.Get("initial_comment"), "ts": ts, "thread_ts": r.PostForm.Get("thread_ts"),
+			"event_ts": ts, "files": []map[string]any{{"id": refs[0].ID, "name": "upload.bin", "size": 1}},
 		})
 		ids := make([]map[string]string, 0, len(refs))
 		for _, ref := range refs {
@@ -465,4 +530,16 @@ func TestSlackEndToEnd(t *testing.T) {
 		t.Fatal("join did not reach Slack")
 	}
 	fake.mu.Unlock()
+
+	// Every outbound change came back as a signed webhook. The app authored
+	// all of them, so the adapter must import none.
+	fake.mu.Lock()
+	queued := len(fake.webhooks)
+	fake.mu.Unlock()
+	if queued == 0 {
+		t.Fatal("fake produced no signed webhooks; the loopback was not exercised")
+	}
+	if echoes := fake.drainWebhooks(t, p); len(echoes) != 0 {
+		t.Fatalf("own webhooks looped back: %+v", echoes)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -25,17 +26,51 @@ func outboundText(markdown string) string {
 	return boardsync.StorableText(cleanText(markdown), maxOutboundText)
 }
 
-// withNotes appends the file lines a message carries when a file could not
-// come over. A file-only message is just its notes.
-func withNotes(text string, notes []string) string {
-	if len(notes) == 0 {
+// slackControlEscaper neutralizes Slack's control markup: a cross-platform
+// message cannot ping a channel, mention someone, or disguise a link.
+var slackControlEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+
+// escapeSlackText makes text inert in Slack's mrkdwn. Slack shows the
+// entities as the characters they replace without interpreting them.
+func escapeSlackText(text string) string {
+	return slackControlEscaper.Replace(text)
+}
+
+// renderBody prepares what Slack receives. Text from another platform is
+// escaped, so raw <!channel>, <@U…>, and <url|label> stay literal; only an
+// explicit board mention under this entry's key becomes a Slack mention. File
+// notes are always escaped because their names are untrusted too.
+func (p *Provider) renderBody(rawText string, notes []string, external bool, key boardsync.Key, label string) string {
+	text := outboundText(rawText)
+	if label != "" {
+		text = withoutLabel(text, label)
+	}
+	if external {
+		text = escapeSlackText(text)
+	}
+	text = restoreMentions(text, key)
+	if len(notes) > 0 {
+		// Notes are system-generated around an untrusted file name. They
+		// never carry mentions, even if the name looks like one.
+		escaped := escapeSlackText(strings.Join(notes, "\n"))
+		if text == "" {
+			text = escaped
+		} else {
+			text += "\n\n" + escaped
+		}
+	}
+	return text
+}
+
+// restoreMentions turns the board's explicit mention token for this entry
+// into Slack's own mention. A user ID from another workspace's key stays
+// text: this adapter's token cannot speak for it.
+func restoreMentions(text string, key boardsync.Key) string {
+	if key == "" || !strings.Contains(text, "@[") {
 		return text
 	}
-	lines := strings.Join(notes, "\n")
-	if text == "" {
-		return lines
-	}
-	return text + "\n\n" + lines
+	pattern := regexp.MustCompile(`@\[` + regexp.QuoteMeta(string(key)) + `:user:([UW][A-Z0-9_]+)\]`)
+	return pattern.ReplaceAllString(text, "<@$1>")
 }
 
 // withoutLabel removes the "**name**: " a rendered message opens with, for a
@@ -66,14 +101,14 @@ func (p *Provider) senderFields(ctx context.Context, sender *boardsync.Sender) (
 // the attribution wouldn't fit, so the message goes as the app with its
 // label.
 func slackUsername(sender *boardsync.Sender) (string, bool) {
-	name := strings.TrimSpace(sender.Name)
+	name := cleanText(strings.TrimSpace(sender.Name))
 	if name == "" {
 		return "", false
 	}
 	if utf8.RuneCountInString(name) <= 80 {
 		return name, true
 	}
-	attribution := sender.Attribution
+	attribution := cleanText(sender.Attribution)
 	room := 80 - utf8.RuneCountInString(attribution) - 1
 	if room < 1 {
 		return "", false
@@ -305,13 +340,32 @@ func (c *Client) SetAssistantStatus(ctx context.Context, channel, threadTS, stat
 	return c.call(ctx, "assistant.threads.setStatus", form, nil)
 }
 
-// reactionName accepts Slack's reaction names: a word of letters, digits,
-// "_", "+", and "-", optionally with a skin-tone suffix. Colons around a
-// name are Slack's own decoration, not part of it.
+// canonicalReactions maps the board's canonical reaction names to the
+// emoji Slack recognizes. A name already in Slack's form passes through.
+var canonicalReactions = map[string]string{
+	"thumbs_up":   "thumbsup",
+	"thumbs_down": "thumbsdown",
+	"check":       "white_check_mark",
+}
+
+// reactionName accepts a canonical or Slack reaction name, keeping a
+// skin-tone suffix. Colons around a name are Slack's own decoration.
 func reactionName(name string) (string, bool) {
 	name = strings.Trim(strings.TrimSpace(name), ":")
 	if name == "" || len(name) > 100 {
 		return "", false
+	}
+	base, suffix := name, ""
+	if before, after, found := strings.Cut(name, "::"); found {
+		base, suffix = before, after
+	}
+	if canonical, ok := canonicalReactions[base]; ok {
+		base = canonical
+	}
+	if suffix != "" {
+		name = base + "::" + suffix
+	} else {
+		name = base
 	}
 	pattern := regexp.MustCompile(`^[A-Za-z0-9_+\-]+(?:::[A-Za-z0-9_+\-]+)?$`)
 	if !pattern.MatchString(name) {
@@ -353,34 +407,83 @@ func (p *Provider) UploadFiles(ctx context.Context, key boardsync.Key, thread bo
 	if len(plan.files) == 0 {
 		return nil, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
 	}
-	return p.uploadFiles(ctx, thread.Channel, threadTS, "", plan.files)
+	ids, _, err := p.uploadFiles(ctx, thread.Channel, threadTS, "", plan.files)
+	return ids, err
 }
 
-// uploadFiles uploads files and shares them in one message. It does not wait
-// for the message Slack makes; callers that need its ts poll after.
-func (p *Provider) uploadFiles(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) ([]string, error) {
+// fileUploadAttempts bounds the retries of the steps before Slack shares the
+// files. A 5xx or 429 gets another try; a refusal does not.
+const fileUploadAttempts = 3
+
+// retryFile runs fn while allow accepts the error. The delay is short: an
+// upload holds a board delivery, and the outbox is the longer retry.
+func (p *Provider) retryFile(ctx context.Context, fn func() error, allow func(error) bool) error {
+	var err error
+	for attempt := 0; attempt < fileUploadAttempts; attempt++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		if !allow(err) || attempt+1 == fileUploadAttempts {
+			return err
+		}
+		if waitErr := p.cfg.sleep(ctx, time.Duration(100*(1<<attempt))*time.Millisecond); waitErr != nil {
+			return waitErr
+		}
+	}
+	return err
+}
+
+func retryableFileError(err error) bool {
+	return !boardsync.IsPermanent(err)
+}
+
+// uploadFiles uploads files and shares them in one message. shares holds the
+// message ts Slack reported; callers may still need a files.info read when
+// Slack omitted it.
+func (p *Provider) uploadFiles(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) ([]string, map[string]string, error) {
 	refs := make([]UploadFileRef, 0, len(files))
 	for _, file := range files {
 		name := uploadFilename(file.Filename, file.MIMEType)
-		uploadURL, fileID, err := p.client.GetUploadURLExternal(ctx, name, int64(len(file.Data)))
+		var uploadURL, fileID string
+		err := p.retryFile(ctx, func() error {
+			var callErr error
+			uploadURL, fileID, callErr = p.client.GetUploadURLExternal(ctx, name, int64(len(file.Data)))
+			return callErr
+		}, retryableFileError)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := p.client.UploadExternal(ctx, uploadURL, name, file.Data); err != nil {
-			return nil, err
+		if err := p.retryFile(ctx, func() error {
+			return p.client.UploadExternal(ctx, uploadURL, name, file.Data)
+		}, retryableFileError); err != nil {
+			return nil, nil, err
 		}
 		refs = append(refs, UploadFileRef{ID: fileID, Title: name})
 	}
-	return p.client.CompleteUploadExternal(ctx, refs, channel, threadTS, comment)
+	var result CompleteUploadResult
+	// Completing twice could share the files twice; only a rate limit is
+	// retried, where Slack refused before doing the work.
+	err := p.retryFile(ctx, func() error {
+		var callErr error
+		result, callErr = p.client.CompleteUploadExternalShares(ctx, refs, channel, threadTS, comment)
+		return callErr
+	}, func(err error) bool { return errors.Is(err, boardsync.ErrRateLimited) })
+	if err != nil {
+		return nil, nil, err
+	}
+	return result.IDs, result.Shares, nil
 }
 
 // uploadAndShare uploads files and finds the message Slack made for them.
 // shared says the files reached Slack; a later failure then must not be
 // mistaken for a refusal and re-post the text.
 func (p *Provider) uploadAndShare(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) (ids []string, ts string, shared bool, err error) {
-	ids, err = p.uploadFiles(ctx, channel, threadTS, comment, files)
+	ids, shares, err := p.uploadFiles(ctx, channel, threadTS, comment, files)
 	if err != nil {
 		return nil, "", false, err
+	}
+	if found := shares[channel]; found != "" {
+		return ids, found, true, nil
 	}
 	ts, err = p.findShare(ctx, channel, ids[0])
 	if err != nil {
@@ -389,16 +492,16 @@ func (p *Provider) uploadAndShare(ctx context.Context, channel, threadTS, commen
 	return ids, ts, true, nil
 }
 
-// attachmentList is the plain text a message with no text gets when its files
-// go as a second message: the reader still sees what came.
-func attachmentList(files []boardsync.OutboundFile) string {
-	lines := make([]string, 0, len(files))
+// attachmentNotes says what a file-only message carried when its files go as
+// a second message. The names stay untrusted and are escaped by renderBody.
+func attachmentNotes(files []boardsync.OutboundFile) []string {
+	notes := make([]string, 0, len(files))
 	for _, file := range files {
 		name := cleanText(file.Filename)
 		if name == "" {
 			name = "file"
 		}
-		lines = append(lines, fmt.Sprintf("📎 %s (%s)", name, humanBytes(int64(len(file.Data)))))
+		notes = append(notes, fmt.Sprintf("📎 %s (%s)", name, humanBytes(int64(len(file.Data)))))
 	}
-	return strings.Join(lines, "\n")
+	return notes
 }

@@ -76,7 +76,7 @@ func (c *Client) UploadExternal(ctx context.Context, uploadURL, filename string,
 	request.Header.Set("Content-Type", writer.FormDataContentType())
 	response, err := c.fileClient().Do(request)
 	if err != nil {
-		return boardsync.RedactError(err, c.token)
+		return boardsync.RedactError(err, boardsync.Secret(uploadURL), c.token)
 	}
 	defer response.Body.Close()
 	if err := httpStatusError("files.upload", response); err != nil {
@@ -86,17 +86,32 @@ func (c *Client) UploadExternal(ctx context.Context, uploadURL, filename string,
 	return nil
 }
 
+// CompleteUploadResult is Slack's answer to files.completeUploadExternal:
+// the file IDs and the message ts each channel holds them under, when Slack
+// includes the shares.
+type CompleteUploadResult struct {
+	IDs    []string
+	Shares map[string]string
+}
+
 // CompleteUploadExternal shares uploaded files in a channel or thread.
 func (c *Client) CompleteUploadExternal(ctx context.Context, files []UploadFileRef, channelID, threadTS, comment string) ([]string, error) {
+	result, err := c.CompleteUploadExternalShares(ctx, files, channelID, threadTS, comment)
+	return result.IDs, err
+}
+
+// CompleteUploadExternalShares shares files and keeps the shares Slack
+// returns, so the caller does not need a second files.info read.
+func (c *Client) CompleteUploadExternalShares(ctx context.Context, files []UploadFileRef, channelID, threadTS, comment string) (CompleteUploadResult, error) {
 	if len(files) == 0 {
-		return nil, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
+		return CompleteUploadResult{}, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
 	}
 	if channelID == "" {
-		return nil, fmt.Errorf("%w: slack upload has no channel", boardsync.ErrBadRequest)
+		return CompleteUploadResult{}, fmt.Errorf("%w: slack upload has no channel", boardsync.ErrBadRequest)
 	}
 	payload, err := json.Marshal(files)
 	if err != nil {
-		return nil, err
+		return CompleteUploadResult{}, err
 	}
 	form := url.Values{
 		"files":      {string(payload)},
@@ -111,22 +126,35 @@ func (c *Client) CompleteUploadExternal(ctx context.Context, files []UploadFileR
 	var response struct {
 		apiEnvelope
 		Files []struct {
-			ID string `json:"id"`
+			ID     string `json:"id"`
+			Shares map[string]map[string][]struct {
+				TS string `json:"ts"`
+			} `json:"shares"`
 		} `json:"files"`
 	}
 	if err := c.call(ctx, "files.completeUploadExternal", form, &response); err != nil {
-		return nil, err
+		return CompleteUploadResult{}, err
 	}
-	ids := make([]string, 0, len(response.Files))
+	result := CompleteUploadResult{Shares: make(map[string]string)}
 	for _, file := range response.Files {
 		if file.ID != "" {
-			ids = append(ids, file.ID)
+			result.IDs = append(result.IDs, file.ID)
+		}
+		for _, scope := range []string{"public", "private"} {
+			for channel, entries := range file.Shares[scope] {
+				for _, entry := range entries {
+					if entry.TS != "" {
+						result.Shares[channel] = entry.TS
+						break
+					}
+				}
+			}
 		}
 	}
-	if len(ids) == 0 {
-		return nil, errors.New("slack files.completeUploadExternal answered no file IDs")
+	if len(result.IDs) == 0 {
+		return CompleteUploadResult{}, errors.New("slack files.completeUploadExternal answered no file IDs")
 	}
-	return ids, nil
+	return result, nil
 }
 
 // FileShares returns the message ts each channel holds a file under. Slack
@@ -184,7 +212,7 @@ func (c *Client) FetchFile(ctx context.Context, file boardsync.File, maxBytes in
 	request.Header.Set("Authorization", "Bearer "+c.token.Reveal())
 	response, err := c.fileClient().Do(request)
 	if err != nil {
-		return nil, boardsync.RedactError(err, c.token)
+		return nil, boardsync.RedactError(err, boardsync.Secret(file.URL), c.token)
 	}
 	defer response.Body.Close()
 	if err := httpStatusError("files.download", response); err != nil {
@@ -219,6 +247,49 @@ func (c *Client) fileClient() *http.Client {
 	return &client
 }
 
+// failureNotes says what happened to each file when the upload did not
+// reach Slack. The name is untrusted; renderBody escapes the whole note.
+func failureNotes(files []boardsync.OutboundFile, boardMessage uint64, err error) []string {
+	reason := failureReason(err)
+	notes := make([]string, 0, len(files))
+	for _, file := range files {
+		name := cleanText(file.Filename)
+		if name == "" {
+			name = "file"
+		}
+		parts := []string{humanBytes(int64(len(file.Data)))}
+		if reason != "" {
+			parts = append(parts, reason)
+		}
+		if boardMessage != 0 {
+			parts = append(parts, fmt.Sprintf("on the board: #%d", boardMessage))
+		}
+		notes = append(notes, fmt.Sprintf("📎 %s (%s)", name, strings.Join(parts, ", ")))
+	}
+	return notes
+}
+
+// failureReason is a Slack error code or a short class, never a URL, token,
+// or message body.
+func failureReason(err error) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Code != "" {
+		return apiErr.Code
+	}
+	switch {
+	case errors.Is(err, ErrFileTooLarge):
+		return "too large"
+	case errors.Is(err, boardsync.ErrRateLimited):
+		return "rate limited"
+	case errors.Is(err, boardsync.ErrUnauthorized):
+		return "not authorized"
+	case errors.Is(err, boardsync.ErrNotFound):
+		return "not found"
+	default:
+		return "upload failed"
+	}
+}
+
 // uploadPlan decides which files Slack can take and what to say about the
 // rest. A file over the limit or past the count is a line in the text, not a
 // reason to lose the message.
@@ -248,23 +319,6 @@ func planUploads(files []boardsync.OutboundFile, cfg Config) uploadPlan {
 		}
 	}
 	return plan
-}
-
-func refusedNotes(files []boardsync.OutboundFile, boardMessage uint64) []string {
-	notes := make([]string, 0, len(files))
-	for _, file := range files {
-		why := "Slack refused the upload"
-		if boardMessage != 0 {
-			why = fmt.Sprintf("on the board: #%d", boardMessage)
-		}
-		name := cleanText(file.Filename)
-		if name == "" {
-			name = "file"
-		}
-		size := humanBytes(int64(len(file.Data)))
-		notes = append(notes, fmt.Sprintf("📎 %s (%s, %s)", name, size, why))
-	}
-	return notes
 }
 
 func fileNote(name, why string) string {

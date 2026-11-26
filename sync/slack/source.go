@@ -9,6 +9,17 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
+// SourceReader is the on-demand read surface a server exposes. It is not a
+// sync: nothing read here is stored or subscribed.
+type SourceReader interface {
+	ReadSource(ctx context.Context, key boardsync.Key, target string, limit int) (SourceRead, error)
+}
+
+// SourceJoiner adds the app to a public channel when the entry opted in.
+type SourceJoiner interface {
+	JoinSource(ctx context.Context, key boardsync.Key, target string) (SourceJoin, error)
+}
+
 // SourceRead is a channel or thread read on demand. It is not a sync: nothing
 // is stored, and reading a channel does not subscribe to it.
 type SourceRead struct {
@@ -261,6 +272,11 @@ func (c *Client) History(ctx context.Context, channel string, limit int) ([]slac
 	}
 	return response.Messages, response.HasMore, nil
 }
+
+var (
+	_ SourceReader = (*Provider)(nil)
+	_ SourceJoiner = (*Provider)(nil)
+)
 
 // JoinChannel adds the app to a public channel.
 func (c *Client) JoinChannel(ctx context.Context, channel string) error {

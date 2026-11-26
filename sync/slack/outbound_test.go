@@ -19,8 +19,8 @@ import (
 func newProvider(t *testing.T, baseURL string, client *http.Client, mutate func(*slack.Config)) *slack.Provider {
 	t.Helper()
 	cfg := slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
-		BotUserID: "UAPP123", APIBaseURL: baseURL, HTTPClient: client, Now: now,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
+		APIBaseURL: baseURL, HTTPClient: client, Now: now,
 	}
 	if mutate != nil {
 		mutate(&cfg)

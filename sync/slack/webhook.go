@@ -501,6 +501,15 @@ func cleanText(text string) string {
 		if unicode.IsControl(r) {
 			return -1
 		}
+		if unicode.Is(unicode.Cf, r) {
+			// Zero-width joiners hold emoji sequences together; other format
+			// characters (bidi overrides, zero-width spaces) have no place in
+			// a board message.
+			if r == '\u200d' {
+				return r
+			}
+			return -1
+		}
 		return r
 	}, text)
 }

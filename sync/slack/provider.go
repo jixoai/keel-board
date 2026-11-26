@@ -84,6 +84,9 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 			Status: 200, ContentType: "application/json", Body: body,
 		}}, nil
 	case "event_callback":
+		if p.cfg.TeamID != "" && envelope.TeamID != p.cfg.TeamID {
+			return boardsync.Intake{}, fmt.Errorf("%w: slack webhook is for team %q, not %q", boardsync.ErrUnauthorized, envelope.TeamID, p.cfg.TeamID)
+		}
 		if len(envelope.Event) == 0 {
 			return boardsync.Intake{Response: boardsync.OK()}, nil
 		}
@@ -150,6 +153,18 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: entry %q isn't this slack app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
 	}
+	trimmed := strings.TrimSpace(target)
+	if strings.HasPrefix(trimmed, "#") {
+		channel, err := p.ResolveChannel(ctx, key, trimmed)
+		if err != nil {
+			return boardsync.ResolvedTarget{}, err
+		}
+		resolved := boardsync.ResolvedTarget{Key: key, Platform: "slack", Channel: channel, Kind: boardsync.TargetChannel}
+		if err := resolved.Validate(); err != nil {
+			return boardsync.ResolvedTarget{}, err
+		}
+		return resolved, nil
+	}
 	resolved, err := parseTarget(ctx, p.client, target)
 	if err != nil {
 		return boardsync.ResolvedTarget{}, err
@@ -183,16 +198,16 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	if err != nil {
 		return boardsync.Posted{}, err
 	}
-	text := outboundText(msg.Markdown)
-	if strings.TrimSpace(text) == "" {
-		text = ""
+	rawText := msg.Markdown
+	if strings.TrimSpace(outboundText(rawText)) == "" {
+		rawText = ""
 	}
 	plan := planUploads(msg.Files, p.cfg)
-	if text == "" && len(plan.files) == 0 && len(plan.notes) == 0 {
+	if rawText == "" && len(plan.files) == 0 && len(plan.notes) == 0 {
 		return boardsync.Posted{}, fmt.Errorf("%w: slack message has no text and no files", boardsync.ErrBadRequest)
 	}
 	if len(plan.files) == 0 {
-		ts, err := p.postText(ctx, target.Channel, threadTS, outboundText(withNotes(text, plan.notes)), msg.Sender)
+		ts, _, err := p.postText(ctx, target.Channel, threadTS, rawText, plan.notes, msg.Sender, msg.External, key)
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
@@ -201,20 +216,33 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	// Finding the message an upload made needs files:read. Without it the
 	// text posts first and the files follow in the same thread.
 	if filesRead, _ := p.hasScope(ctx, "files:read"); !filesRead {
-		return p.postTextThenFiles(ctx, target.Channel, threadTS, text, plan, msg)
+		return p.postTextThenFiles(ctx, target.Channel, threadTS, rawText, plan, msg, key)
 	}
-	comment := outboundText(withNotes(text, plan.notes))
+	comment := p.renderBody(rawText, plan.notes, msg.External, key, "")
 	ids, ts, shared, err := p.uploadAndShare(ctx, target.Channel, threadTS, comment, plan.files)
 	if err != nil {
-		if shared || !isFileRefusal(err) {
-			// The files may already be in Slack. Re-posting the text could
-			// duplicate them; the delivery's retry is Slack's own limit.
-			return boardsync.Posted{}, err
+		if shared {
+			// The files reached Slack but its message is unknown. Return a
+			// partial success rather than re-posting: a retry would duplicate
+			// the text and the files.
+			fallback := ts
+			if fallback == "" && threadTS != "" {
+				fallback = threadTS
+			}
+			if fallback == "" && len(ids) > 0 {
+				fallback = ids[0]
+			}
+			if fallback == "" {
+				return boardsync.Posted{}, err
+			}
+			posted := p.posted(target.Channel, threadTS, fallback, true)
+			posted.Files = ids
+			return posted, nil
 		}
-		// Slack won't take files from this app. The text still lands, with
-		// a line per file saying where it is.
-		fallback := outboundText(withNotes(text, append(plan.notes, refusedNotes(plan.files, msg.BoardMessage)...)))
-		ts, fallbackErr := p.postText(ctx, target.Channel, threadTS, fallback, msg.Sender)
+		// Nothing was shared, so the text can still land with a line per
+		// file. This includes a refusal, a 4xx, or a 5xx after retries.
+		notes := append(append([]string{}, plan.notes...), failureNotes(plan.files, msg.BoardMessage, err)...)
+		ts, _, fallbackErr := p.postText(ctx, target.Channel, threadTS, rawText, notes, msg.Sender, msg.External, key)
 		if fallbackErr != nil {
 			return boardsync.Posted{}, fallbackErr
 		}
@@ -226,13 +254,15 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 }
 
 // postTextThenFiles posts the text first, so a sender name still applies, and
-// uploads the files into the same thread as their own message.
-func (p *Provider) postTextThenFiles(ctx context.Context, channel, threadTS, text string, plan uploadPlan, msg boardsync.OutboundMessage) (boardsync.Posted, error) {
-	body := text
-	if body == "" {
-		body = attachmentList(plan.files)
+// uploads the files into the same thread as their own message. The text is
+// already in Slack, so an upload failure edits in the file notes and is a
+// partial success: retrying would duplicate the text.
+func (p *Provider) postTextThenFiles(ctx context.Context, channel, threadTS, rawText string, plan uploadPlan, msg boardsync.OutboundMessage, key boardsync.Key) (boardsync.Posted, error) {
+	notes := append([]string{}, plan.notes...)
+	if rawText == "" {
+		notes = append(attachmentNotes(plan.files), notes...)
 	}
-	ts, err := p.postText(ctx, channel, threadTS, outboundText(withNotes(body, plan.notes)), msg.Sender)
+	ts, named, err := p.postText(ctx, channel, threadTS, rawText, notes, msg.Sender, msg.External, key)
 	if err != nil {
 		return boardsync.Posted{}, err
 	}
@@ -240,15 +270,17 @@ func (p *Provider) postTextThenFiles(ctx context.Context, channel, threadTS, tex
 	if uploadThread == "" {
 		uploadThread = ts
 	}
-	ids, err := p.uploadFiles(ctx, channel, uploadThread, "", plan.files)
+	ids, _, err := p.uploadFiles(ctx, channel, uploadThread, "", plan.files)
 	if err != nil {
-		if !isFileRefusal(err) {
-			return boardsync.Posted{}, err
+		fallback := append(notes, failureNotes(plan.files, msg.BoardMessage, err)...)
+		label := ""
+		if named && msg.Sender != nil {
+			label = cleanText(msg.Sender.Name)
 		}
-		fallback := outboundText(withNotes(body, append(plan.notes, refusedNotes(plan.files, msg.BoardMessage)...)))
-		if updateErr := p.client.UpdateMessage(ctx, channel, ts, fallback, fallback); updateErr != nil {
-			return boardsync.Posted{}, updateErr
-		}
+		body := p.renderBody(rawText, fallback, msg.External, key, label)
+		// The text is the receipt; a note edit that fails must not make the
+		// delivery retry and post the text again.
+		_ = p.client.UpdateMessage(ctx, channel, ts, body, body)
 		return p.posted(channel, threadTS, ts, true), nil
 	}
 	posted := p.posted(channel, threadTS, ts, true)
@@ -272,33 +304,41 @@ func (p *Provider) posted(channel, threadTS, ts string, hadFiles bool) boardsync
 
 // postText posts text, under the sender's name when the app may set one and
 // falls back to the app with the label when Slack refuses it.
-func (p *Provider) postText(ctx context.Context, channel, threadTS, text string, sender *boardsync.Sender) (string, error) {
-	request := PostMessageRequest{Channel: channel, ThreadTS: threadTS, Text: text, MarkdownText: text}
+func (p *Provider) postText(ctx context.Context, channel, threadTS, rawText string, notes []string, sender *boardsync.Sender, external bool, key boardsync.Key) (string, bool, error) {
+	request := PostMessageRequest{Channel: channel, ThreadTS: threadTS}
 	named := false
+	label := ""
 	if sender != nil {
 		if username, icon, ok := p.senderFields(ctx, sender); ok {
 			request.Username = username
 			request.IconURL = icon
-			request.Text = withoutLabel(text, sender.Name)
-			request.MarkdownText = request.Text
+			label = cleanText(sender.Name)
 			named = true
 		}
 	}
+	body := p.renderBody(rawText, notes, external, key, label)
+	if strings.TrimSpace(body) == "" {
+		return "", false, fmt.Errorf("%w: slack message has no text", boardsync.ErrBadRequest)
+	}
+	request.Text = body
+	request.MarkdownText = body
 	ts, err := p.client.PostMessage(ctx, request)
 	if err == nil {
-		return ts, nil
+		return ts, named, nil
 	}
 	if !named || !isCustomizeRefusal(err) {
-		return "", err
+		return "", false, err
 	}
 	// The scope check can be stale or the workspace can refuse a username;
 	// the app's own identity still delivers the message.
 	p.disableCustomize()
 	request.Username = ""
 	request.IconURL = ""
-	request.Text = text
-	request.MarkdownText = text
-	return p.client.PostMessage(ctx, request)
+	body = p.renderBody(rawText, notes, external, key, "")
+	request.Text = body
+	request.MarkdownText = body
+	ts, err = p.client.PostMessage(ctx, request)
+	return ts, false, err
 }
 
 // Edit replaces a delivered message's text. The label stays unless the
@@ -307,15 +347,22 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 	if len(msg.Files) > 0 {
 		return fmt.Errorf("%w: slack can't attach files to an edit", boardsync.ErrUnsupported)
 	}
+	if strings.TrimSpace(outboundText(msg.Markdown)) == "" {
+		return fmt.Errorf("%w: slack edit has no text", boardsync.ErrBadRequest)
+	}
 	channel, ts, err := p.messageWhere(key, thread, message)
 	if err != nil {
 		return err
 	}
-	text := outboundText(msg.Markdown)
+	label := ""
 	if msg.Sender != nil && p.namedCopy(ctx, channel, ts, msg.Sender) {
-		text = withoutLabel(text, msg.Sender.Name)
+		label = cleanText(msg.Sender.Name)
 	}
-	return p.client.UpdateMessage(ctx, channel, ts, text, text)
+	body := p.renderBody(msg.Markdown, nil, msg.External, key, label)
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("%w: slack edit has no text after its label", boardsync.ErrBadRequest)
+	}
+	return p.client.UpdateMessage(ctx, channel, ts, body, body)
 }
 
 // Delete deletes a delivered message.
@@ -356,6 +403,48 @@ func (p *Provider) Permalink(ctx context.Context, key boardsync.Key, event board
 		return "", fmt.Errorf("%w: slack answered a permalink off its own domain", boardsync.ErrBadRequest)
 	}
 	return link, nil
+}
+
+// FetchRoot recovers a thread root the board hasn't seen, for a reply that
+// arrives first. The thread is native: "C0123ABC:1727000000.123456".
+func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread string) (*boardsync.RootDraft, error) {
+	if p.cfg.Key != "" && key != p.cfg.Key {
+		return nil, fmt.Errorf("%w: entry %q isn't this slack app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
+	}
+	channel, ts, ok := strings.Cut(strings.TrimSpace(thread), ":")
+	if !ok || !channelIDPattern.MatchString(channel) || !isTS(ts) {
+		return nil, fmt.Errorf("%w: %q isn't a slack thread", boardsync.ErrBadRequest, thread)
+	}
+	messages, _, err := p.client.Replies(ctx, channel, ts, 1)
+	if err != nil {
+		return nil, err
+	}
+	for _, message := range messages {
+		if message.TS != ts {
+			continue
+		}
+		text := mrkdwnToMarkdown(message.Text)
+		if text == "" && len(message.Files) > 0 {
+			names := make([]string, 0, len(message.Files))
+			for _, file := range message.Files {
+				name := file.Name
+				if name == "" {
+					name = "file"
+				}
+				names = append(names, "📎 "+name)
+			}
+			text = strings.Join(names, "\n")
+		}
+		root := &boardsync.RootDraft{
+			Text:   boardsync.StorableText(text, boardsync.MaxTextBytes),
+			Author: authorOf(message.User, message.BotID),
+		}
+		if raw, err := json.Marshal(message); err == nil {
+			root.Raw = raw
+		}
+		return root, nil
+	}
+	return nil, fmt.Errorf("%w: slack thread %s has no root", boardsync.ErrNotFound, thread)
 }
 
 // Locate reads a Slack permalink as its channel, thread, and message.
@@ -404,4 +493,5 @@ var (
 	_ boardsync.Typist       = (*Provider)(nil)
 	_ boardsync.FileUploader = (*Provider)(nil)
 	_ boardsync.FileFetcher  = (*Provider)(nil)
+	_ boardsync.RootFetcher  = (*Provider)(nil)
 )

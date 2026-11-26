@@ -222,7 +222,7 @@ func TestReceiveBotIDOwnMessageSkipped(t *testing.T) {
 	data, _ := json.Marshal(body)
 	p, err := slack.New(slack.Config{
 		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
-		BotUserID: "UAPP123", BotID: "BAPP123", Now: now,
+		BotID: "BAPP123", Now: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -272,8 +272,8 @@ func TestReceiveDoesNoNetworkIO(t *testing.T) {
 		return nil, errors.New("no network allowed")
 	})}
 	p, err := slack.New(slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
-		BotUserID: "UAPP123", Now: now, HTTPClient: client,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
+		Now: now, HTTPClient: client,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +288,7 @@ func TestReceiveDoesNoNetworkIO(t *testing.T) {
 
 func TestReceiveRejectsHugeBody(t *testing.T) {
 	p, err := slack.New(slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken, Now: now, MaxBodyBytes: 256,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123", Now: now, MaxBodyBytes: 256,
 	})
 	if err != nil {
 		t.Fatal(err)

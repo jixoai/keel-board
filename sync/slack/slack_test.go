@@ -268,7 +268,7 @@ func TestResolveChannelByName(t *testing.T) {
 	}))
 	defer server.Close()
 	p, err := slack.New(slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
 		APIBaseURL: server.URL, Now: now,
 	})
 	if err != nil {
@@ -306,7 +306,7 @@ func TestPostMessage(t *testing.T) {
 	}))
 	defer server.Close()
 	p, err := slack.New(slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
 		APIBaseURL: server.URL, Now: now,
 	})
 	if err != nil {
@@ -346,7 +346,7 @@ func TestEditDeleteReact(t *testing.T) {
 	}))
 	defer server.Close()
 	p, err := slack.New(slack.Config{
-		Key: "slack", SigningSecret: testSecret, BotToken: testToken,
+		Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
 		APIBaseURL: server.URL, Now: now,
 	})
 	if err != nil {
@@ -389,7 +389,7 @@ func TestSlackAPIErrorClassification(t *testing.T) {
 			_, _ = w.Write([]byte(tc.body))
 		}))
 		p, err := slack.New(slack.Config{
-			Key: "slack", SigningSecret: testSecret, BotToken: testToken,
+			Key: "slack", SigningSecret: testSecret, BotToken: testToken, BotUserID: "UAPP123",
 			APIBaseURL: server.URL, Now: now,
 		})
 		if err != nil {

@@ -22,7 +22,7 @@ worker daemon, and no live platform credential.
 | --- | --- |
 | `sync/` core: `Provider`, `Registry`, normalized `Event`, `ThreadRef`, `OutboundMessage`, `SyncFunc`, `Call`, `Host`, `Runner` | Implemented and tested |
 | Dedupe keys and markers, retry policy, memory inbox (lanes, leases, dead letters), outbox (lane order, retries, dead letters) | Implemented and tested |
-| `sync/slack`: signature, webhook normalization, targets, `chat.postMessage`, edit/delete/reaction, channel lookup, permalink | Skeleton; files, typing, deployment tables, full mrkdwn conversion are open |
+| `sync/slack`: signature, webhook normalization (messages, edits, deletes, reactions, files, links), targets, post/edit/delete/react, files both ways, typing status, source read/join opt-in, channel lookup, permalink, root recovery | Implemented; Vercel deployment tables and full mrkdwn conversion are open |
 | `sync/github`: signature, repo allowlist, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, root recovery, PR/issue/comment links | Skeleton; reaction removal, review-thread URL variants, review-conversation resolution are open |
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery | Skeleton; comment payloads without an issue object, links, reaction removal are open |
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
@@ -428,7 +428,7 @@ Scope checklists, from the upstream platform pages:
 
 | Platform | Needed |
 | --- | --- |
-| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write` (files pending in the skeleton), `groups:read` for private names, `chat:write.customize` for sender names, `channels:join` only if on-demand join is enabled |
+| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write`, `groups:read` for private names, `chat:write.customize` for sender names, `channels:join` only if on-demand join is enabled, `assistant:write` for assistant thread status |
 | GitHub | Issues and Pull requests read/write, Actions read; webhooks for Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs |
 | Linear | `read`, `write`, `comments:create`, `issues:create`; webhooks for Issues and Comments; app actor |
 | Chat SDK adapter | Whatever the platform's adapter documents |
@@ -553,7 +553,8 @@ slack.New(slack.Config{
     Key: "slack",
     SigningSecret: secret, // required
     BotToken: token,       // required for API calls
-    BotUserID: "UAPP123",  // skip the app's own messages
+    BotUserID: "UAPP123",  // skip the app's own messages (BotID also accepted)
+    TeamID: "T0123ABC",    // optional: refuse another workspace's webhooks
     Now: time.Now, Tolerance: 5*time.Minute,
 })
 ```
@@ -589,16 +590,27 @@ off. A channel target starts a root; a thread target replies. `chat.update`,
 through one cached `conversations.list`; IDs never wait. `Locate` reads
 permalinks; `Permalink` calls `chat.getPermalink`.
 
-Known limits of the skeleton:
+Known limits:
 
 * **Reaction thread**: Slack reaction webhooks don't carry `thread_ts`, so the
   native thread is `channel:item.ts`. A reaction on a reply needs the host to
   find the copy by channel + platform message ID, or a richer adapter that
   caches the message's thread. Upstream gets it from the Chat SDK message.
-* Files, typing status, Vercel deployment tables, sender-name length rules,
-  `chat:write.customize` checks, and link unfurl reading are not implemented.
-* A message with no text and no files is dropped; file-only messages are
-  carried as files (their upload is pending).
+* **Typing**: Slack has no public typing-indicator API. `Typing` sets
+  `assistant.threads.setStatus`, which needs `assistant:write` and the Agents
+  & AI Apps feature; a channel target is a no-op and an unsupported workspace
+  returns `ErrUnsupported`.
+* **Files**: uploads use `files.getUploadURLExternal` → the pre-signed URL →
+  `files.completeUploadExternal`; finding the message needs `files:read`
+  (Slack's own shares are used first, then a bounded `files.info` poll).
+  Without `files:read` the text posts first and files follow. A message
+  deletion does not cascade to uploaded files.
+* **Links**: only Slack message permalinks plus the unfurl/forward snapshots
+  Slack includes in the webhook are imported. No URL is fetched; external
+  links are left to the board.
+* Vercel deployment tables and a full mrkdwn ↔ Markdown converter are open.
+* A message with no text and no files is dropped; a file-only message is
+  carried as its files.
 
 ### GitHub
 
@@ -750,7 +762,7 @@ calls and need no credentials.
 | Area | What is covered |
 | --- | --- |
 | `sync/*_test.go` | Event/ThreadRef validation, dedupe keys, markers, secret redaction, retry policy, outbox lane order/retries/dead letters, inbox dedupe/order/lease/retry/dead letters, `Runner.Inbound` once semantics, `Runner.Outbound` receipts, mirror start, origin refusal, registry gate/drop/failure statuses |
-| `sync/slack` | Signature vector, stale timestamp, challenge, message/reply/edit/delete/reaction fixtures, own-bot skip, target parsing, `#name` lookup, `chat.postMessage` form, edit/delete/react paths, API error classification, permalinks |
+| `sync/slack` | Signature vector, stale timestamp, challenge, message/reply/edit/delete/reaction/file/link fixtures, own-bot and marker skip, stable and distinct dedupe, store-before-ack, target parsing, `#name` lookup and cache, `chat.postMessage` form and customize fallback, edit/delete/react paths, file retry/refusal/partial success, typing status, source read/join, permalink, API error and Retry-After classification, fake Slack end-to-end |
 | `sync/github` | Signature vector, ping, issue/PR/review comments, PR opened/closed, review approval, workflow run, repo allowlist, marker echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, root recovery, links |
 | `sync/linear` | Signature and timestamp, issue created/updated, comment created/updated/removed, team allowlist, own comment skip, identifier/native target resolution, comment/issue creation, edit/delete/react, root recovery |
 | `sync/chatsdk` | HMAC verifier, decode/send delegation, target hook, optional operations |
@@ -880,8 +892,8 @@ Recorded in `docs/PORTING.md` as well:
   integration work.
 * A full sync engine: subscription, target backfill, `undelivered`
   projection, key ownership, and `syncedHere`.
-* Files both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
-  attachments), typing, and on-demand source reads/joins.
+* Slack files, typing status, and on-demand source reads/joins are
+  implemented; GitHub asset upload and Linear attachments remain open.
 * Full Slack mrkdwn ↔ Markdown conversion and sender/avatar/scope checks.
 * GitHub reaction removal (needs a reaction ID lookup), review-thread
   conversation resolution, and review-comment URLs from the board.
