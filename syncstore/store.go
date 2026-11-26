@@ -52,6 +52,10 @@ var ErrLeaseLost = boardsync.ErrLeaseLost
 // ErrNotDead is returned when a retry names a row that isn't dead-lettered.
 var ErrNotDead = errors.New("syncstore: the row is not dead-lettered")
 
+// ErrThreadAttached is returned when a platform thread is already attached to
+// a different board thread. One external conversation has one board thread.
+var ErrThreadAttached = errors.New("syncstore: the platform thread is attached to another board thread")
+
 // Config bounds the store's retries and leases. Zero fields take the sync
 // defaults: InboundRetry for inbound imports, DefaultRetry for outbound
 // deliveries, and one minute for a lease.
@@ -124,8 +128,12 @@ type Thread struct {
 	Thread      string               `json:"thread,omitempty"`
 	Subthread   string               `json:"subthread,omitempty"`
 	Kind        boardsync.TargetKind `json:"kind"`
-	CreatedAt   time.Time            `json:"createdAt"`
-	UpdatedAt   time.Time            `json:"updatedAt"`
+	// Since is the board sequence at which this mapping began. A thread target
+	// backed by a board sequence delivers only messages after it; zero keeps
+	// the historical behavior (every message). A channel target ignores it.
+	Since     uint64    `json:"since,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // Validate checks a thread mapping.
@@ -294,11 +302,19 @@ type Store interface {
 	// SaveCopy persists a post's copy. The runner calls it before it records
 	// message.synced, so a receipt retry finds the copy and doesn't post again.
 	SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error)
+	// RemoveCopy forgets a copy whose platform message was deleted.
+	RemoveCopy(ctx context.Context, tenant, id string) error
 	TargetFailures(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error)
 
 	// Threads. ThreadByTarget is the reverse of a thread mapping; ThreadSynced
-	// answers the Gate's key-prefixed external thread.
+	// answers the Gate's key-prefixed external thread. UpsertThread refuses a
+	// thread target already mapped to another board thread with
+	// ErrThreadAttached, under the same lock as its check.
 	UpsertThread(ctx context.Context, thread Thread) (Thread, error)
+	// LockTarget serializes root creation and attachment for one external
+	// target across processes. The caller releases it when its mapping write
+	// is complete.
+	LockTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (release func(), err error)
 	Threads(ctx context.Context, tenant string, boardThread uint64) ([]Thread, error)
 	ThreadByTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (Thread, bool, error)
 	ThreadSynced(ctx context.Context, tenant string, key boardsync.Key, external string) (bool, error)
@@ -507,6 +523,12 @@ func copyIDOf(key boardsync.Key, target boardsync.ResolvedTarget, boardMessage u
 	return "copy_" + boardsync.Hash(keyParts(
 		string(key), targetKeyOf(target), strconv.FormatUint(boardMessage, 10),
 	))
+}
+
+// targetLockID names one external target's cross-process lock.
+func targetLockID(tenant string, key boardsync.Key, target boardsync.ResolvedTarget) string {
+	return keyParts(tenant, string(key), string(target.Platform), target.Channel,
+		target.Thread, target.Subthread, string(target.Kind))
 }
 
 func threadIDOf(boardThread uint64, key boardsync.Key, target boardsync.ResolvedTarget) string {

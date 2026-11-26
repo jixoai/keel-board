@@ -19,6 +19,9 @@ type Memory struct {
 	now     func() time.Time
 	seq     uint64
 	tenants map[string]*memoryTenant
+	// targetLocks serializes root creation and attachment for one external
+	// target. A token channel with capacity one is the lock.
+	targetLocks map[string]chan struct{}
 }
 
 type memoryTenant struct {
@@ -71,9 +74,10 @@ func NewMemory(cfg Config) (*Memory, error) {
 		return nil, err
 	}
 	return &Memory{
-		cfg:     checked,
-		now:     time.Now,
-		tenants: make(map[string]*memoryTenant),
+		cfg:         checked,
+		now:         time.Now,
+		tenants:     make(map[string]*memoryTenant),
+		targetLocks: make(map[string]chan struct{}),
 	}, nil
 }
 
@@ -764,6 +768,20 @@ func (m *Memory) SaveCopy(_ context.Context, tenant string, copy Copy) (Copy, er
 	return m.tenantLocked(tenant).copies[copy.ID], nil
 }
 
+// RemoveCopy implements Store.
+func (m *Memory) RemoveCopy(_ context.Context, tenant, id string) error {
+	if err := validTenant(tenant); err != nil {
+		return err
+	}
+	if id == "" {
+		return fmt.Errorf("%w: a copy removal needs an ID", boardsync.ErrBadRequest)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.tenantLocked(tenant).copies, id)
+	return nil
+}
+
 // CopyForMessage implements Store.
 func (m *Memory) CopyForMessage(_ context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error) {
 	if err := validTenant(tenant); err != nil {
@@ -879,6 +897,16 @@ func (m *Memory) UpsertThread(_ context.Context, thread Thread) (Thread, error) 
 	defer m.mu.Unlock()
 	now := m.now()
 	data := m.tenantLocked(thread.Tenant)
+	if thread.Kind == boardsync.TargetThread {
+		for _, existing := range data.threads {
+			if existing.Kind != boardsync.TargetThread || existing.BoardThread == thread.BoardThread {
+				continue
+			}
+			if sameThreadTarget(existing, thread) {
+				return Thread{}, fmt.Errorf("%w: %s board thread %d", ErrThreadAttached, thread.Key, existing.BoardThread)
+			}
+		}
+	}
 	stored, exists := data.threads[thread.ID]
 	if exists {
 		stored.Platform = thread.Platform
@@ -886,6 +914,9 @@ func (m *Memory) UpsertThread(_ context.Context, thread Thread) (Thread, error) 
 		stored.Thread = thread.Thread
 		stored.Subthread = thread.Subthread
 		stored.Kind = thread.Kind
+		if stored.Since == 0 && thread.Since != 0 {
+			stored.Since = thread.Since
+		}
 		stored.UpdatedAt = now
 		data.threads[thread.ID] = stored
 		return stored, nil
@@ -894,6 +925,43 @@ func (m *Memory) UpsertThread(_ context.Context, thread Thread) (Thread, error) 
 	thread.UpdatedAt = now
 	data.threads[thread.ID] = thread
 	return thread, nil
+}
+
+// LockTarget implements Store.
+func (m *Memory) LockTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (func(), error) {
+	if err := validTenant(tenant); err != nil {
+		return nil, err
+	}
+	if err := expectKey(key); err != nil {
+		return nil, err
+	}
+	if target.Key != key {
+		return nil, fmt.Errorf("%w: target key isn't the lock key", boardsync.ErrBadRequest)
+	}
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
+	id := targetLockID(tenant, key, target)
+	m.mu.Lock()
+	lock := m.targetLocks[id]
+	if lock == nil {
+		lock = make(chan struct{}, 1)
+		lock <- struct{}{}
+		m.targetLocks[id] = lock
+	}
+	m.mu.Unlock()
+	select {
+	case <-lock:
+		return func() { lock <- struct{}{} }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sameThreadTarget reports whether two mappings name the same external thread.
+func sameThreadTarget(a, b Thread) bool {
+	return a.Platform == b.Platform && a.Channel == b.Channel &&
+		a.Thread == b.Thread && a.Subthread == b.Subthread
 }
 
 // Threads implements Store.

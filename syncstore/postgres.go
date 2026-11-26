@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -33,6 +35,13 @@ type PostgresOptions struct {
 type Postgres struct {
 	pool *pgxpool.Pool
 	cfg  Config
+	// searchPath is set transaction-locally as well as on connections, so a
+	// pooled connection can never silently lose the schema after a role or
+	// session setting changes.
+	searchPath string
+	// connConfig opens the dedicated connection a target lock holds, so a
+	// lock never consumes the pool a mapping write needs.
+	connConfig *pgx.ConnConfig
 }
 
 // OpenPostgres connects with opts, applies the board and sync schema, and
@@ -65,7 +74,14 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool, cfg: cfg}, nil
+	searchPath := ""
+	if opts.SearchPath != "" {
+		searchPath = pgx.Identifier{opts.SearchPath}.Sanitize()
+	}
+	return &Postgres{
+		pool: pool, cfg: cfg, searchPath: searchPath,
+		connConfig: config.ConnConfig.Copy(),
+	}, nil
 }
 
 // Close closes the connection pool.
@@ -89,6 +105,11 @@ func (p *Postgres) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx
 	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', $1, true)`, tenant); err != nil {
 		return err
+	}
+	if p.searchPath != "" {
+		if _, err := tx.Exec(ctx, `SELECT set_config('search_path', $1, true)`, p.searchPath); err != nil {
+			return err
+		}
 	}
 	if err := fn(tx); err != nil {
 		return err
@@ -1126,6 +1147,17 @@ func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy
 	return copy, nil
 }
 
+// RemoveCopy implements Store.
+func (p *Postgres) RemoveCopy(ctx context.Context, tenant, id string) error {
+	if id == "" {
+		return fmt.Errorf("%w: a copy removal needs an ID", boardsync.ErrBadRequest)
+	}
+	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM board_sync_copies WHERE tenant_id = $1 AND id = $2`, tenant, id)
+		return err
+	})
+}
+
 // TargetFailures implements Store.
 func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
 	if err := expectKey(key); err != nil {
@@ -1162,45 +1194,116 @@ func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boards
 }
 
 const threadColumns = `tenant_id, id, board_thread, sync_key, platform, channel,
-	thread, subthread, kind, created_at, updated_at`
+	thread, subthread, kind, since_seq, created_at, updated_at`
 
 func scanThread(row scanner) (Thread, error) {
 	var thread Thread
 	err := row.Scan(&thread.Tenant, &thread.ID, &thread.BoardThread, &thread.Key,
 		&thread.Platform, &thread.Channel, &thread.Thread, &thread.Subthread,
-		&thread.Kind, &thread.CreatedAt, &thread.UpdatedAt)
+		&thread.Kind, &thread.Since, &thread.CreatedAt, &thread.UpdatedAt)
 	return thread, err
 }
 
-// UpsertThread implements Store.
+// UpsertThread implements Store. A thread target already attached to another
+// board thread is refused; the partial unique index decides a race, and the
+// pre-check only supplies a friendly error.
 func (p *Postgres) UpsertThread(ctx context.Context, thread Thread) (Thread, error) {
 	if err := thread.Validate(); err != nil {
 		return Thread{}, err
 	}
-	thread.ID = threadIDOf(thread.BoardThread, thread.Key, boardsync.ResolvedTarget{
+	target := boardsync.ResolvedTarget{
 		Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
 		Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
-	})
+	}
+	thread.ID = threadIDOf(thread.BoardThread, thread.Key, target)
 	var stored Thread
 	err := p.withTenant(ctx, thread.Tenant, func(tx pgx.Tx) error {
+		// The partial unique index is the cross-process guarantee; the check
+		// below only gives a friendly answer before the insert. A racing insert
+		// is mapped to ErrThreadAttached from its unique violation.
+		if thread.Kind == boardsync.TargetThread {
+			var existingBoard uint64
+			err := tx.QueryRow(ctx, `
+				SELECT board_thread FROM board_sync_threads
+				WHERE tenant_id = $1 AND sync_key = $2 AND platform = $3
+					AND channel = $4 AND thread = $5 AND subthread = $6 AND kind = 'thread'`,
+				thread.Tenant, thread.Key, thread.Platform, thread.Channel,
+				thread.Thread, thread.Subthread).Scan(&existingBoard)
+			switch {
+			case err == nil && existingBoard != thread.BoardThread:
+				return fmt.Errorf("%w: %s board thread %d", ErrThreadAttached, thread.Key, existingBoard)
+			case err != nil && !errors.Is(err, pgx.ErrNoRows):
+				return err
+			}
+		}
 		var err error
 		stored, err = scanThread(tx.QueryRow(ctx, `
 			INSERT INTO board_sync_threads
-				(tenant_id, id, board_thread, sync_key, platform, channel, thread, subthread, kind)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				(tenant_id, id, board_thread, sync_key, platform, channel, thread, subthread, kind, since_seq)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			ON CONFLICT (tenant_id, id) DO UPDATE
 			SET platform = EXCLUDED.platform, channel = EXCLUDED.channel,
 				thread = EXCLUDED.thread, subthread = EXCLUDED.subthread,
-				kind = EXCLUDED.kind, updated_at = now()
+				kind = EXCLUDED.kind,
+				since_seq = CASE WHEN board_sync_threads.since_seq = 0 THEN EXCLUDED.since_seq
+					ELSE board_sync_threads.since_seq END,
+				updated_at = now()
 			RETURNING `+threadColumns,
 			thread.Tenant, thread.ID, thread.BoardThread, thread.Key, thread.Platform,
-			thread.Channel, thread.Thread, thread.Subthread, thread.Kind))
+			thread.Channel, thread.Thread, thread.Subthread, thread.Kind, thread.Since))
+		if uniqueThreadViolation(err) {
+			return fmt.Errorf("%w: %s", ErrThreadAttached, thread.Key)
+		}
 		return err
 	})
 	if err != nil {
 		return Thread{}, err
 	}
 	return stored, nil
+}
+
+// uniqueThreadViolation reports the partial unique index's rejection of a
+// second board thread for one external thread.
+func uniqueThreadViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "board_sync_threads_unique_thread"
+}
+
+// LockTarget implements Store with a session advisory lock on a dedicated
+// connection. A process crash closes the session and releases the lock.
+func (p *Postgres) LockTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (func(), error) {
+	if err := validTenant(tenant); err != nil {
+		return nil, err
+	}
+	if err := expectKey(key); err != nil {
+		return nil, err
+	}
+	if target.Key != key {
+		return nil, fmt.Errorf("%w: target key isn't the lock key", boardsync.ErrBadRequest)
+	}
+	if err := target.Validate(); err != nil {
+		return nil, err
+	}
+	conn, err := pgx.ConnectConfig(ctx, p.connConfig.Copy())
+	if err != nil {
+		return nil, err
+	}
+	id := targetLockID(tenant, key, target)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, id); err != nil {
+		_ = conn.Close(context.Background())
+		return nil, err
+	}
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, id)
+			_ = conn.Close(unlockCtx)
+		})
+	}
+	return release, nil
 }
 
 // Threads implements Store.

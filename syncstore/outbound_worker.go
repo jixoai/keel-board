@@ -3,7 +3,6 @@ package syncstore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -14,6 +13,15 @@ import (
 // its provider/platform pair is inconsistent). It is transient: the worker
 // releases the job without counting an attempt and never dead-letters it.
 var errEntryNotReady = errors.New("syncstore: sync entry is not ready")
+
+// errNoCopy means a change addresses a copy the board never recorded. Edits,
+// deletes, and label changes are best-effort: there is nothing to change and
+// the delivery is a skip, not a failure.
+var errNoCopy = errors.New("syncstore: no copy to change")
+
+// errCopyPending means a reaction arrived before its message's copy was
+// recorded. It is transient so the outbox retries after the post's receipt.
+var errCopyPending = errors.New("syncstore: the copy is not recorded yet")
 
 // OutboundWorkerConfig configure one tenant's outbound drains. A lane is a
 // board thread, so one worker drains its owned keys' deliveries for that
@@ -154,7 +162,7 @@ func (w *OutboundWorker) Process(ctx context.Context) (WorkResult, error) {
 		case ack.Dead:
 			result.Dead++
 		}
-		if ack.Dead {
+		if ack.Dead && recordsFailure(job.Event.Type) {
 			w.recordFailure(ctx, job, jobErr)
 		}
 		if jobErr != nil {
@@ -216,11 +224,19 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 			return nil, nil, true
 		}
 	}
+	if job.Event.Type == boardsync.BoardMessageDeleted {
+		return w.deleteCopies(ctx, entry, job)
+	}
 	copyID := ""
 	switch job.Event.Type {
-	case boardsync.BoardMessageEdited, boardsync.BoardMessageDeleted,
-		boardsync.BoardReactionAdded, boardsync.BoardReactionRemove:
-		found, err := w.copyFor(ctx, job)
+	case boardsync.BoardMessageEdited, boardsync.BoardReactionAdded, boardsync.BoardReactionRemove:
+		found, err := w.copyForChange(ctx, job)
+		if errors.Is(err, errNoCopy) {
+			return nil, nil, true
+		}
+		if errors.Is(err, errCopyPending) {
+			return err, nil, false
+		}
 		if err != nil {
 			return err, nil, false
 		}
@@ -228,7 +244,10 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 	case boardsync.BoardLabelsChanged:
 		// A label change edits a copy only when a renderer reads labels.
 		if w.renderer != nil {
-			found, err := w.copyFor(ctx, job)
+			found, err := w.copyForChange(ctx, job)
+			if errors.Is(err, errNoCopy) {
+				return nil, nil, true
+			}
 			if err != nil {
 				return err, nil, false
 			}
@@ -248,6 +267,15 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 	}
 	receipt, err := w.runner.OutboundWithOptions(ctx, entry, job.Event, job.Message, &job.Target, copyID, opts)
 	if err != nil {
+		// A change is best-effort: a platform that can't make it (unsupported,
+		// bad target) doesn't mark the message undelivered. Transient failures
+		// still retry; a reaction's missing copy is retried explicitly.
+		if !isPostEvent(job.Event.Type) && boardsync.IsPermanent(err) {
+			w.logger.Warn("sync change skipped",
+				"tenant", w.tenant, "key", job.Key, "delivery", job.ID,
+				"type", job.Event.Type, "error", ErrorCode(err))
+			return nil, nil, true
+		}
 		return err, nil, false
 	}
 	var copy *Copy
@@ -257,26 +285,94 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 	return nil, copy, false
 }
 
-// copyFor finds the platform copy a change addresses. An exact target wins; a
-// single copy for the same board message is the fallback for a root that was
-// posted to a channel and is now changed through its thread.
-func (w *OutboundWorker) copyFor(ctx context.Context, job Delivery) (Copy, error) {
-	if copy, found, err := w.store.Copy(ctx, w.tenant, job.Key, job.Target, job.Message.ID); err != nil {
+// copyForChange finds the platform copy an edit, delete, or reaction
+// addresses. An exact target wins; a root posted to a channel is reached
+// through its concrete thread by matching ExternalThread. A missing copy is a
+// skip for edits and labels, and a retry for a reaction.
+func (w *OutboundWorker) copyForChange(ctx context.Context, job Delivery) (Copy, error) {
+	if copied, found, err := w.store.Copy(ctx, w.tenant, job.Key, job.Target, job.Message.ID); err != nil {
 		return Copy{}, err
 	} else if found {
-		return copy, nil
+		return copied, nil
 	}
 	copies, err := w.store.CopyForMessage(ctx, w.tenant, job.Key, job.Message.ID)
 	if err != nil {
 		return Copy{}, err
 	}
+	if job.Target.Thread != "" {
+		var rootCopies []Copy
+		for _, copied := range copies {
+			if copied.Target.Kind == boardsync.TargetChannel && copied.ExternalThread == job.Target.Thread {
+				rootCopies = append(rootCopies, copied)
+			}
+		}
+		if len(rootCopies) == 1 {
+			return rootCopies[0], nil
+		}
+	}
 	if len(copies) == 1 {
 		return copies[0], nil
 	}
-	if len(copies) > 1 {
-		return Copy{}, boardsync.Permanent(fmt.Errorf("syncstore: board message %d has several copies for %q", job.Message.ID, job.Key))
+	if isReaction(job.Event.Type) {
+		return Copy{}, errCopyPending
 	}
-	return Copy{}, boardsync.Permanent(fmt.Errorf("syncstore: board message %d has no copy for %q", job.Message.ID, job.Key))
+	return Copy{}, errNoCopy
+}
+
+// deleteCopies propagates a board delete to every copy of the message. The
+// copies are read once per delivery; a second delivery finds the same rows and
+// treats a platform's not-found as success.
+func (w *OutboundWorker) deleteCopies(ctx context.Context, entry boardsync.Entry, job Delivery) (error, *Copy, bool) {
+	copies, err := w.store.CopyForMessage(ctx, w.tenant, job.Key, job.Message.ID)
+	if err != nil {
+		return err, nil, false
+	}
+	if len(copies) == 0 {
+		return nil, nil, true
+	}
+	seen := make(map[string]struct{}, len(copies))
+	for _, copied := range copies {
+		if copied.ExternalMessage == "" {
+			continue
+		}
+		if _, duplicate := seen[copied.ExternalMessage]; duplicate {
+			continue
+		}
+		seen[copied.ExternalMessage] = struct{}{}
+		target := copied.Target
+		_, err := w.runner.Outbound(ctx, entry, job.Event, job.Message, &target, copied.ExternalMessage)
+		if err == nil || errors.Is(err, boardsync.ErrNotFound) {
+			// The platform message is gone; forget the copy so another
+			// target's delete job doesn't repeat the call.
+			if removeErr := w.store.RemoveCopy(ctx, w.tenant, copied.ID); removeErr != nil {
+				return removeErr, nil, false
+			}
+			continue
+		}
+		if boardsync.IsPermanent(err) {
+			w.logger.Warn("sync delete skipped",
+				"tenant", w.tenant, "key", job.Key, "delivery", job.ID,
+				"copy", copied.ExternalMessage, "error", ErrorCode(err))
+			continue
+		}
+		return err, nil, false
+	}
+	return nil, nil, true
+}
+
+// recordsFailure reports whether a dead delivery is a message failure a
+// reader should see. Edits, deletes, and reactions are best-effort and write
+// no message.sync_failed/undelivered projection.
+func recordsFailure(eventType boardsync.BoardEventType) bool {
+	return eventType == boardsync.BoardMessagePosted || eventType == boardsync.BoardThreadSynced
+}
+
+func isPostEvent(eventType boardsync.BoardEventType) bool {
+	return eventType == boardsync.BoardMessagePosted || eventType == boardsync.BoardThreadSynced
+}
+
+func isReaction(eventType boardsync.BoardEventType) bool {
+	return eventType == boardsync.BoardReactionAdded || eventType == boardsync.BoardReactionRemove
 }
 
 // recordSynced retries the receipt for a copy that already landed. It is the
