@@ -12,7 +12,7 @@ import (
 func testEntry(t *testing.T, syncFn boardsync.SyncFunc) (boardsync.Entry, *fake.Provider, *fake.Host) {
 	t.Helper()
 	provider := fake.New("slack", boardsync.Capabilities{StartThreads: true, Edits: true, Deletes: true, Reactions: true})
-	return boardsync.Entry{Key: "slack", Provider: provider, Sync: syncFn}, provider, fake.NewHost()
+	return boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: syncFn}, provider, fake.NewHost()
 }
 
 func TestRunnerInboundImportsOnce(t *testing.T) {
@@ -111,6 +111,40 @@ func TestRunnerMirrorStartsThread(t *testing.T) {
 	}
 }
 
+func TestRunnerStartRunsOnce(t *testing.T) {
+	resolves := 0
+	entry, provider, host := testEntry(t, func(ctx context.Context, call *boardsync.Call) error {
+		first, err := call.Start(ctx, "C0123")
+		if err != nil {
+			return err
+		}
+		second, err := call.Start(ctx, "C0123")
+		if err != nil {
+			return err
+		}
+		if first != second {
+			t.Fatalf("second Start = %+v, first %+v", second, first)
+		}
+		return nil
+	})
+	provider.ResolveTargetFunc = func(_ context.Context, key boardsync.Key, target string) (boardsync.ResolvedTarget, error) {
+		resolves++
+		return boardsync.ResolvedTarget{Key: key, Platform: "slack", Channel: target, Kind: boardsync.TargetChannel}, nil
+	}
+	runner := boardsync.NewRunner(host)
+	message := boardsync.Message{ID: 9, Thread: 9, Channel: "support", Text: "hello", Actor: "local:user:ada"}
+	if err := runner.OfferRoot(context.Background(), entry,
+		boardsync.BoardEvent{Type: boardsync.BoardMessagePosted, Thread: 9}, message, "C0123"); err != nil {
+		t.Fatalf("OfferRoot: %v", err)
+	}
+	if resolves != 1 {
+		t.Fatalf("Start resolved %d times, want once", resolves)
+	}
+	if records := host.Records(); len(records) != 1 || records[0].Type != boardsync.BoardThreadSynced {
+		t.Fatalf("thread.synced receipts = %+v", records)
+	}
+}
+
 func TestRunnerStartRefusesOriginChannel(t *testing.T) {
 	entry, provider, host := testEntry(t, boardsync.Mirror("support"))
 	provider.ResolveTargetFunc = func(_ context.Context, key boardsync.Key, target string) (boardsync.ResolvedTarget, error) {
@@ -132,7 +166,7 @@ func TestRunnerStartRefusesOriginChannel(t *testing.T) {
 
 func TestRunnerStartRefusedWithoutCapability(t *testing.T) {
 	provider := fake.New("github", boardsync.Capabilities{StartThreads: false})
-	entry := boardsync.Entry{Key: "github", Provider: provider, Sync: boardsync.Mirror("support")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: provider, Sync: boardsync.Mirror("support")}
 	runner := boardsync.NewRunner(fake.NewHost())
 	message := boardsync.Message{ID: 9, Thread: 9, Channel: "support", Text: "hello"}
 	if err := runner.OfferRoot(context.Background(), entry,
@@ -184,12 +218,12 @@ func TestRegistryHandleWebhookGateAndInbox(t *testing.T) {
 		}, nil
 	}
 	registry := boardsync.NewRegistry()
-	if err := registry.Add(boardsync.Entry{Key: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
 		t.Fatal(err)
 	}
 	inbox := boardsync.NewMemoryInbox(boardsync.DefaultRetry, 0)
 	gate := fake.NewGate([]string{"C0123"}, []string{"slack:C0999:T9"})
-	response, err := registry.HandleWebhook(context.Background(), "slack", &boardsync.WebhookRequest{
+	response, err := registry.HandleWebhook(context.Background(), "t1", "slack", &boardsync.WebhookRequest{
 		Method: "POST", Path: "/webhooks/slack", Header: map[string][]string{"Content-Type": {"application/json"}}, Body: []byte("{}"),
 	}, gate, inbox)
 	if err != nil || response.Status != 200 {
@@ -208,11 +242,11 @@ func TestRegistryDropsUnmappedUnsynced(t *testing.T) {
 		return boardsync.Intake{Response: boardsync.OK(), Records: []boardsync.Record{{Dedupe: "d1", Event: event}}}, nil
 	}
 	registry := boardsync.NewRegistry()
-	if err := registry.Add(boardsync.Entry{Key: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
 		t.Fatal(err)
 	}
 	inbox := boardsync.NewMemoryInbox(boardsync.DefaultRetry, 0)
-	response, err := registry.HandleWebhook(context.Background(), "slack", &boardsync.WebhookRequest{
+	response, err := registry.HandleWebhook(context.Background(), "t1", "slack", &boardsync.WebhookRequest{
 		Method: "POST", Path: "/webhooks/slack", Header: map[string][]string{"Content-Type": {"application/json"}}, Body: []byte("{}"),
 	}, fake.NewGate([]string{"C0123"}, nil), inbox)
 	if err != nil || response.Status != 200 {
@@ -225,18 +259,18 @@ func TestRegistryDropsUnmappedUnsynced(t *testing.T) {
 
 func TestRegistryFailures(t *testing.T) {
 	registry := boardsync.NewRegistry()
-	if _, err := registry.HandleWebhook(context.Background(), "missing", &boardsync.WebhookRequest{Method: "POST", Header: map[string][]string{}}, nil, nil); !errors.Is(err, boardsync.ErrNotFound) {
+	if _, err := registry.HandleWebhook(context.Background(), "t1", "missing", &boardsync.WebhookRequest{Method: "POST", Header: map[string][]string{}}, nil, nil); !errors.Is(err, boardsync.ErrNotFound) {
 		t.Fatalf("missing entry = %v", err)
 	}
 	provider := fake.New("slack", boardsync.Capabilities{})
 	registry = boardsync.NewRegistry()
-	if err := registry.Add(boardsync.Entry{Key: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Noop}); err != nil {
 		t.Fatal(err)
 	}
 	provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
 		return boardsync.Intake{}, boardsync.ErrUnauthorized
 	}
-	response, err := registry.HandleWebhook(context.Background(), "slack", &boardsync.WebhookRequest{
+	response, err := registry.HandleWebhook(context.Background(), "t1", "slack", &boardsync.WebhookRequest{
 		Method: "POST", Header: map[string][]string{"X": {"y"}},
 	}, nil, nil)
 	if !errors.Is(err, boardsync.ErrUnauthorized) || response.Status != 401 {
@@ -245,7 +279,7 @@ func TestRegistryFailures(t *testing.T) {
 	provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
 		return boardsync.Intake{Records: []boardsync.Record{{Dedupe: "d1", Event: boardsync.Event{}}}}, nil
 	}
-	response, err = registry.HandleWebhook(context.Background(), "slack", &boardsync.WebhookRequest{
+	response, err = registry.HandleWebhook(context.Background(), "t1", "slack", &boardsync.WebhookRequest{
 		Method: "POST", Header: map[string][]string{"X": {"y"}},
 	}, nil, nil)
 	if err == nil || response.Status != 400 {
@@ -255,7 +289,7 @@ func TestRegistryFailures(t *testing.T) {
 		return boardsync.Intake{Records: []boardsync.Record{{Dedupe: "d1", Event: inboxEvent("m1", "C0123:T1")}}}, nil
 	}
 	gateErr := errors.New("listing failed")
-	response, err = registry.HandleWebhook(context.Background(), "slack", &boardsync.WebhookRequest{
+	response, err = registry.HandleWebhook(context.Background(), "t1", "slack", &boardsync.WebhookRequest{
 		Method: "POST", Header: map[string][]string{"X": {"y"}},
 	}, &fake.Gate{Err: gateErr}, nil)
 	if !errors.Is(err, gateErr) || response.Status != 500 {

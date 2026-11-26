@@ -3,6 +3,7 @@ package syncstore_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,30 @@ func TestThreadContract(t *testing.T) {
 		if list, err := store.Threads(ctx, "t2", 812); err != nil || len(list) != 0 {
 			t.Fatalf("another tenant's threads = %+v, %v", list, err)
 		}
+		target := boardsync.ResolvedTarget{
+			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
+			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
+		}
+		found, ok, err := store.ThreadByTarget(ctx, "t1", "slack", target)
+		if err != nil || !ok || found.ID != first.ID {
+			t.Fatalf("thread by target = %+v, %v, %v", found, ok, err)
+		}
+		if _, ok, err := store.ThreadByTarget(ctx, "t2", "slack", target); err != nil || ok {
+			t.Fatalf("another tenant's target = %v, %v", ok, err)
+		}
+		external := string(thread.Key) + ":" + thread.Thread
+		if synced, err := store.ThreadSynced(ctx, "t1", "slack", external); err != nil || !synced {
+			t.Fatalf("thread target synced = %v, %v", synced, err)
+		}
+		if synced, err := store.ThreadSynced(ctx, "t1", "slack", "slack:C0999"); err != nil || !synced {
+			t.Fatalf("channel target synced = %v, %v", synced, err)
+		}
+		if synced, err := store.ThreadSynced(ctx, "t1", "slack", "slack:unknown"); err != nil || synced {
+			t.Fatalf("unknown target synced = %v, %v", synced, err)
+		}
+		if synced, err := store.ThreadSynced(ctx, "t2", "slack", external); err != nil || synced {
+			t.Fatalf("another tenant's target synced = %v, %v", synced, err)
+		}
 		if err := store.RemoveThread(ctx, "t1", first.ID); err != nil {
 			t.Fatalf("remove thread: %v", err)
 		}
@@ -148,9 +173,12 @@ func TestNonceContract(t *testing.T) {
 		if claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-1", time.Minute); err != nil || !claimed {
 			t.Fatalf("claim after the window = %v, %v", claimed, err)
 		}
-		removed, err := store.PruneNonces(ctx, time.Now().Add(2*time.Minute))
-		if err != nil || removed < 2 {
-			t.Fatalf("prune = %d, %v", removed, err)
+		removed, err := store.PruneNonces(ctx, "t1", time.Now().Add(2*time.Minute))
+		if err != nil || removed != 1 {
+			t.Fatalf("tenant prune = %d, %v", removed, err)
+		}
+		if claimed, err := store.ClaimNonce(ctx, "t2", "telegram", "nonce-1", time.Minute); err != nil || claimed {
+			t.Fatalf("another tenant's nonce was pruned: %v, %v", claimed, err)
 		}
 	})
 }
@@ -171,6 +199,49 @@ func TestStoreRefusesUnscopedInput(t *testing.T) {
 			t.Fatalf("missing entry = %v, %v", ok, err)
 		}
 	})
+}
+
+func TestDeliveryIDSeparatesTargetParts(t *testing.T) {
+	event := postedEvent(10, 100, 101)
+	// Under a plain separator join these two targets would produce the same
+	// byte string; the length-prefixed identity must not.
+	first := boardsync.ResolvedTarget{
+		Key: "slack", Platform: "slack", Channel: "a\x1fb", Thread: "c",
+		Kind: boardsync.TargetThread,
+	}
+	second := boardsync.ResolvedTarget{
+		Key: "slack", Platform: "slack", Channel: "a", Thread: "b\x1fc",
+		Kind: boardsync.TargetThread,
+	}
+	if err := first.Validate(); err != nil {
+		t.Fatalf("first target: %v", err)
+	}
+	if err := second.Validate(); err != nil {
+		t.Fatalf("second target: %v", err)
+	}
+	if a, b := syncstore.DeliveryID("t1", "slack", event, first), syncstore.DeliveryID("t1", "slack", event, second); a == b {
+		t.Fatalf("delivery IDs collided: %q", a)
+	}
+}
+
+func TestPushInboxRejectsOverlongAndControlInput(t *testing.T) {
+	memory, err := syncstore.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := testRecord("m1", "C0123:T1")
+	record.Dedupe = strings.Repeat("d", boardsync.MaxDedupeLen+1)
+	if _, err := memory.PushInbox(t.Context(), "t1", "slack", []boardsync.Record{record}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("overlong dedupe = %v", err)
+	}
+	controlTenant := "t1\x01evil"
+	if _, err := memory.PushInbox(t.Context(), controlTenant, "slack", []boardsync.Record{testRecord("m1", "C0123:T1")}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("control tenant = %v", err)
+	}
+	depth, err := memory.InboxDepth(t.Context(), "t1", "slack")
+	if err != nil || depth.Pending != 0 {
+		t.Fatalf("rejected input stored rows: %+v, %v", depth, err)
+	}
 }
 
 func TestErrorCodeIsContentFree(t *testing.T) {

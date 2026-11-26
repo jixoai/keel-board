@@ -107,6 +107,15 @@ func TestResolvedTargetValidate(t *testing.T) {
 	if err := bad.Validate(); err == nil {
 		t.Fatal("a thread target without a thread must be refused")
 	}
+	if err := (boardsync.ResolvedTarget{Key: "slack", Channel: "C0123", Kind: boardsync.TargetChannel}).Validate(); err == nil {
+		t.Fatal("a target without a platform must be refused")
+	}
+	if err := (boardsync.ResolvedTarget{Key: "slack", Platform: "slack", Channel: "C0123", Thread: "C0123:1", Subthread: "C9999:1", Kind: boardsync.TargetThread}).Validate(); err == nil {
+		t.Fatal("a sub-thread outside its thread must be refused")
+	}
+	if err := (boardsync.ResolvedTarget{Key: "slack", Platform: "slack", Channel: "C0123", Subthread: "C0123:1", Kind: boardsync.TargetChannel}).Validate(); err == nil {
+		t.Fatal("a channel target with a sub-thread must be refused")
+	}
 }
 
 func TestSecretRedaction(t *testing.T) {

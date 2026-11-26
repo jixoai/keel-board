@@ -14,15 +14,19 @@ import (
 	"github.com/jixoai/keel-board/syncstore"
 )
 
-// testDSN returns the PostgreSQL DSN, or skips the PostgreSQL subtest. Tests
-// never start a container: point them at a local server and each test gets its
-// own schema, dropped when it ends.
+// testDSN returns the PostgreSQL DSN, or skips the PostgreSQL subtest outside
+// CI. Tests never start a container: point them at a local server and each test
+// gets its own schema, dropped when it ends. CI must set a DSN; a missing one
+// is a failure there, not a silent skip.
 func testDSN(t *testing.T) string {
 	t.Helper()
 	for _, name := range []string{"KEEL_BOARD_TEST_DSN", "TEST_DSN"} {
 		if dsn := strings.TrimSpace(os.Getenv(name)); dsn != "" {
 			return dsn
 		}
+	}
+	if strings.TrimSpace(os.Getenv("CI")) != "" {
+		t.Fatal("CI requires KEEL_BOARD_TEST_DSN (or TEST_DSN); PostgreSQL tests must not be skipped")
 	}
 	t.Skip("PostgreSQL tests skipped: set KEEL_BOARD_TEST_DSN (or TEST_DSN), for example postgres://localhost:5432/postgres?sslmode=disable")
 	return ""

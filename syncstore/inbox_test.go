@@ -166,6 +166,7 @@ func TestInboxLeaseIsExclusiveAcrossWorkers(t *testing.T) {
 			leased = make(map[string]boardsync.InboxItem)
 			wg     sync.WaitGroup
 			start  = make(chan struct{})
+			errs   = make(chan error, 8)
 		)
 		for i := 0; i < 8; i++ {
 			wg.Add(1)
@@ -174,6 +175,7 @@ func TestInboxLeaseIsExclusiveAcrossWorkers(t *testing.T) {
 				<-start
 				items, err := store.LeaseInbox(ctx, "t1", "slack", 10, "worker")
 				if err != nil {
+					errs <- err
 					return
 				}
 				mu.Lock()
@@ -185,6 +187,10 @@ func TestInboxLeaseIsExclusiveAcrossWorkers(t *testing.T) {
 		}
 		close(start)
 		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Fatalf("concurrent lease: %v", err)
+		}
 		if len(leased) != 2 {
 			t.Fatalf("workers leased %d distinct items: %+v", len(leased), leased)
 		}

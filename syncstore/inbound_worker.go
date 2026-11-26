@@ -3,7 +3,6 @@ package syncstore
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"time"
 
@@ -12,12 +11,13 @@ import (
 
 // WorkResult counts one worker pass.
 type WorkResult struct {
-	Leased  int `json:"leased"`
-	Acked   int `json:"acked"`
-	Skipped int `json:"skipped"`
-	Retried int `json:"retried"`
-	Dead    int `json:"dead"`
-	Lost    int `json:"lost"`
+	Leased   int `json:"leased"`
+	Acked    int `json:"acked"`
+	Skipped  int `json:"skipped"`
+	Deferred int `json:"deferred"`
+	Retried  int `json:"retried"`
+	Dead     int `json:"dead"`
+	Lost     int `json:"lost"`
 }
 
 // InboundWorkerConfig configure one inbound lane consumer. A worker is scoped
@@ -36,7 +36,10 @@ type InboundWorkerConfig struct {
 	// PollInterval is how long Run waits after a pass with no work. Zero means
 	// one second.
 	PollInterval time.Duration
-	Logger       *slog.Logger
+	// Defer is how long a job is released when its entry isn't ready. Zero
+	// means one second.
+	Defer  time.Duration
+	Logger *slog.Logger
 }
 
 // InboundWorker leases and imports inbox items. The import is idempotent by
@@ -51,6 +54,7 @@ type InboundWorker struct {
 	owner    string
 	limit    int
 	poll     time.Duration
+	deferFor time.Duration
 	logger   *slog.Logger
 }
 
@@ -71,13 +75,17 @@ func NewInboundWorker(cfg InboundWorkerConfig) (*InboundWorker, error) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
 	}
+	if cfg.Defer <= 0 {
+		cfg.Defer = time.Second
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	return &InboundWorker{
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner,
 		tenant: cfg.Tenant, key: cfg.Key, owner: leaseOwner(cfg.Owner),
-		limit: cfg.Limit, poll: cfg.PollInterval, logger: cfg.Logger,
+		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer,
+		logger: cfg.Logger,
 	}, nil
 }
 
@@ -97,13 +105,27 @@ func (w *InboundWorker) Process(ctx context.Context) (WorkResult, error) {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
-		entry, ok := w.registry.Get(w.key)
-		var jobErr error
-		if !ok {
-			jobErr = boardsync.Permanent(fmt.Errorf("syncstore: sync entry %q is not registered", w.key))
-		} else {
-			jobErr = w.runner.Inbound(ctx, entry, item.Event)
+		entry, ok := w.registry.Get(w.tenant, w.key)
+		if !ok || entry.Validate() != nil {
+			// The entry isn't registered for this tenant (or its platform
+			// doesn't match its provider). Don't burn the item's retry budget
+			// or dead-letter another key's work: release it and try later.
+			result.Deferred++
+			if err := w.store.ReleaseInbox(context.WithoutCancel(ctx), w.tenant, w.key, item.ID, item.Lease, w.deferFor); err != nil {
+				if errors.Is(err, ErrLeaseLost) {
+					result.Lost++
+					continue
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			w.logger.Warn("sync inbound entry is not ready",
+				"tenant", w.tenant, "key", w.key, "event", item.ID)
+			continue
 		}
+		jobErr := w.runner.Inbound(ctx, entry, item.Event)
 		if err := ctx.Err(); err != nil {
 			// The import may not have finished; leave the lease to expire
 			// rather than recording a failure it didn't have.

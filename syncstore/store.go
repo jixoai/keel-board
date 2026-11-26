@@ -258,34 +258,46 @@ type Store interface {
 	PushInbox(ctx context.Context, tenant string, key boardsync.Key, records []boardsync.Record) (InboxPush, error)
 	LeaseInbox(ctx context.Context, tenant string, key boardsync.Key, limit int, owner string) ([]boardsync.InboxItem, error)
 	AckInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, jobErr error) (AckResult, error)
+	// ReleaseInbox clears a lease without counting an attempt, so a worker
+	// that isn't ready for its key doesn't burn the item's retry budget.
+	ReleaseInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, delay time.Duration) error
 	DeadInbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]boardsync.InboxItem, error)
 	RetryInbox(ctx context.Context, tenant string, key boardsync.Key, id string) error
 	InboxDepth(ctx context.Context, tenant string, key boardsync.Key) (InboxDepth, error)
 
 	// Outbound. EnqueueOutbox turns one board fact and its targets into one
-	// deterministic job per target. LeaseOutbox returns at most one due job
-	// per board-thread lane across all keys. AckOutbox commits the receipt and
-	// the copy together, or schedules/dead-letters a failure.
+	// deterministic job per target. LeaseOutbox returns at most one due job per
+	// board-thread lane, but only for the caller's keys: lane heads are ranked
+	// across every key, so a worker never jumps over another key's earlier job.
 	EnqueueOutbox(ctx context.Context, tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) (EnqueueResult, error)
-	LeaseOutbox(ctx context.Context, tenant string, limit int, owner string) ([]Delivery, error)
+	LeaseOutbox(ctx context.Context, tenant string, keys []boardsync.Key, limit int, owner string) ([]Delivery, error)
 	AckOutbox(ctx context.Context, tenant, deliveryID, lease string, jobErr error, copy *Copy) (AckResult, error)
+	// ReleaseOutbox is ReleaseInbox for a delivery: no attempt is counted and
+	// the lane stays ordered.
+	ReleaseOutbox(ctx context.Context, tenant, deliveryID, lease string, delay time.Duration) error
 	DeadOutbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error)
 	RetryOutbox(ctx context.Context, tenant, deliveryID string) error
 	OutboxDepth(ctx context.Context, tenant string) (OutboxDepth, error)
 	Copy(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error)
 	CopyForMessage(ctx context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error)
+	// SaveCopy persists a post's copy. The runner calls it before it records
+	// message.synced, so a receipt retry finds the copy and doesn't post again.
+	SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error)
 	TargetFailures(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error)
 
-	// Threads.
+	// Threads. ThreadByTarget is the reverse of a thread mapping; ThreadSynced
+	// answers the Gate's key-prefixed external thread.
 	UpsertThread(ctx context.Context, thread Thread) (Thread, error)
 	Threads(ctx context.Context, tenant string, boardThread uint64) ([]Thread, error)
+	ThreadByTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (Thread, bool, error)
+	ThreadSynced(ctx context.Context, tenant string, key boardsync.Key, external string) (bool, error)
 	RemoveThread(ctx context.Context, tenant, id string) error
 
 	// Source cursors and bridge nonces.
 	Cursor(ctx context.Context, tenant string, key boardsync.Key, source string) (string, bool, error)
 	SetCursor(ctx context.Context, tenant string, key boardsync.Key, source, cursor string) error
 	ClaimNonce(ctx context.Context, tenant string, key boardsync.Key, nonce string, ttl time.Duration) (bool, error)
-	PruneNonces(ctx context.Context, before time.Time) (int64, error)
+	PruneNonces(ctx context.Context, tenant string, before time.Time) (int64, error)
 }
 
 // validTenant refuses an empty or unbounded tenant, so a caller can't
@@ -300,6 +312,20 @@ func validTenant(tenant string) error {
 		}
 	}
 	return nil
+}
+
+// ownedKeys validates a worker's key set and returns it as a set. An empty set
+// means the worker owns nothing, never "all keys": a missing configuration must
+// not let one key's worker burn another key's deliveries.
+func ownedKeys(keys []boardsync.Key) (map[boardsync.Key]struct{}, error) {
+	owned := make(map[boardsync.Key]struct{}, len(keys))
+	for _, key := range keys {
+		if err := expectKey(key); err != nil {
+			return nil, err
+		}
+		owned[key] = struct{}{}
+	}
+	return owned, nil
 }
 
 // prepareRecords validates a webhook's records and fills their event identity.
@@ -319,7 +345,7 @@ func prepareRecords(key boardsync.Key, records []boardsync.Record) ([]boardsync.
 			return nil, fmt.Errorf("%w: record key %q isn't the entry key %q", boardsync.ErrBadRequest, record.Event.Key, key)
 		}
 		if err := record.Validate(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
 		}
 		if _, err := json.Marshal(record.Event); err != nil {
 			return nil, fmt.Errorf("%w: event %q isn't JSON", boardsync.ErrBadRequest, record.Event.ID)
@@ -367,6 +393,12 @@ func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent,
 	if !key.Valid() {
 		return nil, fmt.Errorf("%w: %q isn't a sync key", boardsync.ErrBadRequest, key)
 	}
+	if event.Tenant == "" {
+		event.Tenant = tenant
+	}
+	if event.Tenant != tenant {
+		return nil, fmt.Errorf("%w: event tenant %q isn't the delivery tenant %q", boardsync.ErrBadRequest, event.Tenant, tenant)
+	}
 	if !deliverable(event.Type) {
 		return nil, fmt.Errorf("%w: sync can't deliver %q", boardsync.ErrBadRequest, event.Type)
 	}
@@ -388,7 +420,7 @@ func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent,
 	if event.Thread == 0 || message.Thread == 0 {
 		return nil, fmt.Errorf("%w: a delivery needs a board thread", boardsync.ErrBadRequest)
 	}
-	if message.NoSync {
+	if message.NoSync || event.NoSync {
 		return nil, nil
 	}
 	// The stored event doesn't need a second copy of the message; the runner
@@ -434,30 +466,42 @@ func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent,
 // the same outbox row. event.ID is the board's monotone seq, so two edits to
 // one message are two deliveries while a redelivery is one.
 func DeliveryID(tenant string, key boardsync.Key, event boardsync.BoardEvent, target boardsync.ResolvedTarget) string {
-	parts := []string{
+	return "delivery_" + boardsync.Hash(keyParts(
 		tenant, string(key), strconv.FormatUint(event.ID, 10), string(event.Type),
 		targetKeyOf(target), event.Emoji, event.Cause,
-	}
-	return "delivery_" + boardsync.Hash(strings.Join(parts, "\x1f"))
+	))
 }
 
 func targetKeyOf(target boardsync.ResolvedTarget) string {
-	return strings.Join([]string{
+	return keyParts(
 		string(target.Key), string(target.Platform), target.Channel,
 		target.Thread, target.Subthread, string(target.Kind),
-	}, "\x1f")
+	)
+}
+
+// keyParts encodes parts unambiguously: each part is its byte length, a colon,
+// and the bytes. A platform ID containing a separator can't make two different
+// targets share a delivery or copy identity.
+func keyParts(parts ...string) string {
+	var b strings.Builder
+	for _, part := range parts {
+		b.WriteString(strconv.Itoa(len(part)))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	return b.String()
 }
 
 func copyIDOf(key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) string {
-	return "copy_" + boardsync.Hash(strings.Join([]string{
+	return "copy_" + boardsync.Hash(keyParts(
 		string(key), targetKeyOf(target), strconv.FormatUint(boardMessage, 10),
-	}, "\x1f"))
+	))
 }
 
 func threadIDOf(boardThread uint64, key boardsync.Key, target boardsync.ResolvedTarget) string {
-	return "thread_" + boardsync.Hash(strings.Join([]string{
+	return "thread_" + boardsync.Hash(keyParts(
 		strconv.FormatUint(boardThread, 10), string(key), targetKeyOf(target),
-	}, "\x1f"))
+	))
 }
 
 // ErrorCode reduces an error to a stable, content-free class. Store rows,
@@ -488,30 +532,36 @@ func ErrorCode(err error) string {
 	}
 }
 
-// copyFromReceipt builds the copy a successful post records. It returns nil
+// copyFromRequest builds the copy a successful post records. It returns nil
 // when the provider's answer carries no external message (an edit, a no-op
 // labels change, or a thread target's thread.synced).
-func copyFromReceipt(job Delivery, receipt boardsync.Receipt) *Copy {
-	if receipt.Message == "" {
+func copyFromRequest(req boardsync.CopyRequest) *Copy {
+	if req.Receipt.Message == "" {
 		return nil
 	}
-	externalThread := receipt.Thread.Thread
+	externalThread := req.Receipt.Thread.Thread
 	if externalThread == "" {
-		externalThread = receipt.Thread.Native()
+		externalThread = req.Receipt.Thread.Native()
 	}
 	if externalThread == "" {
-		externalThread = job.Target.Thread
+		externalThread = req.Target.Thread
 	}
 	copy := &Copy{
-		BoardMessage:    job.Message.ID,
-		BoardThread:     job.Message.Thread,
-		Key:             job.Key,
-		Target:          job.Target,
+		BoardMessage:    req.Message.ID,
+		BoardThread:     req.Message.Thread,
+		Key:             req.Target.Key,
+		Target:          req.Target,
 		ExternalThread:  externalThread,
-		ExternalMessage: receipt.Message,
+		ExternalMessage: req.Receipt.Message,
 	}
 	copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
 	return copy
+}
+
+func copyFromReceipt(job Delivery, receipt boardsync.Receipt) *Copy {
+	return copyFromRequest(boardsync.CopyRequest{
+		Tenant: "", Message: job.Message, Target: job.Target, Receipt: receipt,
+	})
 }
 
 func cloneJSON[T any](value T) (T, error) {

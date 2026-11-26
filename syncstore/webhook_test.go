@@ -17,7 +17,7 @@ import (
 func testWebhookProvider(t *testing.T, registry *boardsync.Registry) *fake.Provider {
 	t.Helper()
 	provider := fake.New("slack", boardsync.Capabilities{})
-	if err := registry.Add(boardsync.Entry{Key: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+	if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
 		t.Fatalf("register entry: %v", err)
 	}
 	return provider
@@ -106,15 +106,21 @@ func TestWebhookHandlerStatuses(t *testing.T) {
 	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
 		seedEntry(t, store, "t1", "slack", true)
 		seedEntry(t, store, "t1", "disabled", true)
+		seedEntry(t, store, "t1", "pending", true)
 		if changed, err := store.SetEntryEnabled(t.Context(), "t1", "disabled", false); err != nil || !changed {
 			t.Fatalf("disable entry: %v, %v", changed, err)
 		}
 		registry := boardsync.NewRegistry()
 		provider := fake.New("slack", boardsync.Capabilities{})
-		for _, key := range []boardsync.Key{"slack", "disabled"} {
-			if err := registry.Add(boardsync.Entry{Key: key, Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+		for _, key := range []boardsync.Key{"slack", "disabled", "mismatch"} {
+			if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: key, Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
 				t.Fatalf("register %s: %v", key, err)
 			}
+		}
+		if _, err := store.UpsertEntry(t.Context(), syncstore.Entry{
+			Tenant: "t1", Key: "mismatch", Platform: "github", Enabled: true,
+		}); err != nil {
+			t.Fatalf("seed mismatched entry: %v", err)
 		}
 		provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
 			return boardsync.Intake{Response: boardsync.OK()}, nil
@@ -127,8 +133,10 @@ func TestWebhookHandlerStatuses(t *testing.T) {
 			request func() *http.Request
 			status  int
 		}{
-			{"unknown key", func() *http.Request { return webhookRequest("other", "{}") }, http.StatusNotFound},
-			{"disabled", func() *http.Request { return webhookRequest("disabled", "{}") }, http.StatusNotFound},
+			{"unknown key", func() *http.Request { return webhookRequest("other", "{}") }, http.StatusOK},
+			{"disabled", func() *http.Request { return webhookRequest("disabled", "{}") }, http.StatusOK},
+			{"unregistered", func() *http.Request { return webhookRequest("pending", "{}") }, http.StatusServiceUnavailable},
+			{"platform mismatch", func() *http.Request { return webhookRequest("mismatch", "{}") }, http.StatusInternalServerError},
 			{"get", func() *http.Request { return httptest.NewRequest(http.MethodGet, "/webhooks/slack", nil) }, http.StatusMethodNotAllowed},
 			{"bad key", func() *http.Request { return webhookRequest("BadKey", "{}") }, http.StatusNotFound},
 			{"oversized", func() *http.Request { return webhookRequest("slack", strings.Repeat("x", 64)) }, http.StatusRequestEntityTooLarge},
@@ -145,6 +153,9 @@ func TestWebhookHandlerStatuses(t *testing.T) {
 				}
 			})
 		}
+		if receives := provider.Receives(); len(receives) != 0 {
+			t.Fatalf("a refused request reached the provider: %d calls", len(receives))
+		}
 
 		unauthorized := newWebhookHandler(t, store, registry, func(*http.Request) (string, error) {
 			return "", errors.New("not signed in")
@@ -159,8 +170,8 @@ func TestWebhookHandlerStatuses(t *testing.T) {
 		otherTenant := newWebhookHandler(t, store, registry, func(*http.Request) (string, error) { return "t2", nil }, 1<<20)
 		recorder = httptest.NewRecorder()
 		otherTenant.ServeHTTP(recorder, webhookRequest("slack", "{}"))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("cross-tenant webhook = %d", recorder.Code)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("cross-tenant webhook = %d, want a silent 200", recorder.Code)
 		}
 	})
 }

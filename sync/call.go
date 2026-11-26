@@ -18,6 +18,7 @@ type SyncFunc func(ctx context.Context, call *Call) error
 // most once per call; a call used after the function returns answers
 // ErrCallFinished.
 type Call struct {
+	Tenant    string
 	Key       Key
 	Direction Direction
 	// Event is the normalized platform event for an inbound call.
@@ -56,6 +57,10 @@ type callState struct {
 	deliverRes  Receipt
 	deliverErr  error
 
+	startOnce sync.Once
+	startRes  ThreadRef
+	startErr  error
+
 	permalinkOnce sync.Once
 	permalink     string
 	permalinkErr  error
@@ -79,6 +84,7 @@ type callOps interface {
 
 // DeliverRequest is what Deliver hands to the board side.
 type DeliverRequest struct {
+	Tenant   string
 	Key      Key
 	Event    BoardEvent
 	Message  Message
@@ -89,6 +95,7 @@ type DeliverRequest struct {
 
 // StartRequest is what Start hands to the board side.
 type StartRequest struct {
+	Tenant  string
 	Key     Key
 	Message Message
 	Channel string
@@ -109,6 +116,7 @@ func (c *Call) Import(ctx context.Context, channel string, opts ImportOptions) (
 	}
 	c.state.importOnce.Do(func() {
 		c.state.importRes, c.state.importErr = c.ops.Import(ctx, ImportRequest{
+			Tenant:    c.Tenant,
 			Key:       c.Key,
 			EventID:   c.Event.ID,
 			Channel:   channel,
@@ -141,6 +149,7 @@ func (c *Call) Deliver(ctx context.Context, opts DeliverOptions) (Receipt, error
 			renderer = c.Renderer
 		}
 		c.state.deliverRes, c.state.deliverErr = c.ops.Deliver(ctx, DeliverRequest{
+			Tenant:   c.Tenant,
 			Key:      c.Key,
 			Event:    *c.Board,
 			Message:  *c.Message,
@@ -164,7 +173,12 @@ func (c *Call) Start(ctx context.Context, channel string) (ThreadRef, error) {
 	if c.Direction != DirectionOut || c.Message == nil {
 		return ThreadRef{}, fmt.Errorf("%w: Start is only for an outbound event", ErrBadRequest)
 	}
-	return c.ops.Start(ctx, StartRequest{Key: c.Key, Message: *c.Message, Channel: channel})
+	c.state.startOnce.Do(func() {
+		c.state.startRes, c.state.startErr = c.ops.Start(ctx, StartRequest{
+			Tenant: c.Tenant, Key: c.Key, Message: *c.Message, Channel: channel,
+		})
+	})
+	return c.state.startRes, c.state.startErr
 }
 
 // ResolveChannel turns a platform channel's name into its ID.
@@ -238,6 +252,7 @@ func (r *Runner) Inbound(ctx context.Context, entry Entry, event Event) error {
 		return fmt.Errorf("%w: event key %q isn't entry %q", ErrBadRequest, event.Key, entry.Key)
 	}
 	call := newCall(&Call{
+		Tenant:    entry.Tenant,
 		Key:       entry.Key,
 		Direction: DirectionIn,
 		Event:     &event,
@@ -251,20 +266,37 @@ func (r *Runner) Inbound(ctx context.Context, entry Entry, event Event) error {
 // target nil is a new root: the function may call Start. copy is the native
 // platform message ID for an edit, delete, or reaction.
 func (r *Runner) Outbound(ctx context.Context, entry Entry, event BoardEvent, message Message, target *ResolvedTarget, copy string) (Receipt, error) {
+	return r.OutboundWithOptions(ctx, entry, event, message, target, copy, OutboundOptions{})
+}
+
+// OutboundWithOptions is Outbound with a renderer and a copy sink. The worker
+// uses the sink so a post's copy is durable before Host.Record; a receipt
+// failure then retries without posting to the platform again.
+func (r *Runner) OutboundWithOptions(ctx context.Context, entry Entry, event BoardEvent, message Message, target *ResolvedTarget, copy string, opts OutboundOptions) (Receipt, error) {
 	if err := entry.Validate(); err != nil {
 		return Receipt{}, err
+	}
+	if event.Tenant == "" {
+		event.Tenant = entry.Tenant
+	}
+	if event.Tenant != entry.Tenant {
+		return Receipt{}, fmt.Errorf("%w: event tenant %q isn't entry tenant %q", ErrBadRequest, event.Tenant, entry.Tenant)
 	}
 	if event.Message == nil {
 		event.Message = &message
 	}
 	call := newCall(&Call{
+		Tenant:    entry.Tenant,
 		Key:       entry.Key,
 		Direction: DirectionOut,
 		Board:     &event,
 		Message:   &message,
 		Target:    target,
 		Copy:      copy,
-		ops:       &outboundOps{host: r.host, provider: entry.Provider},
+		Renderer:  opts.Renderer,
+		ops: &outboundOps{
+			host: r.host, provider: entry.Provider, copySink: opts.CopySink,
+		},
 	})
 	defer call.finish()
 	if err := entry.Sync(ctx, call); err != nil {
@@ -286,10 +318,17 @@ func (r *Runner) OfferRoot(ctx context.Context, entry Entry, event BoardEvent, m
 	if err := entry.Validate(); err != nil {
 		return err
 	}
+	if event.Tenant == "" {
+		event.Tenant = entry.Tenant
+	}
+	if event.Tenant != entry.Tenant {
+		return fmt.Errorf("%w: event tenant %q isn't entry tenant %q", ErrBadRequest, event.Tenant, entry.Tenant)
+	}
 	if event.Message == nil {
 		event.Message = &message
 	}
 	call := newCall(&Call{
+		Tenant:    entry.Tenant,
 		Key:       entry.Key,
 		Direction: DirectionOut,
 		Board:     &event,
@@ -336,6 +375,7 @@ func (o *inboundOps) Permalink(ctx context.Context, key Key, event Event) (strin
 type outboundOps struct {
 	host     Host
 	provider Provider
+	copySink CopySink
 }
 
 func (o *outboundOps) Import(context.Context, ImportRequest) (ImportResult, error) {
@@ -454,17 +494,29 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 	}
 	// Only a post creates a copy; edits, deletes, and reactions are
 	// best-effort changes to one and record no receipt (upstream semantics).
-	if o.host != nil && (req.Event.Type == BoardMessagePosted || req.Event.Type == BoardThreadSynced) {
-		record := BoardEvent{
-			Type:     BoardMessageSynced,
-			Thread:   req.Message.Thread,
-			Message:  &req.Message,
-			External: &receipt.Thread,
-			Files:    receipt.Files,
-			FilesSet: receipt.FilesSet,
+	if req.Event.Type == BoardMessagePosted || req.Event.Type == BoardThreadSynced {
+		// The copy is durable before the receipt, so a receipt failure can be
+		// retried without posting to the platform a second time.
+		if o.copySink != nil && receipt.Message != "" {
+			if err := o.copySink(ctx, CopyRequest{
+				Tenant: req.Tenant, Message: req.Message, Target: req.Target, Receipt: receipt,
+			}); err != nil {
+				return receipt, err
+			}
 		}
-		if err := o.host.Record(ctx, record); err != nil {
-			return receipt, err
+		if o.host != nil {
+			record := BoardEvent{
+				Tenant:   req.Tenant,
+				Type:     BoardMessageSynced,
+				Thread:   req.Message.Thread,
+				Message:  &req.Message,
+				External: &receipt.Thread,
+				Files:    receipt.Files,
+				FilesSet: receipt.FilesSet,
+			}
+			if err := o.host.Record(ctx, record); err != nil {
+				return receipt, err
+			}
 		}
 	}
 	return receipt, nil
@@ -498,6 +550,7 @@ func (o *outboundOps) Start(ctx context.Context, req StartRequest) (ThreadRef, e
 		return ThreadRef{}, errors.New("sync: outbound call has no host")
 	}
 	if err := o.host.Record(ctx, BoardEvent{
+		Tenant: req.Tenant,
 		Type:   BoardThreadSynced,
 		Thread: req.Message.Thread,
 		Target: &ref,

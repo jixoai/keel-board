@@ -18,6 +18,7 @@
 package sync
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -419,6 +420,9 @@ func (t ResolvedTarget) Validate() error {
 	if !t.Key.Valid() {
 		return fmt.Errorf("%w: target has no valid sync key", ErrBadRequest)
 	}
+	if t.Platform == "" {
+		return fmt.Errorf("%w: target has no platform", ErrBadRequest)
+	}
 	if t.Channel == "" {
 		return fmt.Errorf("%w: target has no platform channel", ErrBadRequest)
 	}
@@ -430,6 +434,12 @@ func (t ResolvedTarget) Validate() error {
 	}
 	if t.Kind == TargetThread && t.Thread == "" {
 		return fmt.Errorf("%w: a thread target has no thread ID", ErrBadRequest)
+	}
+	if t.Kind == TargetChannel && t.Subthread != "" {
+		return fmt.Errorf("%w: a channel target has no sub-thread", ErrBadRequest)
+	}
+	if t.Subthread != "" && !strings.HasPrefix(t.Subthread, t.Thread) {
+		return fmt.Errorf("%w: a sub-thread must extend its thread", ErrBadRequest)
 	}
 	return nil
 }
@@ -586,6 +596,9 @@ const (
 
 // BoardEvent is one board log fact offered to sync, or one sync records.
 type BoardEvent struct {
+	// Tenant is the board the fact belongs to. Sync carries it through to
+	// receipts so a host can't write into another tenant's log.
+	Tenant  string         `json:"tenant,omitempty"`
 	ID      uint64         `json:"id"`
 	Type    BoardEventType `json:"type"`
 	Thread  uint64         `json:"thread"`
@@ -638,6 +651,7 @@ type RootOverride func(RootDraft) (RootPatch, error)
 
 // ImportRequest is one inbound import, as a Host applies it.
 type ImportRequest struct {
+	Tenant  string `json:"tenant"`
 	Key     Key    `json:"key"`
 	EventID string `json:"eventId"`
 	// Channel is the board channel a new root lands in. Empty means only a
@@ -681,6 +695,29 @@ func DefaultRender(in RenderInput) (string, error) {
 // DeliverOptions are the options a sync function passes to Deliver.
 type DeliverOptions struct {
 	Renderer Renderer `json:"-"`
+}
+
+// CopyRequest is a successful post a host may persist before it records the
+// message.synced receipt. Persisting it first is what lets a retry after a
+// receipt failure skip the platform post.
+type CopyRequest struct {
+	Tenant  string
+	Message Message
+	Target  ResolvedTarget
+	Receipt Receipt
+}
+
+// CopySink persists a copy. A Runner calls it after a provider answers and
+// before Host.Record; a failure is returned so the outbox retries the job.
+type CopySink func(context.Context, CopyRequest) error
+
+// OutboundOptions are the runner-level options a consumer supplies for one
+// outbound call.
+type OutboundOptions struct {
+	// Renderer renders Markdown for every Deliver in the call.
+	Renderer Renderer
+	// CopySink persists a post's copy before the receipt is written.
+	CopySink CopySink
 }
 
 // Errors a provider may return. The registry maps them to HTTP answers and the

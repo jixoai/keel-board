@@ -350,6 +350,37 @@ func (m *Memory) AckInbox(_ context.Context, tenant string, key boardsync.Key, i
 	return AckResult{}, ErrLeaseLost
 }
 
+// ReleaseInbox implements Store.
+func (m *Memory) ReleaseInbox(_ context.Context, tenant string, key boardsync.Key, id, lease string, delay time.Duration) error {
+	if err := validTenant(tenant); err != nil {
+		return err
+	}
+	if err := expectKey(key); err != nil {
+		return err
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	for _, row := range m.inboxLocked(tenant, key).rows {
+		if row.item.ID != id {
+			continue
+		}
+		if row.state != StateLeased || row.item.Lease != lease || !row.leaseUntil.After(now) {
+			return ErrLeaseLost
+		}
+		row.state = StatePending
+		row.item.Lease = ""
+		row.availableAt = now.Add(delay)
+		row.leaseOwner = ""
+		row.leaseUntil = time.Time{}
+		return nil
+	}
+	return ErrLeaseLost
+}
+
 // DeadInbox implements Store.
 func (m *Memory) DeadInbox(_ context.Context, tenant string, key boardsync.Key, limit int) ([]boardsync.InboxItem, error) {
 	if err := validTenant(tenant); err != nil {
@@ -473,9 +504,16 @@ func (m *Memory) EnqueueOutbox(_ context.Context, tenant string, key boardsync.K
 }
 
 // LeaseOutbox implements Store.
-func (m *Memory) LeaseOutbox(_ context.Context, tenant string, limit int, owner string) ([]Delivery, error) {
+func (m *Memory) LeaseOutbox(_ context.Context, tenant string, keys []boardsync.Key, limit int, owner string) ([]Delivery, error) {
 	if err := validTenant(tenant); err != nil {
 		return nil, err
+	}
+	owned, err := ownedKeys(keys)
+	if err != nil {
+		return nil, err
+	}
+	if len(owned) == 0 {
+		return nil, nil
 	}
 	if limit <= 0 {
 		limit = 10
@@ -494,7 +532,12 @@ func (m *Memory) LeaseOutbox(_ context.Context, tenant string, limit int, owner 
 		if _, seen := seenLane[row.lane]; seen {
 			continue
 		}
+		// Rank every lane's head before filtering by ownership: a worker must
+		// not jump over another key's earlier job on the same board thread.
 		seenLane[row.lane] = struct{}{}
+		if _, mine := owned[row.delivery.Key]; !mine {
+			continue
+		}
 		if row.state == StatePending && row.availableAt.After(now) {
 			continue
 		}
@@ -539,6 +582,12 @@ func (m *Memory) AckOutbox(_ context.Context, tenant, deliveryID, lease string, 
 	if row == nil || row.state != StateLeased || row.delivery.Lease != lease || !row.leaseUntil.After(now) {
 		return AckResult{}, ErrLeaseLost
 	}
+	if copy != nil && jobErr == nil {
+		if copy.Key != row.delivery.Key || copy.Target != row.delivery.Target ||
+			copy.BoardMessage != row.delivery.Message.ID || copy.BoardThread != row.delivery.Message.Thread {
+			return AckResult{}, fmt.Errorf("%w: a copy doesn't belong to this delivery", boardsync.ErrBadRequest)
+		}
+	}
 	row.delivery.Lease = ""
 	row.leaseOwner = ""
 	row.leaseUntil = time.Time{}
@@ -571,6 +620,33 @@ func (m *Memory) AckOutbox(_ context.Context, tenant, deliveryID, lease string, 
 	row.availableAt = now.Add(m.cfg.OutboundRetry.Delay(row.delivery.Attempts))
 	row.delivery.State = StatePending
 	return AckResult{State: StatePending, Attempts: row.delivery.Attempts, Retried: true}, nil
+}
+
+// ReleaseOutbox implements Store.
+func (m *Memory) ReleaseOutbox(_ context.Context, tenant, deliveryID, lease string, delay time.Duration) error {
+	if err := validTenant(tenant); err != nil {
+		return err
+	}
+	if deliveryID == "" || lease == "" {
+		return fmt.Errorf("%w: a release needs a delivery and a lease", boardsync.ErrBadRequest)
+	}
+	if delay < 0 {
+		delay = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	row := m.tenantLocked(tenant).byDelivery[deliveryID]
+	if row == nil || row.state != StateLeased || row.delivery.Lease != lease || !row.leaseUntil.After(now) {
+		return ErrLeaseLost
+	}
+	row.state = StatePending
+	row.availableAt = now.Add(delay)
+	row.leaseOwner = ""
+	row.leaseUntil = time.Time{}
+	row.delivery.State = StatePending
+	row.delivery.Lease = ""
+	return nil
 }
 
 // DeadOutbox implements Store.
@@ -673,6 +749,21 @@ func (m *Memory) Copy(_ context.Context, tenant string, key boardsync.Key, targe
 	return copy, ok, nil
 }
 
+// SaveCopy implements Store.
+func (m *Memory) SaveCopy(_ context.Context, tenant string, copy Copy) (Copy, error) {
+	if err := validTenant(tenant); err != nil {
+		return Copy{}, err
+	}
+	if err := copy.Validate(); err != nil {
+		return Copy{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
+	m.saveCopyLocked(tenant, copy, m.now())
+	return m.tenantLocked(tenant).copies[copy.ID], nil
+}
+
 // CopyForMessage implements Store.
 func (m *Memory) CopyForMessage(_ context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error) {
 	if err := validTenant(tenant); err != nil {
@@ -768,6 +859,61 @@ func (m *Memory) Threads(_ context.Context, tenant string, boardThread uint64) (
 	return out, nil
 }
 
+// ThreadByTarget implements Store.
+func (m *Memory) ThreadByTarget(_ context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (Thread, bool, error) {
+	if err := validTenant(tenant); err != nil {
+		return Thread{}, false, err
+	}
+	if err := expectKey(key); err != nil {
+		return Thread{}, false, err
+	}
+	if target.Key != key {
+		return Thread{}, false, fmt.Errorf("%w: target key isn't the lookup key", boardsync.ErrBadRequest)
+	}
+	if err := target.Validate(); err != nil {
+		return Thread{}, false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, thread := range m.tenantLocked(tenant).threads {
+		if thread.Key != key || thread.Platform != target.Platform ||
+			thread.Channel != target.Channel || thread.Thread != target.Thread ||
+			thread.Subthread != target.Subthread || thread.Kind != target.Kind {
+			continue
+		}
+		return thread, true, nil
+	}
+	return Thread{}, false, nil
+}
+
+// ThreadSynced implements Store.
+func (m *Memory) ThreadSynced(_ context.Context, tenant string, key boardsync.Key, external string) (bool, error) {
+	if err := validTenant(tenant); err != nil {
+		return false, err
+	}
+	if err := expectKey(key); err != nil {
+		return false, err
+	}
+	if err := expectLabel(external, "external thread", 1200); err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, thread := range m.tenantLocked(tenant).threads {
+		if thread.Key != key {
+			continue
+		}
+		native := thread.Thread
+		if native == "" {
+			native = thread.Channel
+		}
+		if string(key)+":"+native == external {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // RemoveThread implements Store.
 func (m *Memory) RemoveThread(_ context.Context, tenant, id string) error {
 	if err := validTenant(tenant); err != nil {
@@ -846,7 +992,10 @@ func (m *Memory) ClaimNonce(_ context.Context, tenant string, key boardsync.Key,
 }
 
 // PruneNonces implements Store.
-func (m *Memory) PruneNonces(_ context.Context, before time.Time) (int64, error) {
+func (m *Memory) PruneNonces(_ context.Context, tenant string, before time.Time) (int64, error) {
+	if err := validTenant(tenant); err != nil {
+		return 0, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
@@ -854,12 +1003,10 @@ func (m *Memory) PruneNonces(_ context.Context, before time.Time) (int64, error)
 		before = now
 	}
 	var removed int64
-	for _, data := range m.tenants {
-		for key, expires := range data.nonces {
-			if !expires.After(before) {
-				delete(data.nonces, key)
-				removed++
-			}
+	for key, expires := range m.tenantLocked(tenant).nonces {
+		if !expires.After(before) {
+			delete(m.tenantLocked(tenant).nonces, key)
+			removed++
 		}
 	}
 	return removed, nil

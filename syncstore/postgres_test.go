@@ -82,7 +82,7 @@ func TestPostgresRestartRecovery(t *testing.T) {
 	if _, err := second.AckInbox(t.Context(), "t1", "slack", "m1", items[0].Lease, nil); err != nil {
 		t.Fatalf("ack after restart: %v", err)
 	}
-	jobs, err := second.LeaseOutbox(t.Context(), "t1", 10, "worker")
+	jobs, err := second.LeaseOutbox(t.Context(), "t1", []boardsync.Key{"slack"}, 10, "worker")
 	if err != nil || len(jobs) != 1 || jobs[0].Message.ID != 101 {
 		t.Fatalf("outbox after restart = %+v, %v", jobs, err)
 	}
@@ -137,12 +137,12 @@ func TestPostgresOutboxLeaseExpiry(t *testing.T) {
 		boardMessage(101, 100, "root"), []boardsync.ResolvedTarget{threadTarget("C0123", "C0123:T1")}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	first, err := store.LeaseOutbox(ctx, "t1", 1, "worker-a")
+	first, err := store.LeaseOutbox(ctx, "t1", []boardsync.Key{"slack"}, 1, "worker-a")
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first lease = %+v, %v", first, err)
 	}
 	time.Sleep(350 * time.Millisecond)
-	second, err := store.LeaseOutbox(ctx, "t1", 1, "worker-b")
+	second, err := store.LeaseOutbox(ctx, "t1", []boardsync.Key{"slack"}, 1, "worker-b")
 	if err != nil || len(second) != 1 {
 		t.Fatalf("second lease = %+v, %v", second, err)
 	}

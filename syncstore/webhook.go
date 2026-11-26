@@ -108,9 +108,26 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !found || !entry.Enabled {
-		// An unknown key and another tenant's key answer the same, so a caller
-		// can't probe which connections exist.
-		writeStatus(w, http.StatusNotFound)
+		// A key this tenant doesn't own, and one it deliberately disabled, are
+		// both accepted without reading the body or storing anything. The
+		// platform stops retrying, and a caller can't probe which connections
+		// exist.
+		writeStatus(w, http.StatusOK)
+		return
+	}
+	registered, ok := h.registry.Get(tenant, key)
+	if !ok {
+		// The tenant owns this enabled connection but this process hasn't
+		// registered it (still starting). Answer 5xx so the platform retries;
+		// 404 would drop the event.
+		h.logger.Warn("sync webhook entry is not registered", "tenant", tenant, "key", key)
+		writeStatus(w, http.StatusServiceUnavailable)
+		return
+	}
+	if registered.Platform != entry.Platform || registered.Provider.Platform() != entry.Platform {
+		h.logger.Error("sync webhook platform mismatch", "tenant", tenant, "key", key,
+			"entryPlatform", entry.Platform, "providerPlatform", registered.Provider.Platform())
+		writeStatus(w, http.StatusInternalServerError)
 		return
 	}
 	request, err := boardsync.NewWebhookRequest(r, h.maxBody)
@@ -118,7 +135,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, http.StatusRequestEntityTooLarge)
 		return
 	}
-	response, err := h.registry.HandleWebhook(r.Context(), key, request, h.gate,
+	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, h.gate,
 		NewTenantInbox(h.store, tenant, "webhook"))
 	if err != nil {
 		status := response.Status

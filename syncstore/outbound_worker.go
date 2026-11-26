@@ -10,34 +10,52 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
+// errEntryNotReady means a job's entry isn't registered for this tenant (or
+// its provider/platform pair is inconsistent). It is transient: the worker
+// releases the job without counting an attempt and never dead-letters it.
+var errEntryNotReady = errors.New("syncstore: sync entry is not ready")
+
 // OutboundWorkerConfig configure one tenant's outbound drains. A lane is a
-// board thread, so one worker drains every key's deliveries for that thread
-// in order.
+// board thread, so one worker drains its owned keys' deliveries for that
+// thread in order. Keys is required: an empty list owns nothing, never "all".
 type OutboundWorkerConfig struct {
 	Store    Store
 	Registry *boardsync.Registry
 	Runner   *boardsync.Runner
-	// Host records message.sync_failed when the outbox gives up. Required.
-	Host         boardsync.Host
-	Tenant       string
-	Owner        string
-	Limit        int
+	// Host records message.synced retries and message.sync_failed. Required.
+	Host   boardsync.Host
+	Tenant string
+	// Keys are the connections this worker owns. Required and non-empty.
+	Keys []boardsync.Key
+	// Renderer, when set, renders labels.changed edits.
+	Renderer boardsync.Renderer
+	Owner    string
+	Limit    int
+	// PollInterval is how long Run waits after a pass with no work. Zero means
+	// one second.
 	PollInterval time.Duration
-	Logger       *slog.Logger
+	// Defer is how long an unready entry's job is released for. Zero means one
+	// second.
+	Defer  time.Duration
+	Logger *slog.Logger
 }
 
 // OutboundWorker leases and delivers outbox jobs. A successful post records
-// its copy and clears that target's earlier failures; a dead delivery records
-// message.sync_failed and does not block the next job on the lane.
+// its copy before its receipt and clears that target's earlier failures; a
+// dead delivery records message.sync_failed and does not block the next job on
+// the lane.
 type OutboundWorker struct {
 	store    Store
 	registry *boardsync.Registry
 	runner   *boardsync.Runner
 	host     boardsync.Host
 	tenant   string
+	keys     []boardsync.Key
+	renderer boardsync.Renderer
 	owner    string
 	limit    int
 	poll     time.Duration
+	deferFor time.Duration
 	logger   *slog.Logger
 }
 
@@ -49,19 +67,33 @@ func NewOutboundWorker(cfg OutboundWorkerConfig) (*OutboundWorker, error) {
 	if err := validTenant(cfg.Tenant); err != nil {
 		return nil, err
 	}
+	owned, err := ownedKeys(cfg.Keys)
+	if err != nil {
+		return nil, err
+	}
+	if len(owned) == 0 {
+		return nil, errors.New("syncstore: an outbound worker needs at least one owned key")
+	}
+	keys := make([]boardsync.Key, 0, len(owned))
+	for key := range owned {
+		keys = append(keys, key)
+	}
 	if cfg.Limit <= 0 {
 		cfg.Limit = 10
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = time.Second
 	}
+	if cfg.Defer <= 0 {
+		cfg.Defer = time.Second
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
 	return &OutboundWorker{
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner, host: cfg.Host,
-		tenant: cfg.Tenant, owner: leaseOwner(cfg.Owner),
-		limit: cfg.Limit, poll: cfg.PollInterval, logger: cfg.Logger,
+		tenant: cfg.Tenant, keys: keys, renderer: cfg.Renderer, owner: leaseOwner(cfg.Owner),
+		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer, logger: cfg.Logger,
 	}, nil
 }
 
@@ -71,7 +103,7 @@ func NewOutboundWorker(cfg OutboundWorkerConfig) (*OutboundWorker, error) {
 // twice.
 func (w *OutboundWorker) Process(ctx context.Context) (WorkResult, error) {
 	result := WorkResult{}
-	jobs, err := w.store.LeaseOutbox(ctx, w.tenant, w.limit, w.owner)
+	jobs, err := w.store.LeaseOutbox(ctx, w.tenant, w.keys, w.limit, w.owner)
 	if err != nil {
 		return result, err
 	}
@@ -82,6 +114,21 @@ func (w *OutboundWorker) Process(ctx context.Context) (WorkResult, error) {
 			return result, err
 		}
 		jobErr, copy, skipped := w.deliver(ctx, job)
+		if errors.Is(jobErr, errEntryNotReady) {
+			result.Deferred++
+			if err := w.store.ReleaseOutbox(context.WithoutCancel(ctx), w.tenant, job.ID, job.Lease, w.deferFor); err != nil {
+				if errors.Is(err, ErrLeaseLost) {
+					result.Lost++
+					continue
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+			}
+			w.logger.Warn("sync delivery entry is not ready",
+				"tenant", w.tenant, "key", job.Key, "delivery", job.ID, "lane", job.Lane)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -151,17 +198,21 @@ func (w *OutboundWorker) Run(ctx context.Context) error {
 // error, an optional receipt copy, and whether it skipped an already-delivered
 // post. A missing copy for a change is permanent: retrying can't create one.
 func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Copy, bool) {
-	entry, ok := w.registry.Get(job.Key)
-	if !ok {
-		return boardsync.Permanent(fmt.Errorf("syncstore: sync entry %q is not registered", job.Key)), nil, false
+	entry, ok := w.registry.Get(w.tenant, job.Key)
+	if !ok || entry.Validate() != nil || entry.Tenant != w.tenant || entry.Key != job.Key {
+		return errEntryNotReady, nil, false
 	}
 	switch job.Event.Type {
 	case boardsync.BoardMessagePosted, boardsync.BoardThreadSynced:
 		// A copy means the post already landed; acking again must not post it
-		// a second time.
-		if _, found, err := w.store.Copy(ctx, w.tenant, job.Key, job.Target, job.Message.ID); err != nil {
+		// a second time. The receipt is retried because it may have failed
+		// after the copy was saved.
+		if copy, found, err := w.store.Copy(ctx, w.tenant, job.Key, job.Target, job.Message.ID); err != nil {
 			return err, nil, false
 		} else if found {
+			if err := w.recordSynced(ctx, job, copy); err != nil {
+				return err, nil, false
+			}
 			return nil, nil, true
 		}
 	}
@@ -174,8 +225,28 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 			return err, nil, false
 		}
 		copyID = found.ExternalMessage
+	case boardsync.BoardLabelsChanged:
+		// A label change edits a copy only when a renderer reads labels.
+		if w.renderer != nil {
+			found, err := w.copyFor(ctx, job)
+			if err != nil {
+				return err, nil, false
+			}
+			copyID = found.ExternalMessage
+		}
 	}
-	receipt, err := w.runner.Outbound(ctx, entry, job.Event, job.Message, &job.Target, copyID)
+	opts := boardsync.OutboundOptions{
+		Renderer: w.renderer,
+		CopySink: func(ctx context.Context, req boardsync.CopyRequest) error {
+			saved := copyFromRequest(req)
+			if saved == nil {
+				return nil
+			}
+			_, err := w.store.SaveCopy(ctx, w.tenant, *saved)
+			return err
+		},
+	}
+	receipt, err := w.runner.OutboundWithOptions(ctx, entry, job.Event, job.Message, &job.Target, copyID, opts)
 	if err != nil {
 		return err, nil, false
 	}
@@ -208,12 +279,26 @@ func (w *OutboundWorker) copyFor(ctx context.Context, job Delivery) (Copy, error
 	return Copy{}, boardsync.Permanent(fmt.Errorf("syncstore: board message %d has no copy for %q", job.Message.ID, job.Key))
 }
 
+// recordSynced retries the receipt for a copy that already landed. It is the
+// side effect a crash between the provider's post and Host.Record leaves
+// missing; it never posts to the platform again.
+func (w *OutboundWorker) recordSynced(ctx context.Context, job Delivery, copy Copy) error {
+	ref := boardsync.ThreadRef{
+		Key: copy.Key, Platform: copy.Target.Platform, Channel: copy.Target.Channel,
+		Thread: copy.ExternalThread,
+	}
+	return w.host.Record(ctx, boardsync.BoardEvent{
+		Tenant: w.tenant, Type: boardsync.BoardMessageSynced, Thread: job.Message.Thread,
+		Message: &job.Message, External: &ref,
+	})
+}
+
 // recordFailure writes the board receipt an operator sees after the outbox
 // gives up. The error is the content-free class, never a platform body.
 func (w *OutboundWorker) recordFailure(ctx context.Context, job Delivery, jobErr error) {
 	ref := job.Target.Ref()
 	event := boardsync.BoardEvent{
-		Type: boardsync.BoardMessageSyncFailed, Thread: job.Message.Thread,
+		Tenant: w.tenant, Type: boardsync.BoardMessageSyncFailed, Thread: job.Message.Thread,
 		Message: &job.Message, External: &ref, Error: ErrorCode(jobErr),
 	}
 	if err := w.host.Record(context.WithoutCancel(ctx), event); err != nil {
