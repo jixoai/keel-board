@@ -104,6 +104,9 @@ func (s *SyncState) AddCopy(copy SyncCopy) {
 
 // AddFiles records the file IDs of a copy's files.
 func (s *SyncState) AddFiles(target SyncTarget, files []string, filesSet bool) {
+	if s.Undelivered != nil {
+		delete(s.Undelivered, target.External())
+	}
 	for i := range s.Copies {
 		if s.Copies[i].Target == target {
 			s.Copies[i].Files = append([]string(nil), files...)

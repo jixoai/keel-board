@@ -38,9 +38,9 @@ type SyncOptions struct {
 	// serve. Empty means the server serves webhooks and management only.
 	Owned []SyncKey
 	// StartChannels lists platform channels a new board root may start a
-	// thread in, per key. The entry's own Sync function still decides; a
-	// Mirror only starts in its board channel.
-	StartChannels map[boardsync.Key][]string
+	// thread in, per connection. The entry's own Sync function still decides;
+	// a Mirror only starts in its board channel.
+	StartChannels map[SyncKey][]string
 	// FileHosts is the allowlist of hosts an inbound file or link URL may
 	// name. Empty refuses every URL.
 	FileHosts []string
@@ -63,7 +63,7 @@ type syncService struct {
 	host          *SyncHost
 	runner        *boardsync.Runner
 	webhook       *syncstore.WebhookHandler
-	startChannels map[boardsync.Key][]string
+	startChannels map[SyncKey][]string
 	owned         []SyncKey
 	logger        *slog.Logger
 }
@@ -193,7 +193,7 @@ func (s *syncService) run(ctx context.Context) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := s.runKey(ctx, owned.Tenant, owned.Key); err != nil && ctx.Err() == nil {
+			if err := s.supervise(ctx, owned); err != nil && ctx.Err() == nil {
 				errs <- err
 			}
 		}()
@@ -204,6 +204,32 @@ func (s *syncService) run(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// supervise restarts one connection's subscription with exponential backoff.
+// A store or board failure never silently ends sync for a key: it is logged
+// with the tenant and key and retried until the process stops.
+func (s *syncService) supervise(ctx context.Context, owned SyncKey) error {
+	delay := time.Second
+	const maxDelay = 30 * time.Second
+	for {
+		err := s.runKey(ctx, owned.Tenant, owned.Key)
+		if ctx.Err() != nil {
+			return nil
+		}
+		s.logger.Error("sync subscription stopped; restarting",
+			"tenant", owned.Tenant, "key", owned.Key,
+			"error", syncstore.ErrorCode(err), "retryIn", delay)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+		delay *= 2
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+	}
 }
 
 // runKey follows one connection's board thread events.
@@ -334,12 +360,16 @@ func (s *syncService) deliver(ctx context.Context, tenant string, key boardsync.
 	if err != nil {
 		return err
 	}
-	targets := deliveryTargets(threads, key, message.ID == root.ID)
+	shouldOffer := event.Type == log.EventMessagePosted && message.ID == root.ID && !message.Deleted
+	targets := deliveryTargets(threads, key, message.ID == root.ID, message.ID)
 	if len(targets) == 0 {
 		// A new root may still start a thread.
-		return s.offerRoot(ctx, tenant, key, boardEvent, rendered, message, root)
+		if shouldOffer {
+			return s.offerRoot(ctx, tenant, key, boardEvent, rendered, message, root)
+		}
+		return nil
 	}
-	if message.ID == root.ID {
+	if shouldOffer {
 		if err := s.offerRoot(ctx, tenant, key, boardEvent, rendered, message, root); err != nil {
 			return err
 		}
@@ -373,10 +403,10 @@ func (s *syncService) deliver(ctx context.Context, tenant string, key boardsync.
 // non-permanent failure is retried by the subscription; a permanent one (a
 // channel the platform can't start, a mapping mismatch) is skipped.
 func (s *syncService) offerRoot(ctx context.Context, tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, logMessage, root *log.Message) error {
-	if logMessage.ID != root.ID || message.From != "" || message.NoSync {
+	if logMessage.ID != root.ID || logMessage.Deleted || message.From != "" || message.NoSync {
 		return nil
 	}
-	channels := s.startChannels[key]
+	channels := s.startChannels[SyncKey{Tenant: tenant, Key: key}]
 	if len(channels) == 0 {
 		return nil
 	}
@@ -404,7 +434,7 @@ func (s *syncService) offerRoot(ctx context.Context, tenant string, key boardsyn
 // deliveryTargets turns a board thread's mappings into targets for one key.
 // A reply never starts a new platform thread, and a concrete thread target
 // replaces its channel target for the same platform channel.
-func deliveryTargets(threads []syncstore.Thread, key boardsync.Key, isRoot bool) []boardsync.ResolvedTarget {
+func deliveryTargets(threads []syncstore.Thread, key boardsync.Key, isRoot bool, messageID uint64) []boardsync.ResolvedTarget {
 	mine := make([]boardsync.ResolvedTarget, 0, len(threads))
 	hasThread := make(map[string]struct{})
 	for _, thread := range threads {
@@ -419,6 +449,10 @@ func deliveryTargets(threads []syncstore.Thread, key boardsync.Key, isRoot bool)
 			continue
 		}
 		if target.Kind == boardsync.TargetThread {
+			if thread.Since != 0 && messageID <= thread.Since {
+				// A thread target is future-only from its attach sequence.
+				continue
+			}
 			hasThread[string(target.Platform)+"|"+target.Channel] = struct{}{}
 		}
 		mine = append(mine, target)
@@ -864,16 +898,36 @@ func (s *Server) handleSyncAttach(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalidf("%s can't start a thread in a channel", entry.Platform))
 		return
 	}
-	if target.Kind == boardsync.TargetThread {
-		existing, found, err := s.sync.store.ThreadByTarget(req.ctx, req.tenant, key, target)
-		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		if found && existing.BoardThread != root.ID {
+	head, err := s.board.Head(req.tenant)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// Root creation and a thread attach decide the same target; serialize them
+	// with the same lock so a root cannot land and then lose its mapping.
+	lockTarget := target
+	lockTarget.Subthread = ""
+	release, err := s.sync.store.LockTarget(req.ctx, req.tenant, key, lockTarget)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	defer release()
+	// The mapping is decided and written before the receipt: a refused attach
+	// must not leave a thread.synced fact behind. Since makes a thread target
+	// future-only from this point.
+	thread, err := s.sync.store.UpsertThread(req.ctx, syncstore.Thread{
+		Tenant: req.tenant, BoardThread: root.ID, Key: key, Platform: target.Platform,
+		Channel: target.Channel, Thread: target.Thread, Subthread: target.Subthread,
+		Kind: target.Kind, Since: head,
+	})
+	if err != nil {
+		if errors.Is(err, syncstore.ErrThreadAttached) {
 			writeError(w, protocol.Conflict(protocol.CodeDuplicateID, "that platform thread is already attached to another board thread"))
 			return
 		}
+		s.fail(w, r, err)
+		return
 	}
 	ref := target.Ref()
 	if err := s.sync.host.Record(req.ctx, boardsync.BoardEvent{
@@ -882,17 +936,6 @@ func (s *Server) handleSyncAttach(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		s.fail(w, r, err)
 		return
-	}
-	thread, found, err := s.sync.store.ThreadByTarget(req.ctx, req.tenant, key, target)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	if !found {
-		thread = syncstore.Thread{
-			Tenant: req.tenant, BoardThread: root.ID, Key: key, Platform: target.Platform,
-			Channel: target.Channel, Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
-		}
 	}
 	view := syncAttachView{syncThreadView: threadView(thread), ID: thread.ID}
 	writeJSON(w, http.StatusOK, view)

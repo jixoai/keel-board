@@ -127,16 +127,7 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 		tx.Emit(log.EventMessageEdited, &log.MessageEditedPayload{
 			ID: id, Thread: current.Thread, Text: body.Text, By: req.actor.Actored(),
 		})
-		// A task's root saying what its owner hasn't read waits for them, and
-		// whoever held it has lost it. A hold or a finished task stays as it is.
-		if current.Re == nil && current.Task != nil && !ownedBy(current.Task, req.actor) {
-			if current.Task.State == "waiting" || current.Task.State == "ready" || current.Task.State == "claimed" {
-				kind := protocol.EditedHoldKind
-				tx.Emit(log.EventTaskBlocked, &log.TaskBlockedPayload{
-					ID: id, Thread: current.Thread, Kind: &kind, Reason: editedHoldReason, By: req.actor.Actored(),
-				})
-			}
-		}
+		emitTaskEditHold(tx, current, req.actor)
 		return nil
 	})
 	if err != nil {
@@ -144,6 +135,34 @@ func (s *Server) handleEdit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// emitTaskEditHold makes a task's root wait for its owner after an edit by
+// someone else. A hold or a finished task stays as it is.
+func emitTaskEditHold(tx *log.Tx, current *log.Message, actor protocol.Actor) {
+	if current == nil || current.Re != nil || current.Task == nil || ownedBy(current.Task, actor) {
+		return
+	}
+	if current.Task.State != "waiting" && current.Task.State != "ready" && current.Task.State != "claimed" {
+		return
+	}
+	kind := protocol.EditedHoldKind
+	tx.Emit(log.EventTaskBlocked, &log.TaskBlockedPayload{
+		ID: current.ID, Thread: current.Thread, Kind: &kind, Reason: editedHoldReason, By: actor.Actored(),
+	})
+}
+
+// emitTaskDeleteCancel cancels a task before its root becomes a tombstone.
+func emitTaskDeleteCancel(tx *log.Tx, current *log.Message, actor protocol.Actor) {
+	if current == nil || current.Re != nil || current.Task == nil {
+		return
+	}
+	if current.Task.State == "completed" || current.Task.State == "canceled" {
+		return
+	}
+	tx.Emit(log.EventTaskCanceled, &log.TaskCanceledPayload{
+		ID: current.ID, Thread: current.Thread, Reason: "deleted", By: actor.Actored(),
+	})
 }
 
 // handleDelete answers POST /messages/{id}/delete: its author turns it into a
@@ -202,13 +221,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		if needsActorSeen(tx.Read(), req.actor) {
 			tx.Emit(log.EventActorSeen, actorSeenPayload(req.actor))
 		}
-		// Cancel the task before the tombstone drops the root's labels.
-		if current.Re == nil && current.Task != nil &&
-			current.Task.State != "completed" && current.Task.State != "canceled" {
-			tx.Emit(log.EventTaskCanceled, &log.TaskCanceledPayload{
-				ID: id, Thread: current.Thread, Reason: "deleted", By: req.actor.Actored(),
-			})
-		}
+		emitTaskDeleteCancel(tx, current, req.actor)
 		tx.Emit(log.EventMessageDeleted, &log.MessageDeletedPayload{
 			ID: id, Thread: current.Thread, By: req.actor.Actored(),
 		})

@@ -161,6 +161,8 @@ type MessageEditedPayload struct {
 	Text   string  `json:"text"`
 	By     Author  `json:"by"`
 	From   *string `json:"from"`
+	// Links are additional links the edit carries (a lifecycle subject's URL).
+	Links []protocol.LinkView `json:"links,omitempty"`
 }
 
 func (p *MessageEditedPayload) messageID() uint64 { return p.ID }

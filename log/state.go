@@ -127,6 +127,9 @@ func (s *State) Apply(event Event) {
 	case *MessageEditedPayload:
 		if message := s.Messages[payload.ID]; message != nil && !message.Deleted {
 			message.Text = payload.Text
+			if len(payload.Links) > 0 {
+				message.Links = mergeLinks(message.Links, linksAsAny(payload.Links))
+			}
 			edited := event.At
 			message.EditedAt = &edited
 			message.Version = event.Seq
@@ -569,4 +572,26 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// mergeLinks adds typed links to the board's wire-shaped list, keeping one
+// entry per URL.
+func mergeLinks(existing []any, added []any) []any {
+	seen := make(map[string]struct{}, len(existing)+len(added))
+	for _, link := range existing {
+		if view, ok := link.(protocol.LinkView); ok {
+			seen[view.URL] = struct{}{}
+		}
+	}
+	out := append([]any(nil), existing...)
+	for _, link := range added {
+		if view, ok := link.(protocol.LinkView); ok && view.URL != "" {
+			if _, duplicate := seen[view.URL]; duplicate {
+				continue
+			}
+			seen[view.URL] = struct{}{}
+		}
+		out = append(out, link)
+	}
+	return out
 }

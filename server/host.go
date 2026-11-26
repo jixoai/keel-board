@@ -225,77 +225,79 @@ func safeURL(raw string, hosts map[string]struct{}) string {
 	return raw
 }
 
-// importMessage creates a thread root or a reply, then stores the mapping and
-// the platform copy.
+// importMessage creates a thread root or a reply. Root creation is serialized
+// per external thread and keyed by the platform thread, so two concurrent
+// events cannot create two roots; the loser imports as a reply.
 func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
 	mapping, mapped, err := h.lookupThread(ctx, req.Tenant, req.Key, event)
 	if err != nil {
 		return boardsync.ImportResult{}, err
 	}
-	if !mapped && req.Channel == "" {
+	if mapped {
+		return h.importReply(ctx, req, event, mapping)
+	}
+	if req.Channel == "" {
 		// A reply on a thread the board doesn't sync has nowhere to land.
 		return boardsync.ImportResult{}, nil
 	}
-	createRoot := !mapped
-	channel := req.Channel
-	if !createRoot {
-		// An existing mapping wins; the channel is only for a new root.
-		channel = ""
+	// Serialize root creation across processes for this external thread.
+	lockTarget := boardsync.ResolvedTarget{
+		Key: req.Key, Platform: event.Platform, Channel: event.Channel,
+		Thread: event.Thread, Kind: boardsync.TargetThread,
 	}
+	release, err := h.store.LockTarget(ctx, req.Tenant, req.Key, lockTarget)
+	if err != nil {
+		return boardsync.ImportResult{}, err
+	}
+	defer release()
+	// Another process may have created the root while this one waited.
+	mapping, mapped, err = h.lookupThread(ctx, req.Tenant, req.Key, event)
+	if err != nil {
+		return boardsync.ImportResult{}, err
+	}
+	if mapped {
+		return h.importReply(ctx, req, event, mapping)
+	}
+	return h.importRoot(ctx, req, event)
+}
 
+// importRoot creates the board root for an external thread. Its idempotency
+// key is the thread, not the event, so a duplicate root delivery replays the
+// same board message instead of creating a second one.
+func (h *SyncHost) importRoot(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
 	text, labels, err := overrideRoot(req, event, event.Text)
 	if err != nil {
 		return boardsync.ImportResult{}, err
 	}
 	attachments := attachmentRefs(event.Files)
 	links := h.safeLinks(event.Links)
-	if !createRoot {
-		text = overrideText(req, event.Text)
-	}
 	origin := originOf(event)
 	from := string(req.Key)
-	noSync := req.Overrides.NoSync
-
-	idempotency := &log.Idempotency{
-		Key:    syncImportKey(req),
-		Digest: importDigest(req),
-	}
+	rootKey := syncRootKey(req, event)
+	rootDigest := rootDigest(req, event)
 	var result boardsync.ImportResult
-	err = h.board.Update(ctx, req.Tenant, log.UpdateOptions{Idempotency: idempotency}, func(tx *log.Tx) error {
+	needsReply := false
+	err = h.board.Update(ctx, req.Tenant, log.UpdateOptions{
+		Idempotency: &log.Idempotency{Key: rootKey, Digest: rootDigest},
+	}, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
-			result.Message = lastMessageID(replay.MessageIDs)
-			result.Root = result.Message
-			if replayMessage := tx.Message(result.Message); replayMessage != nil && replayMessage.Re == nil {
+			rootID := lastMessageID(replay.MessageIDs)
+			if rootID == 0 {
+				return fmt.Errorf("%w: root replay has no message", boardsync.ErrBadRequest)
+			}
+			result.Root, result.Message = rootID, rootID
+			if rootIsEvent(tx.Message(rootID), event, req.Key) {
 				result.CreatedRoot = true
+				return nil
 			}
-			if mapped {
-				result.Root = mapping.BoardThread
-			}
-			return nil
-		}
-		if !createRoot {
-			root := tx.Message(mapping.BoardThread)
-			if root == nil {
-				return fmt.Errorf("%w: board thread %d is missing", boardsync.ErrNotFound, mapping.BoardThread)
-			}
-			offset := h.emitActorSeen(tx, event)
-			offset += emitLabelChanges(tx, event, root, req.Overrides.Labels, req.Overrides.Unset)
-			id := tx.NextID(offset)
-			tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
-				ID: id, Channel: root.Channel, Text: text,
-				Re: uint64Ptr(root.ID), Thread: root.Thread,
-				Labels: map[string]string{}, NoSync: noSync,
-				By: boardsyncAuthor(event, req.Key), From: &from, Origin: origin,
-				Attachments: attachments, Links: links,
-			})
-			tx.RecordResult(id)
-			result = boardsync.ImportResult{Root: root.ID, Message: id}
+			// A different event lost the root race; it becomes a reply.
+			needsReply = true
 			return nil
 		}
 		offset := h.emitActorSeen(tx, event)
 		id := tx.NextID(offset)
 		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
-			ID: id, Channel: channel, Text: text,
+			ID: id, Channel: req.Channel, Text: text,
 			Thread: log.ThreadKey(id), Labels: nonNilLabels(labels), NoSync: false,
 			By: boardsyncAuthor(event, req.Key), From: &from, Origin: origin,
 			Attachments: attachments, Links: links,
@@ -307,29 +309,112 @@ func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportReques
 	if err != nil {
 		return boardsync.ImportResult{}, err
 	}
-	if result.Message == 0 {
-		return result, nil
-	}
-	if createRoot {
-		threads, err := h.threadTargetsFor(req, event)
-		if err != nil {
-			return result, err
+	if needsReply {
+		mapping, found, lookupErr := h.lookupThread(ctx, req.Tenant, req.Key, event)
+		if lookupErr != nil {
+			return boardsync.ImportResult{}, lookupErr
 		}
-		for _, target := range threads {
-			if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
-				Tenant: req.Tenant, BoardThread: result.Root,
-				Key: target.Key, Platform: target.Platform,
-				Channel: target.Channel, Thread: target.Thread, Subthread: target.Subthread,
-				Kind: target.Kind,
-			}); err != nil {
-				return result, err
+		if !found {
+			// The winner may not have written its mapping yet; this side can
+			// record the same mapping, keyed by the root it replayed.
+			targets, targetErr := h.threadTargetsFor(req, event)
+			if targetErr != nil {
+				return boardsync.ImportResult{}, targetErr
 			}
+			for _, target := range targets {
+				mapping, err = h.store.UpsertThread(ctx, syncstore.Thread{
+					Tenant: req.Tenant, BoardThread: result.Root, Key: req.Key,
+					Platform: target.Platform, Channel: target.Channel,
+					Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
+					Since: result.Root,
+				})
+				if err != nil {
+					return boardsync.ImportResult{}, err
+				}
+			}
+		}
+		return h.importReply(ctx, req, event, mapping)
+	}
+	targets, err := h.threadTargetsFor(req, event)
+	if err != nil {
+		return result, err
+	}
+	for _, target := range targets {
+		if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
+			Tenant: req.Tenant, BoardThread: result.Root, Key: req.Key,
+			Platform: target.Platform, Channel: target.Channel,
+			Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
+			Since: result.Root,
+		}); err != nil {
+			return result, err
 		}
 	}
 	if err := h.storeCopy(ctx, req, event, result); err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+// importReply appends one imported reply to an existing board thread.
+func (h *SyncHost) importReply(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, mapping syncstore.Thread) (boardsync.ImportResult, error) {
+	root, err := h.rootMessage(ctx, req.Tenant, mapping.BoardThread)
+	if err != nil {
+		return boardsync.ImportResult{}, err
+	}
+	if rootIsEvent(root, event, req.Key) {
+		// A retried root delivery finds its own root and its mapping; replay
+		// it instead of appending the root text as a reply.
+		return boardsync.ImportResult{Root: root.ID, Message: root.ID, CreatedRoot: true}, nil
+	}
+	text := overrideText(req, event.Text)
+	attachments := attachmentRefs(event.Files)
+	links := h.safeLinks(event.Links)
+	origin := originOf(event)
+	from := string(req.Key)
+	noSync := req.Overrides.NoSync
+	idempotency := &log.Idempotency{Key: syncImportKey(req), Digest: importDigest(req)}
+	var result boardsync.ImportResult
+	err = h.board.Update(ctx, req.Tenant, log.UpdateOptions{Idempotency: idempotency}, func(tx *log.Tx) error {
+		if replay, ok := tx.Replay(); ok {
+			result.Message = lastMessageID(replay.MessageIDs)
+			result.Root = mapping.BoardThread
+			return nil
+		}
+		current := tx.Message(root.ID)
+		if current == nil {
+			return fmt.Errorf("%w: board thread %d is missing", boardsync.ErrNotFound, root.ID)
+		}
+		offset := h.emitActorSeen(tx, event)
+		offset += emitLabelChanges(tx, event, current, req.Overrides.Labels, req.Overrides.Unset)
+		id := tx.NextID(offset)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: current.Channel, Text: text,
+			Re: uint64Ptr(current.ID), Thread: current.Thread,
+			Labels: map[string]string{}, NoSync: noSync,
+			By: boardsyncAuthor(event, req.Key), From: &from, Origin: origin,
+			Attachments: attachments, Links: links,
+		})
+		tx.RecordResult(id)
+		result = boardsync.ImportResult{Root: current.ID, Message: id}
+		return nil
+	})
+	if err != nil {
+		return boardsync.ImportResult{}, err
+	}
+	if result.Message != 0 {
+		if err := h.storeCopy(ctx, req, event, result); err != nil {
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+// rootIsEvent reports whether the root was created by this platform event.
+func rootIsEvent(root *log.Message, event boardsync.Event, key boardsync.Key) bool {
+	if root == nil || root.From == nil || *root.From != string(key) || root.Origin == nil {
+		return false
+	}
+	return root.Origin.Message == event.Message && root.Origin.Thread == keyedThread(key, event)
 }
 
 // overrideRoot shapes the text and labels a root is created with.
@@ -404,12 +489,19 @@ func (h *SyncHost) importEdit(ctx context.Context, req boardsync.ImportRequest, 
 		if message == nil || message.Deleted {
 			return nil
 		}
+		if message.Text == text {
+			// The same text again is the same board.
+			result = boardsync.ImportResult{Root: copy.BoardThread, Message: message.ID}
+			return nil
+		}
 		root := tx.RootOf(message.ID)
+		actor := syncActor(event)
 		h.emitActorSeen(tx, event)
 		tx.Emit(log.EventMessageEdited, &log.MessageEditedPayload{
 			ID: message.ID, Thread: message.Thread, Text: text,
-			By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
+			By: actor.Actored(), From: stringPtr(string(req.Key)),
 		})
+		emitTaskEditHold(tx, message, actor)
 		tx.RecordResult(message.ID)
 		result = boardsync.ImportResult{Root: root.ID, Message: message.ID}
 		return nil
@@ -436,10 +528,12 @@ func (h *SyncHost) importDelete(ctx context.Context, req boardsync.ImportRequest
 			return nil
 		}
 		root := tx.RootOf(message.ID)
+		actor := syncActor(event)
 		h.emitActorSeen(tx, event)
+		emitTaskDeleteCancel(tx, message, actor)
 		tx.Emit(log.EventMessageDeleted, &log.MessageDeletedPayload{
 			ID: message.ID, Thread: message.Thread,
-			By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
+			By: actor.Actored(), From: stringPtr(string(req.Key)),
 		})
 		tx.RecordResult(message.ID)
 		result = boardsync.ImportResult{Root: root.ID, Message: message.ID}
@@ -448,11 +542,18 @@ func (h *SyncHost) importDelete(ctx context.Context, req boardsync.ImportRequest
 	return result, err
 }
 
+// errSyncCopyPending reports a reaction whose message copy isn't recorded yet.
+// It is retryable: the inbound worker tries again on its lane.
+var errSyncCopyPending = errors.New("sync: the message copy is not recorded yet")
+
 // importReaction applies a reaction to the board copy it names.
 func (h *SyncHost) importReaction(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
 	copy, found, err := h.lookupCopy(ctx, req, event)
-	if err != nil || !found {
+	if err != nil {
 		return boardsync.ImportResult{}, err
+	}
+	if !found {
+		return boardsync.ImportResult{}, errSyncCopyPending
 	}
 	key, digest := syncEventKey("reaction", req)
 	var result boardsync.ImportResult
@@ -520,7 +621,8 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 			tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
 				ID: id, Channel: req.Channel, Text: text,
 				Thread: log.ThreadKey(id), Labels: nonNilLabels(labels),
-				By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)), Origin: originOf(event),
+				By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
+				Origin: originOf(event), Links: h.lifecycleLinks(event.Lifecycle),
 			})
 			tx.RecordResult(id)
 			result = boardsync.ImportResult{Root: id, Message: id, CreatedRoot: true}
@@ -539,6 +641,7 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 					Tenant: req.Tenant, BoardThread: result.Root, Key: target.Key,
 					Platform: target.Platform, Channel: target.Channel,
 					Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
+					Since: result.Root,
 				}); err != nil {
 					return result, err
 				}
@@ -569,11 +672,12 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 			if len(set) > 0 || len(unset) > 0 {
 				offset += emitLabelChanges(tx, event, root, set, unset)
 			}
-			if lifecycle.Retitled && lifecycle.Title != "" {
+			if lifecycle.Retitled && (lifecycle.Title != "" || lifecycle.Body != "") {
 				tx.Emit(log.EventMessageEdited, &log.MessageEditedPayload{
 					ID: root.ID, Thread: root.Thread,
-					Text: boardsync.StorableText(lifecycle.Title, boardsync.MaxTextBytes),
+					Text: boardsync.StorableText(lifecycleText(lifecycle), boardsync.MaxTextBytes),
 					By:   boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
+					Links: h.lifecycleLinks(lifecycle),
 				})
 				offset++
 			}
@@ -594,6 +698,34 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 		return nil
 	})
 	return result, err
+}
+
+// lifecycleText is a lifecycle subject's title and body; an edit keeps both,
+// so a body-only change is not lost.
+func lifecycleText(lifecycle *boardsync.Lifecycle) string {
+	if lifecycle == nil {
+		return ""
+	}
+	text := lifecycle.Title
+	if lifecycle.Body != "" {
+		if text != "" {
+			text += "\n\n"
+		}
+		text += lifecycle.Body
+	}
+	return text
+}
+
+// lifecycleLinks keeps a lifecycle subject's URL as a safe board link.
+func (h *SyncHost) lifecycleLinks(lifecycle *boardsync.Lifecycle) []protocol.LinkView {
+	if lifecycle == nil || strings.TrimSpace(lifecycle.URL) == "" {
+		return nil
+	}
+	safe := safeURL(lifecycle.URL, h.fileHosts)
+	if safe == "" {
+		return []protocol.LinkView{{Unavailable: "external link"}}
+	}
+	return []protocol.LinkView{{URL: safe}}
 }
 
 // lookupThread finds the board thread a platform thread maps to. A precise
@@ -701,16 +833,41 @@ func boardsyncAuthor(event boardsync.Event, key boardsync.Key) protocol.Author {
 	return protocol.Author{Actor: id, Principal: id}
 }
 
-// originOf is the platform's own identity of an imported message.
+// originOf is the platform's identity of an imported message, key-prefixed so
+// a reader can tell two connections' native IDs apart.
 func originOf(event boardsync.Event) *log.MessageOrigin {
 	origin := &log.MessageOrigin{
-		Channel: event.Channel, Thread: event.Thread,
-		Subthread: event.Subthread, Message: event.Message, Context: event.Context,
+		Channel: keyedChannel(event.Key, event), Thread: keyedThread(event.Key, event),
+		Subthread: keyedSubthread(event.Key, event), Message: event.Message, Context: event.Context,
 	}
 	if origin.Channel == "" && origin.Thread == "" && origin.Message == "" {
 		return nil
 	}
 	return origin
+}
+
+// keyedChannel returns the key-prefixed channel ID, or "".
+func keyedChannel(key boardsync.Key, event boardsync.Event) string {
+	if event.Channel == "" {
+		return ""
+	}
+	return string(key) + ":" + event.Channel
+}
+
+// keyedThread returns the key-prefixed thread ID.
+func keyedThread(key boardsync.Key, event boardsync.Event) string {
+	if event.Thread == "" {
+		return ""
+	}
+	return string(key) + ":" + event.Thread
+}
+
+// keyedSubthread returns the key-prefixed sub-thread ID, or "".
+func keyedSubthread(key boardsync.Key, event boardsync.Event) string {
+	if event.Subthread == "" {
+		return ""
+	}
+	return string(key) + ":" + event.Subthread
 }
 
 // attachmentRefs turns safe platform files into board attachment metadata. No
@@ -778,6 +935,26 @@ func cleanLabel(key, value string) (string, bool) {
 // syncImportKey is the log idempotency key of one import.
 func syncImportKey(req boardsync.ImportRequest) string {
 	return "sync:import:" + string(req.Key) + ":" + req.EventID
+}
+
+// syncRootKey names the root of one external thread. Duplicate root events,
+// and two events racing to create the thread, share it.
+func syncRootKey(req boardsync.ImportRequest, event boardsync.Event) string {
+	return "sync:root:" + string(req.Key) + ":" + event.Thread
+}
+
+// rootDigest is fixed for a thread: the first event to create its root wins,
+// and a different event replays instead of conflicting.
+func rootDigest(req boardsync.ImportRequest, event boardsync.Event) string {
+	return digestOf(struct {
+		Tenant   string
+		Key      boardsync.Key
+		Platform boardsync.Platform
+		Thread   string
+	}{
+		Tenant: req.Tenant, Key: req.Key, Platform: event.Platform,
+		Thread: event.Thread,
+	})
 }
 
 // syncEventKey is the log idempotency key of an inbound change.
@@ -880,6 +1057,33 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 	if err != nil {
 		return err
 	}
+	kind := boardsync.TargetThread
+	if target.Thread == "" {
+		kind = boardsync.TargetChannel
+	}
+	since := uint64(0)
+	if kind == boardsync.TargetThread {
+		// A receipt without an attach API's sequence still makes its thread
+		// future-only from now.
+		head, err := h.board.Head(event.Tenant)
+		if err != nil {
+			return err
+		}
+		since = head
+	}
+	// The mapping is written before the receipt: an attach that loses a race
+	// is refused without leaving a thread.synced fact behind. Since stays as
+	// it is for a re-attach.
+	if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
+		Tenant: event.Tenant, BoardThread: root.ID, Key: boardsync.Key(target.Key),
+		Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
+		Thread: target.Thread, Subthread: target.Subthread, Kind: kind, Since: since,
+	}); err != nil {
+		if errors.Is(err, syncstore.ErrThreadAttached) {
+			return boardsync.Permanent(err)
+		}
+		return err
+	}
 	payload := &log.ThreadSyncedPayload{
 		ID: root.ID, Thread: root.Thread, Target: target, Cause: event.Cause,
 	}
@@ -893,27 +1097,6 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 		tx.Emit(log.EventThreadSynced, payload)
 	})
 	if err != nil {
-		return err
-	}
-	kind := boardsync.TargetThread
-	if target.Thread == "" {
-		kind = boardsync.TargetChannel
-	}
-	if kind == boardsync.TargetThread {
-		resolved := resolvedTarget(target, kind)
-		existing, found, err := h.store.ThreadByTarget(ctx, event.Tenant, boardsync.Key(target.Key), resolved)
-		if err != nil {
-			return err
-		}
-		if found && existing.BoardThread != root.ID {
-			return boardsync.Permanent(fmt.Errorf("sync: platform thread %s is already attached to board thread %d", target.External(), existing.BoardThread))
-		}
-	}
-	if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
-		Tenant: event.Tenant, BoardThread: root.ID, Key: boardsync.Key(target.Key),
-		Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
-		Thread: target.Thread, Subthread: target.Subthread, Kind: kind,
-	}); err != nil {
 		return err
 	}
 	if kind != boardsync.TargetChannel {
@@ -1021,11 +1204,14 @@ func (h *SyncHost) recordMessageSynced(ctx context.Context, event boardsync.Boar
 			Tenant: event.Tenant, BoardThread: root.ID, Key: key,
 			Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
 			Thread: target.Thread, Kind: boardsync.TargetThread,
+			Since: message.ID,
 		}); err != nil {
 			return err
 		}
 	}
-	if message.ID != root.ID || target.Thread == "" {
+	// Backfill only a root that a channel target started. A message delivered
+	// to an existing thread target is future traffic and has no queue to fill.
+	if message.ID != root.ID || target.Thread == "" || !found || copied.Target.Kind != boardsync.TargetChannel {
 		return nil
 	}
 	return h.backfill(ctx, event.Tenant, key, root, target)
@@ -1117,7 +1303,8 @@ func (h *SyncHost) recordSyncFailed(ctx context.Context, event boardsync.BoardEv
 		ID     uint64
 		Thread string
 		Target log.SyncTarget
-	}{payload.ID, payload.Thread, payload.Target}
+		Error  string
+	}{payload.ID, payload.Thread, payload.Target, payload.Error}
 	_, err = h.appendSync(ctx, event.Tenant, key, digest, payload, func(tx *log.Tx) {
 		tx.Emit(log.EventMessageSyncFailed, payload)
 	})
