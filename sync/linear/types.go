@@ -547,8 +547,6 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	return nil
 }
 
-const teamQuery = `query Team($key: String!) { teams(filter: { key: { eq: $key } }) { nodes { id key } } }`
-
 const issueByKeyQuery = `query IssueByKey($team: String!, $number: Float!) {
   issues(filter: { team: { key: { eq: $team } }, number: { eq: $number } }) { nodes { id identifier team { key } } }
 }`
@@ -724,16 +722,9 @@ func (c *Client) ReactComment(ctx context.Context, commentID, emoji string) erro
 
 // TeamID resolves a team key to its ID for issue creation.
 func (c *Client) TeamID(ctx context.Context, key string) (string, error) {
-	var out struct {
-		Teams struct {
-			Nodes []team `json:"nodes"`
-		} `json:"teams"`
-	}
-	if err := c.do(ctx, teamQuery, map[string]any{"key": key}, &out); err != nil {
+	teamInfo, err := c.TeamByKey(ctx, key)
+	if err != nil {
 		return "", err
 	}
-	if len(out.Teams.Nodes) == 0 || out.Teams.Nodes[0].ID == "" {
-		return "", fmt.Errorf("%w: no linear team %s", boardsync.ErrNotFound, key)
-	}
-	return out.Teams.Nodes[0].ID, nil
+	return teamInfo.ID, nil
 }

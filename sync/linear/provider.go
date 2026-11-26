@@ -377,4 +377,5 @@ var (
 	_ boardsync.Deleter     = (*Provider)(nil)
 	_ boardsync.Reactor     = (*Provider)(nil)
 	_ boardsync.RootFetcher = (*Provider)(nil)
+	_ boardsync.Permalinker = (*Provider)(nil)
 )
