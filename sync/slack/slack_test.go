@@ -290,7 +290,12 @@ func TestResolveChannelByName(t *testing.T) {
 func TestPostMessage(t *testing.T) {
 	var got url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/chat.postMessage" {
+		switch r.URL.Path {
+		case "/auth.test":
+			_, _ = w.Write([]byte(`{"ok":true,"user_id":"UAPP123","response_metadata":{"scopes":["chat:write","chat:write.customize"]}}`))
+			return
+		case "/chat.postMessage":
+		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		if err := r.ParseForm(); err != nil {
@@ -325,7 +330,7 @@ func TestPostMessage(t *testing.T) {
 	if got.Get("channel") != "C0123ABC" || got.Get("thread_ts") != "1727000000.123456" {
 		t.Fatalf("form = %v", got)
 	}
-	if got.Get("markdown_text") != "**Ada**: ship it" || got.Get("username") != "Ada" {
+	if got.Get("markdown_text") != "ship it" || got.Get("username") != "Ada" {
 		t.Fatalf("form = %v", got)
 	}
 	if got.Get("unfurl_links") != "false" || got.Get("unfurl_media") != "false" {

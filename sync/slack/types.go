@@ -518,8 +518,6 @@ func readLimited(reader io.Reader, max int64) ([]byte, error) {
 // not a sync target.
 var channelIDPattern = regexp.MustCompile(`^[CG][A-Z0-9]{2,}$`)
 
-var permalinkPattern = regexp.MustCompile(`^https://[a-z0-9-]+(?:\.enterprise)?\.slack\.com/archives/([A-Z0-9]+)/p(\d{10})(\d{6})(?:\?.*)?$`)
-
 // parseTarget reads a Slack target: #name, C0123, C0123:1727.9, or a
 // message permalink (its thread). Name resolution uses client.
 func parseTarget(ctx context.Context, client *Client, name string) (boardsync.ResolvedTarget, error) {
