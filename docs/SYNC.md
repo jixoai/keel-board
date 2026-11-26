@@ -650,8 +650,8 @@ entry's are dropped before normalization: fail closed. Handled events:
 
 Tag and assignee keys are keyed by name, not platform: `good first issue` →
 `tag.good-first-issue=good first issue`, `grace` →
-`assignee.grace=grace`, accents dropped, other runs turned into `-`, at most
-64 characters. A CI key longer than 64 characters keeps its owned prefix and
+`assignee.grace=grace`, lowercased, runs of other characters turned into `-`,
+and the key is bounded to 64 characters. A CI key longer than 64 characters keeps its owned prefix and
 ends in a short hash, so two workflow names can't collide. Every PR/issue
 event carries the full label and assignee arrays in GitHub's payload, so the
 mirror reconciles what it owns: `state`, `review`, `tag.*`, `assignee.*`. A

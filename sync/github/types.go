@@ -400,8 +400,9 @@ func authorFor(primary, sender user) boardsync.Author {
 	return authorOf(primary)
 }
 
-// slug is a GitHub label or login as a board label key part: accents dropped,
-// lowercased, runs of other characters turned into "-", at most 64.
+// slug is a GitHub label, login, or workflow name as a board label key part:
+// lowercased, runs of other characters turned into "-". boundedKey applies the
+// board's length limit and keeps long names distinct.
 func slug(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	var b strings.Builder
@@ -423,25 +424,19 @@ func slug(name string) string {
 			lastDash = true
 		}
 	}
-	out := strings.Trim(b.String(), "-.")
-	if len(out) > 64 {
-		out = out[:64]
-	}
-	return out
+	return strings.Trim(b.String(), "-.")
 }
 
 func tagLabels(labels []label, assignees []user) map[string]string {
 	out := make(map[string]string)
 	for _, l := range labels {
-		key := slug(l.Name)
-		if key != "" {
-			out["tag."+key] = labelValue(l.Name)
+		if key := boundedKey("tag.", slug(l.Name)); key != "" {
+			out[key] = labelValue(l.Name)
 		}
 	}
 	for _, a := range assignees {
-		key := slug(a.Login)
-		if key != "" {
-			out["assignee."+key] = labelValue(a.Login)
+		if key := boundedKey("assignee.", slug(a.Login)); key != "" {
+			out[key] = labelValue(a.Login)
 		}
 	}
 	return out
@@ -522,20 +517,24 @@ func ciPrefix(repoID int64, number int) string {
 	return fmt.Sprintf("ci.%d-%d.", repoID, number)
 }
 
-// ciLabelKey bounds a workflow's CI label to the board's 64-character key
-// limit without letting two long workflow names collide: the tail becomes a
-// hash of the full name, while the owned prefix stays intact.
-func ciLabelKey(prefix, workflow string) string {
-	if len(prefix)+len(workflow) <= 64 {
-		return prefix + workflow
+// boundedKey joins a prefix and a slug within the board's 64-character key
+// limit without letting two long names collide: the tail becomes a hash of the
+// full name while the prefix stays readable and owns.prefix matching still
+// works.
+func boundedKey(prefix, slug string) string {
+	if slug == "" {
+		return ""
 	}
-	sum := sha256.Sum256([]byte(prefix + workflow))
+	if len(prefix)+len(slug) <= 64 {
+		return prefix + slug
+	}
+	sum := sha256.Sum256([]byte(prefix + slug))
 	suffix := "-" + hex.EncodeToString(sum[:4])
 	budget := 64 - len(prefix) - len(suffix)
 	if budget < 1 {
 		return prefix + suffix
 	}
-	return prefix + workflow[:budget] + suffix
+	return prefix + slug[:budget] + suffix
 }
 
 // Client is GitHub's REST client. It is the only place the token is revealed.

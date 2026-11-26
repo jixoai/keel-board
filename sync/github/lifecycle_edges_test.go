@@ -126,6 +126,30 @@ func TestLabelValuesAreSanitized(t *testing.T) {
 	}
 }
 
+func TestLongLabelKeepsBoundedKey(t *testing.T) {
+	long := strings.Repeat("x", 70)
+	body := mutateFixture(t, "pr_opened.json", func(payload map[string]any) {
+		payload["pull_request"].(map[string]any)["labels"] = []any{map[string]any{"name": long}}
+	})
+	event := receive(t, newProvider(t, false), "pull_request", body)[0].Event
+	found := false
+	for key, value := range event.Lifecycle.Labels {
+		if !strings.HasPrefix(key, "tag.") {
+			continue
+		}
+		found = true
+		if len(key) > 64 {
+			t.Fatalf("tag key %q is %d bytes", key, len(key))
+		}
+		if value != long {
+			t.Fatalf("tag value = %q", value)
+		}
+	}
+	if !found {
+		t.Fatalf("labels = %+v", event.Lifecycle.Labels)
+	}
+}
+
 func TestCommentReviewDoesNotChangeReviewLabel(t *testing.T) {
 	body := mutateFixture(t, "review_approved.json", func(payload map[string]any) {
 		payload["review"].(map[string]any)["state"] = "commented"

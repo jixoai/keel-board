@@ -331,7 +331,7 @@ func (p *Provider) normalizeWorkflowRun(key boardsync.Key, delivery string, body
 			continue
 		}
 		prefix := ciPrefix(pl.Repository.ID, pr.Number)
-		keyName := ciLabelKey(prefix, fileSlug)
+		keyName := boundedKey(prefix, fileSlug)
 		labels := map[string]string{}
 		lifecycle := boardsync.Lifecycle{
 			Type:  "ci.passed",
