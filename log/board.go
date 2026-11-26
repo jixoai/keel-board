@@ -41,6 +41,9 @@ type tenant struct {
 	state  *State
 	events []Event
 	idem   map[string]idemEntry
+	// active is the keyed batch whose records are still being folded: a page
+	// boundary can split one, so it carries across apply calls.
+	active string
 	// notify is closed and replaced after each append, waking waiters.
 	notify chan struct{}
 }
@@ -77,52 +80,86 @@ func (b *Board) SetNow(now Clock) {
 // ensure returns a tenant, loading and folding its log the first time.
 // The caller holds b.mu.
 func (b *Board) ensure(tenantName string) (*tenant, error) {
-	if tenantName == "" {
-		tenantName = "default"
-	}
-	if existing, ok := b.tenants[tenantName]; ok {
+	name := normalizeTenant(tenantName)
+	if existing, ok := b.tenants[name]; ok {
 		return existing, nil
 	}
-	records, err := b.store.Load(context.Background(), tenantName)
+	records, err := b.store.Load(context.Background(), name)
 	if err != nil {
 		return nil, err
 	}
-	state := NewState()
-	events := make([]Event, 0, len(records))
-	idem := make(map[string]idemEntry)
-	// A keyed batch's metadata rides its first record; the posts it made are
-	// the message events up to its last.
-	active := ""
+	created := newTenant()
+	if err := created.apply(records); err != nil {
+		return nil, err
+	}
+	b.tenants[name] = created
+	return created, nil
+}
+
+// newTenant returns an empty tenant log.
+func newTenant() *tenant {
+	return &tenant{
+		state:  NewState(),
+		idem:   make(map[string]idemEntry),
+		notify: make(chan struct{}),
+	}
+}
+
+// apply folds records into the tenant's log, in seq order. It is idempotent
+// for records already folded, so a catch-up that overlaps the head changes
+// nothing. A keyed batch's metadata rides its first record; the posts it made
+// are the message events up to its last.
+func (t *tenant) apply(records []store.Record) error {
+	changed := false
 	for _, record := range records {
+		if record.Seq <= t.state.Head {
+			continue
+		}
+		if record.Seq != t.state.Head+1 {
+			return fmt.Errorf("log: record #%d after head #%d: the log has a gap", record.Seq, t.state.Head)
+		}
 		event, err := decodeEvent(record)
 		if err != nil {
-			return nil, fmt.Errorf("log: replaying %s #%d: %w", record.Type, record.Seq, err)
+			return fmt.Errorf("log: replaying %s #%d: %w", record.Type, record.Seq, err)
 		}
-		state.Apply(event)
-		events = append(events, event)
+		t.state.Apply(event)
+		t.events = append(t.events, event)
 		if record.RequestKey != "" {
 			last := record.RequestLast
 			if last < record.Seq {
 				last = record.Seq
 			}
-			idem[record.RequestKey] = idemEntry{digest: record.Digest, first: record.Seq, last: last}
-			active = record.RequestKey
+			t.idem[record.RequestKey] = idemEntry{digest: record.Digest, first: record.Seq, last: last}
+			t.active = record.RequestKey
 		}
-		if active != "" {
-			entry := idem[active]
+		if t.active != "" {
+			entry := t.idem[t.active]
 			if posted, ok := event.Payload.(*MessagePostedPayload); ok && posted.ID == event.Seq {
 				entry.messageIDs = append(entry.messageIDs, event.Seq)
-				idem[active] = entry
+				t.idem[t.active] = entry
 			}
 			if event.Seq >= entry.last {
-				active = ""
+				t.active = ""
 			}
 		}
+		changed = true
 	}
-	created := &tenant{state: state, events: events, idem: idem, notify: make(chan struct{})}
-	b.tenants[tenantName] = created
-	return created, nil
+	if changed {
+		t.wake()
+	}
+	return nil
 }
+
+// wake releases everyone waiting on this tenant's log.
+func (t *tenant) wake() {
+	close(t.notify)
+	t.notify = make(chan struct{})
+}
+
+// errRequestReplayed reports that the store held the write's request key
+// although this process's cache did not: the cache was refreshed and the
+// update must run once more, now seeing the key and replaying it.
+var errRequestReplayed = errors.New("log: the store replayed the request")
 
 // Update runs fn against a transaction and commits what it emits, atomically:
 // either every emitted event lands or none does. The board is locked for the
@@ -132,16 +169,32 @@ func (b *Board) ensure(tenantName string) (*tenant, error) {
 // With opts.Idempotency set, a key already seen with the same digest answers
 // the first result and fn should return early after calling tx.Replay; a key
 // seen with another digest is 409 duplicate_id before fn runs.
+//
+// If the store knows a key this process's cache didn't (another process wrote
+// it), the cache is refreshed and fn runs once more; its replay path answers.
 func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOptions, fn func(*Tx) error) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		b.mu.Lock()
+		err := b.update(ctx, tenantName, opts, fn)
+		b.mu.Unlock()
+		if errors.Is(err, errRequestReplayed) && attempt == 0 {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("log: the store replayed a request the refreshed log doesn't know")
+}
+
+// update is one read-decide-append. The caller holds b.mu.
+func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOptions, fn func(*Tx) error) error {
 	current, err := b.ensure(tenantName)
 	if err != nil {
 		return err
 	}
+	tenant := normalizeTenant(tenantName)
 	tx := &Tx{
 		board:  b,
-		tenant: normalizeTenant(tenantName),
+		tenant: tenant,
 		snap:   &Snapshot{state: current.state, now: b.now()},
 		head:   current.state.Head,
 	}
@@ -149,13 +202,40 @@ func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOption
 		tx.idem = opts.Idempotency
 		if entry, ok := current.idem[opts.Idempotency.Key]; ok {
 			if entry.digest != opts.Idempotency.Digest {
-				return protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write")
+				return duplicateIDError()
 			}
-			tx.replay = &AppendResult{
-				FirstSeq:   entry.first,
-				LastSeq:    entry.last,
-				Replayed:   true,
-				MessageIDs: append([]uint64(nil), entry.messageIDs...),
+			tx.replay = replayOf(entry)
+		} else if looker, ok := b.store.(store.RequestStore); ok {
+			// The store may know a write this process's cache predates.
+			stored, found, err := looker.Request(ctx, tenant, opts.Idempotency.Key)
+			if err != nil {
+				return err
+			}
+			if found {
+				if stored.Digest != opts.Idempotency.Digest {
+					return duplicateIDError()
+				}
+				if err := b.refreshLocked(ctx, tenant, current); err != nil {
+					return err
+				}
+				entry, ok := current.idem[opts.Idempotency.Key]
+				if !ok {
+					// The log should carry the keyed batch; trust the store's
+					// answer if it somehow doesn't.
+					entry = idemEntry{
+						digest:     stored.Digest,
+						messageIDs: append([]uint64(nil), stored.Result.MessageIDs...),
+						first:      stored.Result.FirstSeq,
+						last:       stored.Result.LastSeq,
+					}
+					current.idem[opts.Idempotency.Key] = entry
+				} else if len(entry.messageIDs) == 0 && len(stored.Result.MessageIDs) > 0 {
+					// A fold that can't identify a post by its seq (a write
+					// with a pre-set ID) still gets the store's answer.
+					entry.messageIDs = append([]uint64(nil), stored.Result.MessageIDs...)
+					current.idem[opts.Idempotency.Key] = entry
+				}
+				tx.replay = replayOf(entry)
 			}
 		}
 	}
@@ -174,34 +254,107 @@ func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOption
 		if err != nil {
 			return fmt.Errorf("log: encoding %s #%d: %w", event.Type, event.Seq, err)
 		}
-		records[i] = store.Record{Seq: event.Seq, Type: string(event.Type), Payload: payload, At: event.At}
+		records[i] = store.Record{
+			Seq:     event.Seq,
+			Type:    string(event.Type),
+			Channel: channelOf(tx, event),
+			Payload: payload,
+			At:      event.At,
+		}
 	}
-	if tx.idem != nil && len(records) > 0 {
+	result := tx.Result()
+	if tx.idem != nil {
 		records[0].RequestKey = tx.idem.Key
 		records[0].Digest = tx.idem.Digest
-		records[0].RequestLast = tx.events[len(tx.events)-1].Seq
-	}
-	if err := b.store.Append(ctx, normalizeTenant(tenantName), records, tx.head); err != nil {
-		if errors.Is(err, store.ErrHeadMoved) {
-			return ErrHeadMoved
+		records[0].RequestLast = result.LastSeq
+		raw, err := json.Marshal(store.BatchResult{
+			FirstSeq:   result.FirstSeq,
+			LastSeq:    result.LastSeq,
+			MessageIDs: result.MessageIDs,
+		})
+		if err != nil {
+			return fmt.Errorf("log: encoding request %q: %w", tx.idem.Key, err)
 		}
+		records[0].RequestResult = raw
+	}
+	outcome, err := b.store.Append(ctx, tenant, records, tx.head)
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrDuplicateRequest):
+		return duplicateIDError()
+	case errors.Is(err, store.ErrHeadMoved):
+		// Another process moved the head. Catch this cache up so the caller's
+		// next attempt decides from the log as it is now.
+		if refreshErr := b.refreshLocked(ctx, tenant, current); refreshErr != nil {
+			return refreshErr
+		}
+		return ErrHeadMoved
+	default:
 		return err
+	}
+	if outcome.Replayed {
+		// Another process landed the key between the lookup and the append.
+		// Fold what the store has, then let the retry see the replay.
+		if err := b.refreshLocked(ctx, tenant, current); err != nil {
+			return err
+		}
+		return errRequestReplayed
 	}
 	for _, event := range tx.events {
 		current.state.Apply(event)
 		current.events = append(current.events, event)
 	}
-	if tx.idem != nil && tx.idem.Key != "" {
+	if tx.idem != nil {
 		current.idem[tx.idem.Key] = idemEntry{
 			digest:     tx.idem.Digest,
 			messageIDs: append([]uint64(nil), tx.results...),
-			first:      tx.events[0].Seq,
-			last:       tx.events[len(tx.events)-1].Seq,
+			first:      result.FirstSeq,
+			last:       result.LastSeq,
 		}
 	}
-	close(current.notify)
-	current.notify = make(chan struct{})
+	current.wake()
 	return nil
+}
+
+// duplicateIDError is the 409 an idempotency key reused for another write
+// answers.
+func duplicateIDError() *protocol.Error {
+	return protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write")
+}
+
+// replayOf turns a landed request's entry into the answer a retry gets.
+func replayOf(entry idemEntry) *AppendResult {
+	return &AppendResult{
+		FirstSeq:   entry.first,
+		LastSeq:    entry.last,
+		Replayed:   true,
+		MessageIDs: append([]uint64(nil), entry.messageIDs...),
+	}
+}
+
+// channelOf is the channel an event concerns, when it concerns one. Message
+// and channel events name it; a task event names its root, which this write
+// may have posted earlier in the same batch.
+func channelOf(tx *Tx, event Event) string {
+	switch payload := event.Payload.(type) {
+	case *MessagePostedPayload:
+		return payload.Channel
+	case *ChannelCreatedPayload:
+		return payload.Channel
+	}
+	id := ConcernedMessageID(event)
+	if id == 0 {
+		return ""
+	}
+	for index := len(tx.events) - 1; index >= 0; index-- {
+		if posted, ok := tx.events[index].Payload.(*MessagePostedPayload); ok && posted.ID == id {
+			return posted.Channel
+		}
+	}
+	if message := tx.snap.Message(id); message != nil {
+		return message.Channel
+	}
+	return ""
 }
 
 // UpdateOptions are a write's conditions.
@@ -324,7 +477,13 @@ func (b *Board) History(tenantName string, first, last uint64) ([]Event, error) 
 
 // Wait blocks until the tenant's head moves past after, or ctx ends. It reads
 // nothing, so a caller that wants the events calls History after it returns.
+//
+// A store another process may write to (store.Waiter) is asked to wait too;
+// when it reports a change this board catches up from the store first, so a
+// PostgreSQL-backed board's feed sees other processes' writes. The store's
+// wait never holds a write lock.
 func (b *Board) Wait(ctx context.Context, tenantName string, after uint64) error {
+	tenant := normalizeTenant(tenantName)
 	for {
 		b.mu.Lock()
 		current, err := b.ensure(tenantName)
@@ -337,13 +496,73 @@ func (b *Board) Wait(ctx context.Context, tenantName string, after uint64) error
 			return nil
 		}
 		notify := current.notify
+		head := current.state.Head
 		b.mu.Unlock()
+
+		if waiter, ok := b.store.(store.Waiter); ok {
+			if err := waiter.Wait(ctx, tenant, head); err != nil {
+				return err
+			}
+			b.mu.Lock()
+			err := b.refreshLocked(ctx, tenant, current)
+			b.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-notify:
 		}
 	}
+}
+
+// refreshLocked folds records the store has gained since the tenant's head: a
+// write by another process, or a key this process hadn't loaded. The caller
+// holds b.mu.
+func (b *Board) refreshLocked(ctx context.Context, tenant string, current *tenant) error {
+	const page = 1000
+	for {
+		records, err := b.recordsAfter(ctx, tenant, current.state.Head, page)
+		if err != nil {
+			return err
+		}
+		if len(records) == 0 {
+			return nil
+		}
+		if err := current.apply(records); err != nil {
+			return err
+		}
+		if len(records) < page {
+			return nil
+		}
+	}
+}
+
+// recordsAfter reads a tenant's records after seq, a page at a time. A store
+// that can page does; one that can't is read whole.
+func (b *Board) recordsAfter(ctx context.Context, tenant string, after uint64, limit int) ([]store.Record, error) {
+	if historian, ok := b.store.(store.HistoryStore); ok {
+		return historian.History(ctx, tenant, after, limit)
+	}
+	records, err := b.store.Load(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]store.Record, 0, limit)
+	for _, record := range records {
+		if record.Seq <= after {
+			continue
+		}
+		if len(out) == limit {
+			break
+		}
+		out = append(out, record)
+	}
+	return out, nil
 }
 
 // SnapshotOf wraps a state as a read-only view. It is for a feed that folds

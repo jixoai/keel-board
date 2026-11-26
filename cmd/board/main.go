@@ -1,7 +1,11 @@
 // Command board runs a phase-1 Keel board: the message, channel, task, claim,
-// needs, label and event-feed core over HTTP, with an in-memory log.
+// needs, label and event-feed core over HTTP.
 //
 //	board serve --addr 127.0.0.1:8790
+//	board serve --dsn 'postgres://user:pass@host/db?sslmode=disable'
+//
+// Without --dsn the log lives in memory and is lost when the process exits.
+// With --dsn it lives in PostgreSQL, and a restart replays it.
 //
 // The development server trusts its caller headers (see server.DevActor) and
 // allows every permission. It is for curl smoke tests and local work, never
@@ -24,6 +28,7 @@ import (
 
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/server"
+	"github.com/jixoai/keel-board/store"
 )
 
 func main() {
@@ -52,15 +57,29 @@ func usage() {
 	fmt.Fprint(os.Stderr, `board: the Keel board server (phase 1)
 
 Usage:
-  board serve [--addr 127.0.0.1:8790] [--verbose]
+  board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--verbose]
   board version
 `)
+}
+
+// openStore opens the log's store: PostgreSQL when a DSN is given, memory
+// otherwise. closeStore is never nil.
+func openStore(ctx context.Context, dsn string) (events store.EventStore, closeStore func(), name string, err error) {
+	if strings.TrimSpace(dsn) == "" {
+		return store.NewMemory(), func() {}, "memory", nil
+	}
+	postgres, err := store.Open(ctx, dsn)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return postgres, postgres.Close, "postgres", nil
 }
 
 // serve runs the HTTP server until it's interrupted.
 func serve(args []string) error {
 	flags := flag.NewFlagSet("board serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8790", "the address to listen on")
+	dsn := flags.String("dsn", "", "PostgreSQL DSN for the board's log; empty keeps it in memory")
 	verbose := flags.Bool("verbose", false, "log every request")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -72,7 +91,16 @@ func serve(args []string) error {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	board := log.New(log.Options{})
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	events, closeStore, storeName, err := openStore(ctx, *dsn)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
+
+	board := log.New(log.Options{Store: events})
 	api := server.New(server.Options{Board: board, Logger: logger})
 	handler := http.Handler(api)
 	if *verbose {
@@ -85,13 +113,10 @@ func serve(args []string) error {
 		// No WriteTimeout: the event feed is a long-lived SSE stream.
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Info("board serving", "addr", "http://"+*addr+server.APIPrefix)
-		fmt.Printf("board listening on http://%s%s\n", *addr, server.APIPrefix)
+		logger.Info("board serving", "addr", "http://"+*addr+server.APIPrefix, "store", storeName)
+		fmt.Printf("board listening on http://%s%s (store: %s)\n", *addr, server.APIPrefix, storeName)
 		err := httpServer.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
