@@ -27,7 +27,8 @@ worker daemon, and no live platform credential.
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery | Skeleton; comment payloads without an issue object, links, reaction removal are open |
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
-| Production engine: durable inbox/outbox, subscription, backfill, files, typing, permissions, key ownership | Not in this phase; the seams are defined below |
+| `syncstore`: PostgreSQL/memory durable inbox and outbox, leases, dedupe, lane order, copies, failure receipts, webhook handler, inbound/outbound workers | Implemented and tested; server route wiring and board-event subscription are pending |
+| Production engine: subscription, backfill, files, typing, permissions, key ownership | Not in this phase; the seams are defined below |
 
 The upstream pin keeps all sync code in `packages/board/src/sync/`; the
 `src/sync-slack/`, `src/sync-github/`, `src/sync-linear/`, and
@@ -849,8 +850,10 @@ Recorded in `docs/PORTING.md` as well:
 
 ## Open items
 
-* Durable `Inbox`/`Outbox` stores on PostgreSQL, SQLite, and memory, with the
-  same lease/lane semantics as `MemoryInbox`/`Outbox`.
+* SQLite durable `Inbox`/`Outbox` stores. PostgreSQL and memory are in
+  `syncstore` with the same lease/lane semantics as `MemoryInbox`/`Outbox`;
+  the server's route wiring and board-event subscription are the remaining
+  integration work.
 * A full sync engine: subscription, target backfill, `undelivered`
   projection, key ownership, and `syncedHere`.
 * Files both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
