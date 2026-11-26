@@ -62,10 +62,18 @@ func usage() {
 
 Usage:
   board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--freshness 1s] [--blobs <dir>] [--verbose]
+              [--sync-tenant <tenant>] [--sync-dsn <dsn>] [--sync-schema <schema>]
+              [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
+              [--sync-start key=platformChannel]
   board version
 
 With --blobs, attachment bytes and their records live under that directory;
 without it they live in memory and are gone when the process ends.
+
+Sync is disabled unless at least one --sync-key is given. Each key's
+credentials come from KEEL_SYNC_<KEY>_* environment variables (SIGNING_SECRET or
+WEBHOOK_SECRET, BOT_TOKEN/TOKEN, BOT_USER_ID, and the platform's allowlists);
+secrets never come from flags or the board log. One process must own each key.
 `)
 }
 
@@ -99,7 +107,13 @@ func openBlobs(dir string) (blob.Store, error) {
 // the serve process opened. It is what `board serve` runs, and what the smoke
 // test drives.
 func devHandler(logger *slog.Logger, board *log.Board, blobs blob.Store) http.Handler {
-	return server.New(server.Options{Board: board, Logger: logger, Blobs: blobs})
+	return devServer(logger, board, blobs, nil)
+}
+
+// devServer is devHandler with an explicit sync surface; serve uses it when
+// sync connections are configured.
+func devServer(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOptions *server.SyncOptions) *server.Server {
+	return server.New(server.Options{Board: board, Logger: logger, Blobs: blobs, Sync: syncOptions})
 }
 
 // serve runs the HTTP server until it's interrupted.
@@ -110,6 +124,7 @@ func serve(args []string) error {
 	freshness := flags.Duration("freshness", time.Second, "how stale a shared PostgreSQL cache may be; negative disables the check")
 	blobsDir := flags.String("blobs", "", "directory for attachment files (default: memory)")
 	verbose := flags.Bool("verbose", false, "log every request")
+	syncCfg := registerSyncFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -135,7 +150,31 @@ func serve(args []string) error {
 	}
 
 	board := log.New(log.Options{Store: events, Freshness: *freshness})
-	handler := devHandler(logger, board, blobs)
+	var syncOptions *server.SyncOptions
+	var syncRuntime *serverSyncRuntime
+	if syncCfg.enabled() {
+		if strings.TrimSpace(syncCfg.dsn) == "" && strings.TrimSpace(*dsn) != "" {
+			syncCfg.dsn = *dsn
+		}
+		syncRuntime, err = buildSyncOptions(ctx, syncCfg, "default")
+		if err != nil {
+			return err
+		}
+		syncOptions = &server.SyncOptions{
+			Store: syncRuntime.store, Registry: syncRuntime.registry,
+			Tenant:        func(*http.Request) (string, error) { return syncRuntime.tenant, nil },
+			Owned:         syncRuntime.owned,
+			StartChannels: syncRuntime.startChannels,
+			Logger:        logger,
+		}
+	}
+	api := devServer(logger, board, blobs, syncOptions)
+	handler := http.Handler(api)
+	stopSync, err := startSyncWorkers(ctx, logger, syncRuntime, api)
+	if err != nil {
+		return err
+	}
+	defer stopSync()
 
 	if *verbose {
 		handler = requestLogger(logger, handler)
