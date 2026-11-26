@@ -10,29 +10,21 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: board_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d board_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
+    runs-on: [self-hosted, macOS]
     env:
-      KEEL_BOARD_TEST_DSN: postgres://postgres:postgres@127.0.0.1:5432/board_test?sslmode=disable
+      # The org self-hosted runner (mac-ext-01) has PostgreSQL 18 on the
+      # loopback interface. Tests create and drop their own schemas.
+      KEEL_BOARD_TEST_DSN: postgres://kzf@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+      - name: postgres
+        run: |
+          command -v pg_isready >/dev/null 2>&1 || export PATH="/opt/homebrew/bin:$PATH"
+          pg_isready -h 127.0.0.1 -p 5432
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: vet
