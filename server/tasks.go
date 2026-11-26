@@ -340,6 +340,50 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("a task needs `channel` and `text` for a new thread, or `re` for a thread that's there"))
 		return
 	}
+	clientID := body.ID
+	if clientID == "" && body.Re == nil {
+		clientID = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+	if clientID != "" {
+		if err := protocol.ValidateClientID(clientID); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	digest := writePlaceDigest(body.Channel, body.Re)
+	// A retry answers what it landed before anything else is checked: its
+	// caller may have lost post or read since, and its files may be gone.
+	if clientID != "" {
+		result, found, err := s.board.ReplayKey(req.tenant, idemKey("task", req.actor.ID, clientID))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if found {
+			if result.Digest != digest {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			if len(result.MessageIDs) == 0 {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			sent := ""
+			if body.Text != nil {
+				sent = *body.Text
+			}
+			view, perr := s.replayMessage(req, result.MessageIDs[0], sent)
+			if perr != nil {
+				writeError(w, perr)
+				return
+			}
+			writeJSON(w, http.StatusCreated, struct {
+				Task  protocol.MessageView `json:"task"`
+				Claim *protocol.TaskClaim  `json:"claim,omitempty"`
+			}{Task: view})
+			return
+		}
+	}
 	if len(body.Attachments) > 0 && body.Re != nil {
 		writeError(w, protocol.Invalid("`attachments` are a new thread's: `re` makes a task of a thread as it is"))
 		return
@@ -416,17 +460,6 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	clientID := body.ID
-	if clientID == "" && body.Re == nil {
-		clientID = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	}
-	if clientID != "" {
-		if err := protocol.ValidateClientID(clientID); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
-
 	channel := body.Channel
 	rootID := uint64(0)
 	if body.Re != nil {
@@ -486,16 +519,9 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reValue := ""
-	if body.Re != nil {
-		reValue = *body.Re
-	}
 	var opts log.UpdateOptions
 	if clientID != "" {
-		opts.Idempotency = &log.Idempotency{
-			Key:    "task:" + req.actor.ID + ":" + clientID,
-			Digest: fmt.Sprintf("channel=%s;re=%s", channel, reValue),
-		}
+		opts.Idempotency = &log.Idempotency{Key: idemKey("task", req.actor.ID, clientID), Digest: digest}
 	}
 	var claim *protocol.TaskClaim
 	var preview *log.Message
@@ -605,7 +631,11 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var view protocol.MessageView
 	err = s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
-		view = messageView(snapshot, preview, &req.actor)
+		sent := ""
+		if body.Text != nil {
+			sent = *body.Text
+		}
+		view = s.viewForCaller(req, snapshot, preview, sent)
 		return nil
 	})
 	if err != nil {
@@ -1646,7 +1676,9 @@ func labelsMatch(labels map[string]string, filters []labelFilter) bool {
 }
 
 // matchesWho reports whether a `by`, `owner`, or `for` value names the actor
-// or principal. `me` is the caller's own actor.
+// or principal. `me` is the caller's own actor. A handle that names a person
+// also covers that person's profiles; a handle that names one profile covers
+// only that profile, never its principal: `alice/claude` is not `alice/bob`.
 func matchesWho(snapshot *log.Snapshot, req *request, value, actor, principal string) bool {
 	if value == "me" {
 		return actor == req.actor.ID
@@ -1658,12 +1690,8 @@ func matchesWho(snapshot *log.Snapshot, req *request, value, actor, principal st
 		if id == actor {
 			return true
 		}
-		// A person's handle covers their agents: a message written as
-		// "<principal>+claude" is written by the principal too.
-		if id == principal {
-			return true
-		}
-		if index := strings.Index(id, "+"); index > 0 && id[:index] == principal {
+		record := snapshot.Actor(id)
+		if record != nil && record.Kind == string(protocol.ActorPerson) && id == principal {
 			return true
 		}
 	}

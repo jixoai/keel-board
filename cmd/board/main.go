@@ -29,6 +29,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
@@ -57,11 +58,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `board: the Keel board server (phase 1)
+	fmt.Fprint(os.Stderr, `board: the Keel board server
 
 Usage:
-  board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--freshness 1s] [--verbose]
+  board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--freshness 1s] [--blobs <dir>] [--verbose]
   board version
+
+With --blobs, attachment bytes and their records live under that directory;
+without it they live in memory and are gone when the process ends.
 `)
 }
 
@@ -78,12 +82,34 @@ func openStore(ctx context.Context, dsn string) (events store.EventStore, closeS
 	return postgres, postgres.Close, "postgres", nil
 }
 
+// openBlobs returns the attachment store a serve process uses: memory by
+// default, files under dir when one is given.
+func openBlobs(dir string) (blob.Store, error) {
+	if dir == "" {
+		return blob.NewMemory(), nil
+	}
+	store, err := blob.NewFS(dir)
+	if err != nil {
+		return nil, fmt.Errorf("blobs: %w", err)
+	}
+	return store, nil
+}
+
+// devHandler is the development server's handler over the board and blob store
+// the serve process opened. It is what `board serve` runs, and what the smoke
+// test drives.
+func devHandler(logger *slog.Logger, board *log.Board, blobs blob.Store) http.Handler {
+	return server.New(server.Options{Board: board, Logger: logger, Blobs: blobs})
+
+}
+
 // serve runs the HTTP server until it's interrupted.
 func serve(args []string) error {
 	flags := flag.NewFlagSet("board serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8790", "the address to listen on")
 	dsn := flags.String("dsn", "", "PostgreSQL DSN for the board's log; empty keeps it in memory")
 	freshness := flags.Duration("freshness", time.Second, "how stale a shared PostgreSQL cache may be; negative disables the check")
+	blobsDir := flags.String("blobs", "", "directory for attachment files (default: memory)")
 	verbose := flags.Bool("verbose", false, "log every request")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -104,9 +130,14 @@ func serve(args []string) error {
 	}
 	defer closeStore()
 
+	blobs, err := openBlobs(*blobsDir)
+	if err != nil {
+		return err
+	}
+
 	board := log.New(log.Options{Store: events, Freshness: *freshness})
-	api := server.New(server.Options{Board: board, Logger: logger})
-	handler := http.Handler(api)
+	handler := devHandler(logger, board, blobs)
+
 	if *verbose {
 		handler = requestLogger(logger, handler)
 	}

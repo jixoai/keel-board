@@ -38,6 +38,8 @@ func TestThreadsListAndPaging(t *testing.T) {
 	// A label on the root is a filter, not activity.
 	status, data = h.request(http.MethodPost, "/messages/"+a.ID+"/labels", map[string]any{"set": map[string]string{"status": "open"}}, alice, "", nil)
 	h.expect(status, data, http.StatusOK)
+	status, data = h.request(http.MethodPost, "/messages/"+aReply1.ID+"/labels", map[string]any{"set": map[string]string{"kind": "reply"}}, alice, "", nil)
+	h.expect(status, data, http.StatusOK)
 
 	t.Run("a page is threads by latest activity", func(t *testing.T) {
 		page := h.threads(alice, "?channel=dev")
@@ -91,6 +93,8 @@ func TestThreadsListAndPaging(t *testing.T) {
 		{"by me", "?channel=dev&by=me", []string{a.ID}},
 		{"mentions handle", "?channel=dev&mentions=alice", []string{b.ID}},
 		{"label", "?label=status%3Dopen", []string{a.ID}},
+		{"root label and reply text", "?channel=dev&label=status%3Dopen&text=first", []string{a.ID}},
+		{"root text and reply label", "?channel=dev&text=deploy&label=kind%3Dreply", []string{a.ID}},
 		{"text", "?text=review", []string{b.ID}},
 		{"from the board", "?channel=dev&from=board", []string{b.ID, a.ID}},
 		{"from nowhere", "?channel=dev&from=slack", []string{}},
@@ -261,5 +265,36 @@ func TestActorsAndActorSnapshots(t *testing.T) {
 		if seenTypes[eventType] != alice && seenTypes[eventType] != bob {
 			t.Fatalf("%s carries no actor: %+v", eventType, seenTypes)
 		}
+	}
+}
+
+func TestThreadsByPersonAndAgent(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+	const agent = "local:user:alice+claude"
+
+	h.postMessage(alice, "work", "person wrote this")
+	status, data := h.request(http.MethodPost, "/messages", map[string]any{
+		"channel": "work", "text": "agent wrote this @alice/claude",
+	}, "", "", map[string]string{"X-Board-Actor": agent})
+	h.expect(status, data, http.StatusCreated)
+
+	byProfile := h.threads(alice, "?channel=work&by="+url.QueryEscape("alice/claude"))
+	if len(byProfile.Threads) != 1 || byProfile.Threads[0].Message.Text != "agent wrote this @alice/claude" {
+		t.Fatalf("a profile handle should match only the profile: %+v", byProfile)
+	}
+	byID := h.threads(alice, "?channel=work&by="+url.QueryEscape(agent))
+	if len(byID.Threads) != 1 || byID.Threads[0].Message.ID != byProfile.Threads[0].Message.ID {
+		t.Fatalf("a profile actor ID should match its thread: %+v", byID)
+	}
+	// A person's handle still covers that person's profiles.
+	byPerson := h.threads(alice, "?channel=work&by=alice")
+	if len(byPerson.Threads) != 2 {
+		t.Fatalf("a person handle should cover the person and its agent: %+v", byPerson)
+	}
+	// A mention of a profile matches the person prefix.
+	prefixed := h.threads(alice, "?channel=work&mentions=alice")
+	if len(prefixed.Threads) != 1 || prefixed.Threads[0].Message.ID != byProfile.Threads[0].Message.ID {
+		t.Fatalf("mentions=alice should match @alice/claude: %+v", prefixed)
 	}
 }

@@ -36,6 +36,15 @@ type RequestValidator interface {
 	ValidateRequest(ctx context.Context, tenant string, actor protocol.Actor) error
 }
 
+// AnywhereAuthorizer is an optional seam for permissions that aren't about one
+// channel, such as uploading a file before any message names its channel.
+// Upstream lets a caller upload when it may post or sync somewhere. A policy
+// that implements this doesn't have to answer "does this actor have post in at
+// least one channel?" from the per-channel Authorizer.
+type AnywhereAuthorizer interface {
+	AuthorizeAnywhere(ctx context.Context, actor protocol.Actor, permission protocol.Permission) error
+}
+
 // AllowAll allows every caller every permission. It is for development and
 // tests, never for a shared deployment.
 type AllowAll struct{}

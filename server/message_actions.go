@@ -257,6 +257,12 @@ func (s *Server) handleReact(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	// Reading is its own permission: a reaction on a message the caller can't
+	// see is 404, not a 200/403 that tells it the message is there.
+	if !req.can(s, channel, protocol.PermissionRead) {
+		writeError(w, protocol.NotFound(protocol.CodeMessageNotFound, fmt.Sprintf("message not found: #%d", id)))
+		return
+	}
 	if err := req.permit(s, channel, protocol.PermissionReact); err != nil {
 		writeError(w, err)
 		return

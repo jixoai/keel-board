@@ -175,7 +175,7 @@ func batchDigest(body protocol.CreateTasksRequest) (string, *protocol.Error) {
 	return "batch:" + hex.EncodeToString(sum[:]), nil
 }
 
-func batchKey(actorID, id string) string { return "taskbatch:" + actorID + ":" + id }
+func batchKey(actorID, id string) string { return idemKey("taskbatch", actorID, id) }
 
 // handleBatchTasks answers POST /tasks/batch.
 func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
@@ -188,6 +188,39 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if body.ID != "" {
+		if err := protocol.ValidateClientID(body.ID); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	digest, perr := batchDigest(body)
+	if perr != nil {
+		writeError(w, perr)
+		return
+	}
+	// A retry answers what it landed before anything else is checked: its
+	// caller may have lost post or read since, and its files may be gone.
+	if body.ID != "" {
+		result, found, err := s.board.ReplayKey(req.tenant, batchKey(req.actor.ID, body.ID))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if found {
+			if result.Digest != digest {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			page, perr := s.replayBatch(req, result.MessageIDs)
+			if perr != nil {
+				writeError(w, perr)
+				return
+			}
+			writeJSON(w, http.StatusCreated, page)
+			return
+		}
+	}
 	if err := protocol.ValidateChannel(body.Channel); err != nil {
 		writeError(w, err)
 		return
@@ -196,18 +229,6 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NewError(protocol.CodeBatchTooLarge,
 			fmt.Sprintf("a batch makes 1 to %d tasks", protocol.TaskBatchMax)))
 		return
-	}
-	if body.Request != "" {
-		if err := protocol.ValidateBatchRequest(body.Request); err != nil {
-			writeError(w, err)
-			return
-		}
-	}
-	if body.ID != "" {
-		if err := protocol.ValidateClientID(body.ID); err != nil {
-			writeError(w, err)
-			return
-		}
 	}
 	assignees := make([]*string, len(body.Tasks))
 	hasLabels := false
@@ -285,11 +306,6 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	digest, perr := batchDigest(body)
-	if perr != nil {
-		writeError(w, perr)
-		return
-	}
 	var opts log.UpdateOptions
 	if body.ID != "" {
 		opts.Idempotency = &log.Idempotency{Key: batchKey(req.actor.ID, body.ID), Digest: digest}
@@ -371,9 +387,13 @@ func (s *Server) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	tasks := make([]protocol.MessageView, 0, len(rootIDs))
 	err = s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
-		for _, id := range rootIDs {
+		for at, id := range rootIDs {
 			if message := snapshot.Message(id); message != nil {
-				tasks = append(tasks, messageView(snapshot, message, &req.actor))
+				sent := ""
+				if at < len(body.Tasks) {
+					sent = body.Tasks[at].Text
+				}
+				tasks = append(tasks, s.viewForCaller(req, snapshot, message, sent))
 			}
 		}
 		return nil
@@ -417,18 +437,10 @@ func (s *Server) handleCreatedTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
 		return
 	}
-	tasks := make([]protocol.MessageView, 0, len(result.MessageIDs))
-	err = s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
-		for _, messageID := range result.MessageIDs {
-			if message := snapshot.Message(messageID); message != nil {
-				tasks = append(tasks, messageView(snapshot, message, &req.actor))
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		s.fail(w, r, err)
+	page, perr := s.replayBatch(req, result.MessageIDs)
+	if perr != nil {
+		writeError(w, perr)
 		return
 	}
-	writeJSON(w, http.StatusOK, protocol.CreatedTasksPage{Tasks: tasks})
+	writeJSON(w, http.StatusOK, page)
 }

@@ -24,6 +24,7 @@ const (
 	CodeInvalidBlock       Code = "invalid_block"
 	CodeAttachmentNotFound Code = "attachment_not_found"
 	CodeAttachmentInUse    Code = "attachment_in_use"
+	CodeInvalidAttachment  Code = "invalid_attachment"
 	CodeTooLarge           Code = "too_large"
 	CodeNoFiles            Code = "no_files"
 	CodeNoDirectUploads    Code = "no_direct_uploads"
@@ -65,6 +66,7 @@ var statuses = map[Code]int{
 	CodeInvalidBlock:       http.StatusBadRequest,
 	CodeAttachmentNotFound: http.StatusNotFound,
 	CodeAttachmentInUse:    http.StatusConflict,
+	CodeInvalidAttachment:  http.StatusBadRequest,
 	CodeTooLarge:           http.StatusRequestEntityTooLarge,
 	CodeNoFiles:            http.StatusNotImplemented,
 	CodeNoDirectUploads:    http.StatusNotImplemented,

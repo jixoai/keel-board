@@ -25,46 +25,56 @@ type threadFilter struct {
 	text       string
 }
 
-// messageMatches reports whether one message matches the filter.
-func (s *Server) messageMatches(req *request, snapshot *log.Snapshot, message *log.Message, filter threadFilter) bool {
-	if filter.hasChannel && !channelMatches(message.Channel, filter.channel) {
-		return false
-	}
-	if filter.hasBy && !matchesWho(snapshot, req, filter.by, message.By.Actor, message.By.Principal) {
-		return false
-	}
-	if filter.hasMention && !protocol.MentionsMatch(message.Text, filter.mentions) {
-		return false
-	}
-	if len(filter.labels) > 0 && !labelsMatch(message.Labels, filter.labels) {
-		return false
-	}
-	if filter.from != nil {
-		if *filter.from == "board" {
-			if message.From != nil {
-				return false
+// threadMatches reports whether the thread satisfies every filter predicate.
+// Each predicate may be met by the root or by any reply: a root label and a
+// reply's text both count, as a single message needn't carry everything a
+// filter names.
+func (s *Server) threadMatches(req *request, snapshot *log.Snapshot, root *log.Message, filter threadFilter) bool {
+	messages := make([]*log.Message, 0, 1+len(snapshot.AllReplies(root.ID)))
+	messages = append(messages, root)
+	messages = append(messages, snapshot.AllReplies(root.ID)...)
+	any := func(matches func(*log.Message) bool) bool {
+		for _, message := range messages {
+			if matches(message) {
+				return true
 			}
-		} else if message.From == nil || *message.From != *filter.from {
-			return false
 		}
+		return false
 	}
-	if filter.text != "" && !strings.Contains(strings.ToLower(message.Text), strings.ToLower(filter.text)) {
+	if filter.hasChannel && !any(func(message *log.Message) bool {
+		return channelMatches(message.Channel, filter.channel)
+	}) {
+		return false
+	}
+	if filter.hasBy && !any(func(message *log.Message) bool {
+		return matchesWho(snapshot, req, filter.by, message.By.Actor, message.By.Principal)
+	}) {
+		return false
+	}
+	if filter.hasMention && !any(func(message *log.Message) bool {
+		return protocol.MentionsMatch(message.Text, filter.mentions)
+	}) {
+		return false
+	}
+	if len(filter.labels) > 0 && !any(func(message *log.Message) bool {
+		return labelsMatch(message.Labels, filter.labels)
+	}) {
+		return false
+	}
+	if filter.from != nil && !any(func(message *log.Message) bool {
+		if *filter.from == "board" {
+			return message.From == nil
+		}
+		return message.From != nil && *message.From == *filter.from
+	}) {
+		return false
+	}
+	if filter.text != "" && !any(func(message *log.Message) bool {
+		return strings.Contains(strings.ToLower(message.Text), strings.ToLower(filter.text))
+	}) {
 		return false
 	}
 	return true
-}
-
-// threadMatches reports whether the root or any reply matches.
-func (s *Server) threadMatches(req *request, snapshot *log.Snapshot, root *log.Message, filter threadFilter) bool {
-	if s.messageMatches(req, snapshot, root, filter) {
-		return true
-	}
-	for _, reply := range snapshot.AllReplies(root.ID) {
-		if s.messageMatches(req, snapshot, reply, filter) {
-			return true
-		}
-	}
-	return false
 }
 
 // threadEntry is a thread as a page orders it: by its latest live message.

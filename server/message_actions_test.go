@@ -410,6 +410,22 @@ func TestReactions(t *testing.T) {
 		}
 	})
 
+	t.Run("a reaction needs read", func(t *testing.T) {
+		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
+			if actor.ID == bob && channel == "hidden" && permission == protocol.PermissionRead {
+				return protocol.Forbidden("no read")
+			}
+			return nil
+		})
+		hidden := newHarness(t, server.Options{Authorize: policy})
+		message := hidden.postMessage(alice, "hidden", "not for bob")
+		status, data := hidden.request(http.MethodPost, "/messages/"+message.ID+"/reactions", map[string]any{"emoji": "eyes"}, bob, "", nil)
+		hidden.expect(status, data, http.StatusNotFound)
+		if code := errorCode(t, data); code != protocol.CodeMessageNotFound {
+			t.Fatalf("expected message_not_found, got %s", code)
+		}
+	})
+
 	t.Run("react is its own permission", func(t *testing.T) {
 		policy := server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
 			if actor.ID == bob && channel == "quiet" && permission == protocol.PermissionReact {

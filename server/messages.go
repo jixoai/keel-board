@@ -249,6 +249,48 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("a post needs `channel`; a reply needs `re`"))
 		return
 	}
+	clientID := body.ID
+	if clientID == "" {
+		clientID = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	}
+	if clientID != "" {
+		if err := protocol.ValidateClientID(clientID); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+	channelForDigest := ""
+	if body.Channel != nil {
+		channelForDigest = *body.Channel
+	}
+	digest := writePlaceDigest(channelForDigest, body.Re)
+	// A retry answers what it landed before anything else is checked: the
+	// caller may have lost post or read since, and its files may be gone.
+	// What it gets is its own message, and only what it may read.
+	if clientID != "" {
+		result, found, err := s.board.ReplayKey(req.tenant, idemKey("post", req.actor.ID, clientID))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if found {
+			if result.Digest != digest {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			if len(result.MessageIDs) == 0 {
+				writeError(w, protocol.NewError(protocol.CodeDuplicateID, "that id was already used for a different write"))
+				return
+			}
+			view, perr := s.replayMessage(req, result.MessageIDs[0], body.Text)
+			if perr != nil {
+				writeError(w, perr)
+				return
+			}
+			writeJSON(w, http.StatusCreated, postResponse{Message: view})
+			return
+		}
+	}
 	if len(body.Sync) > 0 {
 		writeError(w, protocol.Invalid("sync: phase 1 syncs nothing"))
 		return
@@ -276,17 +318,6 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	if err := protocol.ValidateNewLabels(body.Labels); err != nil {
 		writeError(w, err)
 		return
-	}
-
-	clientID := body.ID
-	if clientID == "" {
-		clientID = strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	}
-	if clientID != "" {
-		if err := protocol.ValidateClientID(clientID); err != nil {
-			writeError(w, err)
-			return
-		}
 	}
 
 	var after *uint64
@@ -364,14 +395,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reValue := ""
-	if body.Re != nil {
-		reValue = *body.Re
-	}
-	digest := fmt.Sprintf("channel=%s;re=%s", channel, reValue)
 	var opts log.UpdateOptions
 	if clientID != "" {
-		opts.Idempotency = &log.Idempotency{Key: "post:" + req.actor.ID + ":" + clientID, Digest: digest}
+		opts.Idempotency = &log.Idempotency{Key: idemKey("post", req.actor.ID, clientID), Digest: digest}
 	}
 	postID := uint64(0)
 	err := s.board.Update(req.ctx, req.tenant, opts, func(tx *log.Tx) error {
@@ -439,7 +465,7 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		if message == nil {
 			return protocol.NotFound(protocol.CodeMessageNotFound, fmt.Sprintf("message not found: #%d", postID))
 		}
-		view = messageView(snapshot, message, &req.actor)
+		view = s.viewForCaller(req, snapshot, message, body.Text)
 		return nil
 	})
 	if err != nil {

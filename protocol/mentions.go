@@ -187,12 +187,14 @@ func MentionTerms(text string) []string {
 	return terms
 }
 
-// MentionsMatch reports whether text mentions any term a filter names.
+// MentionsMatch reports whether text mentions any term a filter names. A
+// term also matches the profiles under it: `alice` matches `@alice/claude`.
+// An exact term wins where both could apply, but both answer true.
 func MentionsMatch(text string, wanted []string) bool {
 	terms := MentionTerms(text)
 	for _, want := range wanted {
 		for _, term := range terms {
-			if term == want {
+			if term == want || strings.HasPrefix(term, want+"/") {
 				return true
 			}
 		}

@@ -175,8 +175,17 @@ func TestMentions(t *testing.T) {
 	if !protocol.MentionsMatch("hi @[local:user:bob]", []string{"local:user:bob"}) {
 		t.Fatal("expected a match")
 	}
+	if !protocol.MentionsMatch("hi @alice/claude", []string{"alice"}) {
+		t.Fatal("a profile's mention should match its person prefix")
+	}
+	if !protocol.MentionsMatch("hi @alice/claude", []string{"alice/claude"}) {
+		t.Fatal("an exact handle should match")
+	}
 	if protocol.MentionsMatch("hi @alice", []string{"bob"}) {
 		t.Fatal("unexpected match")
+	}
+	if protocol.MentionsMatch("hi @alicebob", []string{"alice"}) {
+		t.Fatal("a prefix must end at a segment boundary")
 	}
 }
 

@@ -438,10 +438,34 @@ func ValidateAttachmentIDs(ids []string) *Error {
 	return nil
 }
 
+// ValidateFileName checks a request's file name as upstream does: the last
+// path segment is the name, a dotfile is refused, and so is one that holds
+// invisible formatting characters (bidi overrides, zero-width, line and
+// paragraph separators). It doesn't rewrite the name; the server refuses it.
+func ValidateFileName(name string) *Error {
+	base := name
+	if index := strings.LastIndexAny(base, `/\`); index >= 0 {
+		base = base[index+1:]
+	}
+	if !utf8.ValidString(base) {
+		return NewError(CodeInvalidAttachment, "attachment names must be valid UTF-8")
+	}
+	if strings.HasPrefix(base, ".") {
+		return NewError(CodeInvalidAttachment, fmt.Sprintf("attachment names can't start with a dot: %q", base))
+	}
+	for _, r := range base {
+		if unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return NewError(CodeInvalidAttachment, fmt.Sprintf("attachment names can't hold invisible formatting characters: %q", base))
+		}
+	}
+	return nil
+}
+
 // SanitizeFileName turns a request's file name into one the board stores: the
 // last path segment, without control or invisible formatting characters, no
 // leading dot, at most AttachmentNameMax characters. An empty result is
-// "file".
+// "file". A name ValidateFileName refuses isn't silently rewritten; this is
+// for names that passed it and for the default.
 func SanitizeFileName(name string) string {
 	if index := strings.LastIndexAny(name, `/\`); index >= 0 {
 		name = name[index+1:]

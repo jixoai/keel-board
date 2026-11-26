@@ -84,9 +84,25 @@ that name them are refused rather than half-accepted.
   append. Editing a task's root by anyone but its owner holds the task for its
   owner (`blocked.kind: edited`) and ends any claim.
 - Reactions are stored under Chat SDK names (`thumbs_up`), with common Slack
-  aliases normalized. A repeated add/remove is a no-op.
+  aliases normalized. A repeated add/remove is a no-op. A reaction needs
+  `read`, as well as `react`: an unreadable message is 404, never a 200/403
+  that would confirm it exists.
 - Label writes under `board.` are refused, and a write that leaves labels as
   they are emits nothing.
+- Idempotency keys are per tenant and name the actor without ambiguity:
+  `namespace:<len(actorID)>:<actorID>:<client id>`. `local:user` + `bob:k` and
+  `local:user:bob` + `k` are different writes; tenants never share a key.
+- A retry is answered before validation, permission checks, and attachment
+  resolution: `POST /messages`, `POST /tasks`, and `POST /tasks/batch` first
+  look up the idempotent result, then check the caller may have it. A landed
+  message is returned only to the actor/principal/profile that wrote it and
+  only while the caller can read its channel; a blind write gets back just the
+  text it sent, with no labels, files, reactions, or task. A batch read
+  (`GET /tasks/batch/{id}`) applies the same rule and answers 404 when any root
+  isn't the caller's or isn't readable.
+- `GET /tasks/batch/{id}` and a batch's POST replay reuse the landed roots;
+  neither re-checks `post`, re-binds files, nor needs the current request body
+  to validate.
 
 ### Deliberate simplifications
 
@@ -94,28 +110,68 @@ that name them are refused rather than half-accepted.
   yet: `git-commit@1` and `vercel-deployment@1` are known, and any other
   `json#name@version` fence is refused with `invalid_block`. The scanner reads
   top-level fences, not upstream's full Markdown containers (quotes/list
-  items).
+  items). `BlocksIn` reads a message's current text; a legacy message whose
+  text holds an invalid block simply shows none, the write-time invariant is
+  the only guarantee.
 - **Mentions are parsed, not settled.** `@[actor-id]` is validated as an actor
-  ID; `@handle` stays as typed and filters match it as written. Upstream also
-  rewrites a unique `@handle` to `@[actor-id]` and accepts email mentions from
-  sync.
+  ID; `@handle` stays as typed. A `mentions` filter matches an exact term or a
+  profile under it (`alice` matches `@alice/claude`, never `@alicebob`).
+  Upstream also rewrites a unique `@handle` to `@[actor-id]` and accepts email
+  mentions from sync.
 - **Emoji normalization is a small table.** Short names and common Slack
   aliases (`+1`, `white_check_mark`, …) are canonicalized; Unicode emoji
   characters aren't.
 - **Attachments gained an explicit delete.** Upstream has no delete route; here
   the uploader may delete bytes no live message carries, messages hide their
-  files when deleted, and the uploader keeps read access (as upstream). Upload
-  itself isn't permission-checked because the `Authorizer` seam answers per
-  channel; binding a file to a message requires `post` there. Direct uploads
-  exist only for a `blob.Store` that also implements `blob.UploadSigner`; no
-  external object store is wired in.
+  files when deleted, and the uploader keeps read access (as upstream).
+  Blob keys and records are tenant-scoped (`tenants/<sha256(tenant)>/...`), so
+  one tenant's ID reads nothing on another. A file name is refused with
+  `invalid_attachment` when it is a dotfile or holds invisible formatting
+  characters; it is never silently renamed. Attachment responses carry
+  `cache-control: private, max-age=31536000, immutable`; deleting removes the
+  bytes first and the record second, so a failed store leaves a retryable
+  record.
+- **Upload permission is an optional seam.** When the configured
+  `server.Authorizer` also implements `server.AnywhereAuthorizer`, uploads and
+  direct-upload starts need `post` or `sync` anywhere. A policy that only
+  implements the per-channel seam keeps the old behavior: uploads are
+  authenticated only, and binding a file to a message still requires `post`
+  there. The access package will implement the seam later.
+- **Two blob reads stay under the board's lock.** Binding re-reads the records
+  inside the write transaction (so a delete that won the race can't leave a
+  dangling reference), and `DELETE /attachments/{id}` checks live references
+  and deletes under the lock (so a concurrent post can't bind what it removes).
+  The first read that resolves attachment metadata happens outside the lock.
 - **Thread filters are computed over the folded log.** There's no search
-  index; `from` matches only `board` (nothing records sync origins yet).
+  index; `from` matches only `board` (nothing records sync origins yet). Each
+  predicate is met by the root or any reply: a root label and a reply's text
+  can satisfy one read together. A `by` handle that names a person covers that
+  person's profiles; a handle that names one profile covers only that profile.
 - **Batch is the plan.** Upstream has no separate plan entry; a batch whose
   tasks wait on each other by `key` is that plan. The batch `request` digest is
   trusted as a fronting board's, as upstream does.
+- **Not implemented:** `GET /posts/{id}`, typing, schedules, the schema
+  registry, `scanned` on a thread page, and watchers. `older` is the thread
+  page's only backward cursor.
+- **`message.by` is an ActorView here.** Upstream's `MessageView.by` is the
+  author record (`actor`, `principal`, `profile`) and `author` is the
+  ActorView; this port has `by` and `author` both as ActorView.
 - **No migration change.** Every new fact rides the existing `payload jsonb`
   column; `store/migrations/0001_board_log.sql` is unchanged.
+
+### Known deferred
+
+- `BlocksIn` trusts a message's current text; old data isn't revalidated.
+- `by` query shape and handle resolution are small string matches, not
+  upstream's full actor-index resolver.
+- Cursor details (a thread page's `after` naming a deleted message, a
+  cross-channel cursor) aren't normalized.
+- Label names are plain Go map keys, so inherited names (`constructor`,
+  `__proto__`) are ordinary data and safe, but no compatibility shim exists.
+- A same-text edit is a no-op and doesn't advance `revision` (upstream would
+  append an edit); this makes retries idempotent.
+- Error precedence isn't fixed: which of two invalid fields is reported first
+  may differ from upstream.
 
 Tests: `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`,
 `gofmt -l .`.

@@ -2,7 +2,9 @@ package server
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,9 +30,7 @@ import (
 // what makes an unbound upload readable and deletable by its sender.
 
 const (
-	attachmentDataPrefix = "attachments/"
 	attachmentMetaSuffix = ".json"
-	uploadTicketPrefix   = "uploads/"
 	directUploadTTL      = 30 * time.Minute
 	attachmentTicketType = "application/json"
 )
@@ -38,6 +38,7 @@ const (
 // attachmentRecord is what the board remembers about a file.
 type attachmentRecord struct {
 	ID         string    `json:"id"`
+	Tenant     string    `json:"tenant"`
 	Name       string    `json:"name"`
 	Type       string    `json:"type"`
 	Size       int64     `json:"size"`
@@ -48,6 +49,7 @@ type attachmentRecord struct {
 // uploadTicket is a signed direct upload waiting for its bytes.
 type uploadTicket struct {
 	ID         string    `json:"id"`
+	Tenant     string    `json:"tenant"`
 	Name       string    `json:"name"`
 	Type       string    `json:"type"`
 	Size       int64     `json:"size"`
@@ -55,9 +57,25 @@ type uploadTicket struct {
 	ExpiresAt  time.Time `json:"expiresAt"`
 }
 
-func attachmentDataKey(id string) string { return attachmentDataPrefix + id }
-func attachmentMetaKey(id string) string { return attachmentDataPrefix + id + attachmentMetaSuffix }
-func uploadTicketKey(id string) string   { return uploadTicketPrefix + id + attachmentMetaSuffix }
+// tenantPart names a tenant in a blob key without trusting its bytes: a
+// custom TenantFunc may return anything, and blobs live in one store. A hash
+// keeps every tenant's files under its own prefix.
+func tenantPart(tenant string) string {
+	sum := sha256.Sum256([]byte(tenant))
+	return hex.EncodeToString(sum[:])
+}
+
+func attachmentDataKey(tenant, id string) string {
+	return "tenants/" + tenantPart(tenant) + "/attachments/" + id
+}
+
+func attachmentMetaKey(tenant, id string) string {
+	return "tenants/" + tenantPart(tenant) + "/attachments/" + id + attachmentMetaSuffix
+}
+
+func uploadTicketKey(tenant, id string) string {
+	return "tenants/" + tenantPart(tenant) + "/uploads/" + id + attachmentMetaSuffix
+}
 
 func (r attachmentRecord) view() protocol.Attachment {
 	return protocol.Attachment{ID: r.ID, Name: r.Name, Type: r.Type, Size: r.Size}
@@ -67,6 +85,24 @@ func (r attachmentRecord) view() protocol.Attachment {
 // files.
 func noFiles() *protocol.Error {
 	return protocol.NewError(protocol.CodeNoFiles, "this board keeps no files")
+}
+
+// permitUpload asks an optional AnywhereAuthorizer whether the caller may post
+// or sync somewhere. A board whose policy doesn't implement the seam keeps its
+// old behavior: uploads are authenticated only, and binding a file to a
+// message still needs `post` there.
+func (s *Server) permitUpload(req *request) *protocol.Error {
+	gate, ok := s.authorize.(AnywhereAuthorizer)
+	if !ok {
+		return nil
+	}
+	if gate.AuthorizeAnywhere(req.ctx, req.actor, protocol.PermissionPost) == nil {
+		return nil
+	}
+	if gate.AuthorizeAnywhere(req.ctx, req.actor, protocol.PermissionSync) == nil {
+		return nil
+	}
+	return protocol.Forbidden("this token can't post or sync anywhere, so it can't upload")
 }
 
 // newAttachmentID returns 128 random bits in base64url. An ID starting with
@@ -87,31 +123,36 @@ func newAttachmentID() (string, error) {
 // saveAttachmentRecord writes a record, refusing to overwrite one. It returns
 // the record already stored when the key was taken, so a retried finish
 // answers what landed.
-func (s *Server) saveAttachmentRecord(r *http.Request, record attachmentRecord) (attachmentRecord, error) {
+func (s *Server) saveAttachmentRecord(r *http.Request, tenant string, record attachmentRecord) (attachmentRecord, error) {
+	record.Tenant = tenant
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return attachmentRecord{}, err
 	}
-	err = s.blobs.Put(r.Context(), attachmentMetaKey(record.ID), encoded, attachmentTicketType)
+	err = s.blobs.Put(r.Context(), attachmentMetaKey(tenant, record.ID), encoded, attachmentTicketType)
 	if err == nil {
 		return record, nil
 	}
-	existing, readErr := s.loadAttachmentRecord(r, record.ID)
+	existing, readErr := s.loadAttachmentRecord(r, tenant, record.ID)
 	if readErr == nil {
 		return existing, nil
 	}
 	return attachmentRecord{}, err
 }
 
-// loadAttachmentRecord reads a file's record, or ErrNotFound.
-func (s *Server) loadAttachmentRecord(r *http.Request, id string) (attachmentRecord, error) {
-	data, _, err := s.blobs.Get(r.Context(), attachmentMetaKey(id))
+// loadAttachmentRecord reads a file's record, or ErrNotFound. A record from
+// another tenant is not found, even if a caller names its ID.
+func (s *Server) loadAttachmentRecord(r *http.Request, tenant, id string) (attachmentRecord, error) {
+	data, _, err := s.blobs.Get(r.Context(), attachmentMetaKey(tenant, id))
 	if err != nil {
 		return attachmentRecord{}, err
 	}
 	var record attachmentRecord
 	if err := json.Unmarshal(data, &record); err != nil {
 		return attachmentRecord{}, fmt.Errorf("attachment %s: bad record: %w", id, err)
+	}
+	if record.Tenant != tenant {
+		return attachmentRecord{}, blob.ErrNotFound
 	}
 	return record, nil
 }
@@ -163,20 +204,26 @@ func (s *Server) bindAttachmentIDs(req *request, ids []string) (map[string]proto
 			return nil, err
 		}
 	}
+	// Read the records before taking the board's lock: blob I/O stays outside
+	// the log's global lock, and only the message bindings need the fold.
+	records := make(map[string]attachmentRecord, len(ids))
+	for _, id := range ids {
+		if _, done := records[id]; done {
+			continue
+		}
+		record, err := s.loadAttachmentRecord(req.http, req.tenant, id)
+		if errors.Is(err, blob.ErrNotFound) {
+			return nil, protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id))
+		}
+		if err != nil {
+			return nil, protocol.NewError(protocol.CodeInternal, "could not read attachments")
+		}
+		records[id] = record
+	}
 	var failure *protocol.Error
 	err := s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
 		for _, id := range ids {
-			if _, done := bound[id]; done {
-				continue
-			}
-			record, err := s.loadAttachmentRecord(req.http, id)
-			if errors.Is(err, blob.ErrNotFound) {
-				failure = protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id))
-				return nil
-			}
-			if err != nil {
-				return err
-			}
+			record := records[id]
 			if !s.attachmentReadable(req, snapshot, record) {
 				failure = protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id))
 				return nil
@@ -224,7 +271,7 @@ func (s *Server) bindAttachments(req *request, ids []string) ([]protocol.Attachm
 // answers 404 rather than referencing bytes that are gone.
 func (s *Server) verifyAttachments(req *request, attachments []protocol.Attachment) *protocol.Error {
 	for _, attachment := range attachments {
-		if _, err := s.loadAttachmentRecord(req.http, attachment.ID); errors.Is(err, blob.ErrNotFound) {
+		if _, err := s.loadAttachmentRecord(req.http, req.tenant, attachment.ID); errors.Is(err, blob.ErrNotFound) {
 			return protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", attachment.ID))
 		} else if err != nil {
 			return protocol.NewError(protocol.CodeInternal, "could not read attachments")
@@ -244,6 +291,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, noFiles())
 		return
 	}
+	if err := s.permitUpload(req); err != nil {
+		writeError(w, err)
+		return
+	}
 	name := "file"
 	if header := r.Header.Get("X-Board-Filename"); header != "" {
 		decoded, err := url.PathUnescape(header)
@@ -252,6 +303,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		name = decoded
+	}
+	if err := protocol.ValidateFileName(name); err != nil {
+		writeError(w, err)
+		return
 	}
 	data, err := io.ReadAll(io.LimitReader(r.Body, protocol.AttachmentBytesMax+1))
 	if err != nil {
@@ -281,16 +336,30 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		UploadedBy: req.actor.Principal,
 		CreatedAt:  s.now().UTC(),
 	}
-	if err := s.blobs.Put(req.ctx, attachmentDataKey(id), data, contentType); err != nil {
+	if err := s.blobs.Put(req.ctx, attachmentDataKey(req.tenant, id), data, contentType); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	record, err = s.saveAttachmentRecord(r, record)
+	record, err = s.saveAttachmentRecord(r, req.tenant, record)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	// The record is the answer only once the store really has that many bytes.
+	size, err := s.blobs.Stat(req.ctx, attachmentDataKey(req.tenant, id))
+	if err != nil || size != record.Size {
+		s.fail(w, r, errOrMismatch(err, size, record.Size))
+		return
+	}
 	writeJSON(w, http.StatusCreated, protocol.AttachmentResponse{Attachment: record.view()})
+}
+
+// errOrMismatch is the failure of a stored size that doesn't match its record.
+func errOrMismatch(err error, have, want int64) error {
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("attachment store has %d bytes, want %d", have, want)
 }
 
 // handleAttachment answers GET /attachments/{id}: the file's bytes, with
@@ -309,7 +378,7 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id)))
 		return
 	}
-	record, err := s.loadAttachmentRecord(r, id)
+	record, err := s.loadAttachmentRecord(r, req.tenant, id)
 	if errors.Is(err, blob.ErrNotFound) {
 		writeError(w, protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id)))
 		return
@@ -331,7 +400,7 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id)))
 		return
 	}
-	data, contentType, err := s.blobs.Get(req.ctx, attachmentDataKey(id))
+	data, contentType, err := s.blobs.Get(req.ctx, attachmentDataKey(req.tenant, id))
 	if errors.Is(err, blob.ErrNotFound) {
 		writeError(w, protocol.NotFound(protocol.CodeAttachmentNotFound, fmt.Sprintf("no attachment: %s", id)))
 		return
@@ -352,6 +421,7 @@ func (s *Server) handleAttachment(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename*=UTF-8''%s", disposition, url.PathEscape(record.Name)))
 	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }
@@ -388,7 +458,7 @@ func (s *Server) handleDeleteAttachment(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	record, err := s.loadAttachmentRecord(r, id)
+	record, err := s.loadAttachmentRecord(r, req.tenant, id)
 	if errors.Is(err, blob.ErrNotFound) {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -409,10 +479,12 @@ func (s *Server) handleDeleteAttachment(w http.ResponseWriter, r *http.Request) 
 			return protocol.NewError(protocol.CodeAttachmentInUse,
 				fmt.Sprintf("%s is on %d message(s): delete them before its bytes", id, len(refs)))
 		}
-		if err := s.blobs.Delete(req.ctx, attachmentMetaKey(id)); err != nil {
+		// Data first, then its record: a store that fails midway leaves the
+		// record, so the same delete can be retried.
+		if err := s.blobs.Delete(req.ctx, attachmentDataKey(req.tenant, id)); err != nil {
 			return err
 		}
-		return s.blobs.Delete(req.ctx, attachmentDataKey(id))
+		return s.blobs.Delete(req.ctx, attachmentMetaKey(req.tenant, id))
 	})
 	if err != nil {
 		s.fail(w, r, err)
@@ -430,6 +502,10 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.blobs == nil {
 		writeError(w, noFiles())
+		return
+	}
+	if err := s.permitUpload(req); err != nil {
+		writeError(w, err)
 		return
 	}
 	signer, ok := s.blobs.(blob.UploadSigner)
@@ -456,6 +532,10 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	if body.Name != nil {
 		name = *body.Name
 	}
+	if err := protocol.ValidateFileName(name); err != nil {
+		writeError(w, err)
+		return
+	}
 	contentType := "application/octet-stream"
 	if body.Type != nil {
 		contentType = protocol.MediaType(*body.Type)
@@ -468,6 +548,7 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	expires := s.now().UTC().Add(directUploadTTL)
 	ticket := uploadTicket{
 		ID:         id,
+		Tenant:     req.tenant,
 		Name:       protocol.SanitizeFileName(name),
 		Type:       contentType,
 		Size:       body.Size,
@@ -479,11 +560,11 @@ func (s *Server) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if err := s.blobs.Put(req.ctx, uploadTicketKey(id), encoded, attachmentTicketType); err != nil {
+	if err := s.blobs.Put(req.ctx, uploadTicketKey(req.tenant, id), encoded, attachmentTicketType); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	signed, err := signer.SignUpload(req.ctx, attachmentDataKey(id), blob.SignOptions{
+	signed, err := signer.SignUpload(req.ctx, attachmentDataKey(req.tenant, id), blob.SignOptions{
 		ContentType: contentType,
 		MaxBytes:    body.Size,
 		ExpiresAt:   expires,
@@ -521,7 +602,7 @@ func (s *Server) handleUploadFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeUploadNotFound, fmt.Sprintf("no upload: %s", id)))
 		return
 	}
-	ticketData, _, err := s.blobs.Get(req.ctx, uploadTicketKey(id))
+	ticketData, _, err := s.blobs.Get(req.ctx, uploadTicketKey(req.tenant, id))
 	if errors.Is(err, blob.ErrNotFound) {
 		writeError(w, protocol.NotFound(protocol.CodeUploadNotFound, fmt.Sprintf("no upload: %s", id)))
 		return
@@ -535,16 +616,16 @@ func (s *Server) handleUploadFinish(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if ticket.UploadedBy != "" && ticket.UploadedBy != req.actor.Principal {
+	if ticket.Tenant != req.tenant || (ticket.UploadedBy != "" && ticket.UploadedBy != req.actor.Principal) {
 		writeError(w, protocol.NotFound(protocol.CodeUploadNotFound, fmt.Sprintf("no upload: %s", id)))
 		return
 	}
 	// A second finish answers what the first recorded.
-	if existing, err := s.loadAttachmentRecord(r, id); err == nil {
+	if existing, err := s.loadAttachmentRecord(r, req.tenant, id); err == nil {
 		writeJSON(w, http.StatusCreated, protocol.AttachmentResponse{Attachment: existing.view()})
 		return
 	}
-	size, err := s.blobs.Stat(req.ctx, attachmentDataKey(id))
+	size, err := s.blobs.Stat(req.ctx, attachmentDataKey(req.tenant, id))
 	if errors.Is(err, blob.ErrNotFound) {
 		writeError(w, protocol.NewError(protocol.CodeNotUploaded,
 			fmt.Sprintf("nothing's been uploaded for %s yet: PUT the file to its URL first", id)))
@@ -561,15 +642,21 @@ func (s *Server) handleUploadFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	record := attachmentRecord{
 		ID:         id,
+		Tenant:     req.tenant,
 		Name:       ticket.Name,
 		Type:       ticket.Type,
 		Size:       size,
 		UploadedBy: ticket.UploadedBy,
 		CreatedAt:  s.now().UTC(),
 	}
-	record, err = s.saveAttachmentRecord(r, record)
+	record, err = s.saveAttachmentRecord(r, req.tenant, record)
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	stored, err := s.blobs.Stat(req.ctx, attachmentDataKey(req.tenant, id))
+	if err != nil || stored != record.Size {
+		s.fail(w, r, errOrMismatch(err, stored, record.Size))
 		return
 	}
 	writeJSON(w, http.StatusCreated, protocol.AttachmentResponse{Attachment: record.view()})

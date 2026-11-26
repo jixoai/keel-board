@@ -3,6 +3,7 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,9 +19,11 @@ import (
 // plays the client's PUT by writing the key itself.
 type signingMemory struct {
 	*blob.Memory
+	lastKey string
 }
 
-func (s signingMemory) SignUpload(_ context.Context, key string, opts blob.SignOptions) (blob.SignedUpload, error) {
+func (s *signingMemory) SignUpload(_ context.Context, key string, opts blob.SignOptions) (blob.SignedUpload, error) {
+	s.lastKey = key
 	return blob.SignedUpload{
 		URL:     "https://blob.test/" + url.PathEscape(key),
 		Headers: map[string]string{"x-test-signature": "ok"},
@@ -63,14 +66,29 @@ func (h *harness) upload(actor, name, contentType string, data []byte) (int, []b
 	return h.rawRequest(http.MethodPost, "/attachments", bytes.NewReader(data), headers)
 }
 
-// attachment reads a file's bytes as actor.
-func (h *harness) attachment(actor, id string) (int, []byte, http.Header) {
+// uploadInTenant sends a file on one board.
+func (h *harness) uploadInTenant(actor, tenant, name, contentType string, data []byte) (int, []byte) {
+	h.t.Helper()
+	headers := map[string]string{
+		"X-Board-Actor":    actor,
+		"X-Board-Tenant":   tenant,
+		"X-Board-Filename": url.PathEscape(name),
+		"Content-Type":     contentType,
+	}
+	return h.rawRequest(http.MethodPost, "/attachments", bytes.NewReader(data), headers)
+}
+
+// attachment reads a file's bytes as actor on one board.
+func (h *harness) attachmentInTenant(actor, tenant, id string) (int, []byte, http.Header) {
 	h.t.Helper()
 	request, err := http.NewRequest(http.MethodGet, h.http.URL+server.APIPrefix+"/attachments/"+id, nil)
 	if err != nil {
 		h.t.Fatal(err)
 	}
 	request.Header.Set("X-Board-Actor", actor)
+	if tenant != "" {
+		request.Header.Set("X-Board-Tenant", tenant)
+	}
 	response, err := h.http.Client().Do(request)
 	if err != nil {
 		h.t.Fatal(err)
@@ -81,6 +99,12 @@ func (h *harness) attachment(actor, id string) (int, []byte, http.Header) {
 		h.t.Fatal(err)
 	}
 	return response.StatusCode, data, response.Header
+}
+
+// attachment reads a file's bytes as actor.
+func (h *harness) attachment(actor, id string) (int, []byte, http.Header) {
+	h.t.Helper()
+	return h.attachmentInTenant(actor, "", id)
 }
 
 func decodeAttachment(t *testing.T, data []byte) protocol.Attachment {
@@ -134,6 +158,9 @@ func TestAttachmentLifecycle(t *testing.T) {
 	}
 	if headers.Get("Content-Security-Policy") == "" || headers.Get("X-Content-Type-Options") != "nosniff" {
 		t.Fatalf("unexpected safety headers: %+v", headers)
+	}
+	if headers.Get("Cache-Control") != "private, max-age=31536000, immutable" {
+		t.Fatalf("unexpected cache header: %q", headers.Get("Cache-Control"))
 	}
 	if headers.Get("Content-Disposition") == "" || !strings.HasPrefix(headers.Get("Content-Disposition"), "inline") {
 		t.Fatalf("an image shows inline: %q", headers.Get("Content-Disposition"))
@@ -261,6 +288,18 @@ func TestAttachmentLimitsAndValidation(t *testing.T) {
 		"channel": "work", "text": "bad", "attachments": []string{"nope"},
 	}, alice, "", nil)
 	h.expect(status, data, http.StatusBadRequest)
+
+	// A dotfile and a name with invisible formatting are refused, not silently
+	// rewritten.
+	for _, name := range []string{".env", "a\u202eb.txt", ".\u200bhidden"} {
+		t.Run("name "+name, func(t *testing.T) {
+			status, data := h.upload(alice, name, "text/plain", []byte("x"))
+			h.expect(status, data, http.StatusBadRequest)
+			if code := errorCode(t, data); code != protocol.CodeInvalidAttachment {
+				t.Fatalf("expected invalid_attachment, got %s", code)
+			}
+		})
+	}
 }
 
 func TestDirectUploads(t *testing.T) {
@@ -275,7 +314,8 @@ func TestDirectUploads(t *testing.T) {
 		}
 	})
 
-	h := newHarness(t, server.Options{Blobs: signingMemory{blob.NewMemory()}})
+	signer := &signingMemory{Memory: blob.NewMemory()}
+	h := newHarness(t, server.Options{Blobs: signer})
 	const alice = "local:user:alice"
 	const bob = "local:user:bob"
 
@@ -299,8 +339,8 @@ func TestDirectUploads(t *testing.T) {
 		t.Fatalf("expected upload_not_found, got %s", code)
 	}
 
-	blobs := h.blobs
-	key := "attachments/" + ticket.ID
+	blobs := signer.Memory
+	key := signer.lastKey
 	if err := blobs.Put(context.Background(), key, []byte("four"), "application/octet-stream"); err != nil {
 		t.Fatal(err)
 	}
@@ -334,5 +374,149 @@ func TestDirectUploads(t *testing.T) {
 	h.expect(status, data, http.StatusRequestEntityTooLarge)
 	if code := errorCode(t, data); code != protocol.CodeTooLarge {
 		t.Fatalf("expected too_large, got %s", code)
+	}
+	status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
+		"name": ".env", "size": 1,
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusBadRequest)
+	if code := errorCode(t, data); code != protocol.CodeInvalidAttachment {
+		t.Fatalf("expected invalid_attachment, got %s", code)
+	}
+}
+
+// uploadGate is a policy that answers only the anywhere seam.
+type uploadGate struct {
+	post bool
+	sync bool
+}
+
+func (g uploadGate) Authorize(context.Context, protocol.Actor, string, protocol.Permission) error {
+	return nil
+}
+
+func (g uploadGate) AuthorizeAnywhere(_ context.Context, _ protocol.Actor, permission protocol.Permission) error {
+	switch permission {
+	case protocol.PermissionPost:
+		if g.post {
+			return nil
+		}
+	case protocol.PermissionSync:
+		if g.sync {
+			return nil
+		}
+	}
+	return protocol.Forbidden("not anywhere")
+}
+
+func TestUploadsUseAnywhereAuthorizer(t *testing.T) {
+	const alice = "local:user:alice"
+	t.Run("neither post nor sync", func(t *testing.T) {
+		signer := &signingMemory{Memory: blob.NewMemory()}
+		h := newHarness(t, server.Options{Blobs: signer, Authorize: uploadGate{}})
+		status, data := h.upload(alice, "a.txt", "text/plain", []byte("x"))
+		h.expect(status, data, http.StatusForbidden)
+		status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
+			"name": "a.txt", "size": 1,
+		}, alice, "", nil)
+		h.expect(status, data, http.StatusForbidden)
+	})
+	for _, gate := range []uploadGate{{post: true}, {sync: true}} {
+		name := "post anywhere"
+		if gate.sync {
+			name = "sync anywhere"
+		}
+		t.Run(name, func(t *testing.T) {
+			signer := &signingMemory{Memory: blob.NewMemory()}
+			h := newHarness(t, server.Options{Blobs: signer, Authorize: gate})
+			status, data := h.upload(alice, "a.txt", "text/plain", []byte("x"))
+			h.expect(status, data, http.StatusCreated)
+			status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
+				"name": "a.txt", "size": 1,
+			}, alice, "", nil)
+			h.expect(status, data, http.StatusCreated)
+		})
+	}
+}
+
+func TestAttachmentsArePerTenant(t *testing.T) {
+	signer := &signingMemory{Memory: blob.NewMemory()}
+	h := newHarness(t, server.Options{Blobs: signer})
+	const alice = "local:user:alice"
+
+	status, data := h.uploadInTenant(alice, "tenant-a", "a.txt", "text/plain", []byte("tenant a"))
+	h.expect(status, data, http.StatusCreated)
+	file := decodeAttachment(t, data)
+
+	status, body, _ := h.attachmentInTenant(alice, "tenant-a", file.ID)
+	h.expect(status, body, http.StatusOK)
+	if string(body) != "tenant a" {
+		t.Fatalf("tenant a read %q", body)
+	}
+	status, _, _ = h.attachmentInTenant(alice, "tenant-b", file.ID)
+	if status != http.StatusNotFound {
+		t.Fatalf("tenant b read another tenant's file: %d", status)
+	}
+	// Binding it on the other board finds nothing.
+	status, data = h.request(http.MethodPost, "/messages", map[string]any{
+		"channel": "work", "text": "", "attachments": []string{file.ID},
+	}, alice, "tenant-b", nil)
+	h.expect(status, data, http.StatusNotFound)
+	if code := errorCode(t, data); code != protocol.CodeAttachmentNotFound {
+		t.Fatalf("expected attachment_not_found, got %s", code)
+	}
+	// Deleting on the other board is nothing, and doesn't touch this one.
+	status, data = h.request(http.MethodDelete, "/attachments/"+file.ID, nil, alice, "tenant-b", nil)
+	h.expect(status, data, http.StatusNoContent)
+	status, body, _ = h.attachmentInTenant(alice, "tenant-a", file.ID)
+	h.expect(status, body, http.StatusOK)
+
+	// A direct upload's ticket is the tenant's too.
+	status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
+		"name": "big.bin", "size": 1,
+	}, alice, "tenant-a", nil)
+	h.expect(status, data, http.StatusCreated)
+	ticket := decode[protocol.UploadTicket](t, data)
+	status, data = h.request(http.MethodPost, "/attachments/uploads/"+ticket.ID, nil, alice, "tenant-b", nil)
+	h.expect(status, data, http.StatusNotFound)
+	if code := errorCode(t, data); code != protocol.CodeUploadNotFound {
+		t.Fatalf("expected upload_not_found, got %s", code)
+	}
+	if err := signer.Memory.Put(context.Background(), signer.lastKey, []byte("1"), "application/octet-stream"); err != nil {
+		t.Fatal(err)
+	}
+	status, data = h.request(http.MethodPost, "/attachments/uploads/"+ticket.ID, nil, alice, "tenant-a", nil)
+	h.expect(status, data, http.StatusCreated)
+}
+
+// flakyDeleteStore refuses the first data-file delete, as a store outage does.
+type flakyDeleteStore struct {
+	*blob.Memory
+	fail bool
+}
+
+func (s *flakyDeleteStore) Delete(ctx context.Context, key string) error {
+	if s.fail && !strings.HasSuffix(key, ".json") {
+		return errors.New("store unavailable")
+	}
+	return s.Memory.Delete(ctx, key)
+}
+
+func TestAttachmentDeleteCanBeRetried(t *testing.T) {
+	store := &flakyDeleteStore{Memory: blob.NewMemory(), fail: true}
+	h := newHarness(t, server.Options{Blobs: store})
+	const alice = "local:user:alice"
+	status, data := h.upload(alice, "a.txt", "text/plain", []byte("x"))
+	h.expect(status, data, http.StatusCreated)
+	file := decodeAttachment(t, data)
+
+	status, data = h.request(http.MethodDelete, "/attachments/"+file.ID, nil, alice, "", nil)
+	h.expect(status, data, http.StatusInternalServerError)
+	// The record survives a failed data delete, so the retry succeeds.
+	store.fail = false
+	status, data = h.request(http.MethodDelete, "/attachments/"+file.ID, nil, alice, "", nil)
+	h.expect(status, data, http.StatusNoContent)
+	status, _, _ = h.attachment(alice, file.ID)
+	if status != http.StatusNotFound {
+		t.Fatalf("deleted file still reads: %d", status)
 	}
 }
