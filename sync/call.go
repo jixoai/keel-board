@@ -521,13 +521,14 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 		}
 		if o.host != nil {
 			record := BoardEvent{
-				Tenant:   req.Tenant,
-				Type:     BoardMessageSynced,
-				Thread:   req.Message.Thread,
-				Message:  &req.Message,
-				External: &receipt.Thread,
-				Files:    receipt.Files,
-				FilesSet: receipt.FilesSet,
+				Tenant:          req.Tenant,
+				Type:            BoardMessageSynced,
+				Thread:          req.Message.Thread,
+				Message:         &req.Message,
+				External:        &receipt.Thread,
+				ExternalMessage: receipt.Message,
+				Files:           receipt.Files,
+				FilesSet:        receipt.FilesSet,
 			}
 			if err := o.host.Record(ctx, record); err != nil {
 				return receipt, err

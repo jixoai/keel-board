@@ -289,7 +289,8 @@ func (w *OutboundWorker) recordSynced(ctx context.Context, job Delivery, copy Co
 	}
 	return w.host.Record(ctx, boardsync.BoardEvent{
 		Tenant: w.tenant, Type: boardsync.BoardMessageSynced, Thread: job.Message.Thread,
-		Message: &job.Message, External: &ref,
+		Message: &job.Message, External: &ref, ExternalMessage: copy.ExternalMessage,
+		Files: copy.Files, FilesSet: copy.FilesSet,
 	})
 }
 

@@ -19,10 +19,11 @@ type RouteFunc func(ctx context.Context, channel string) (bool, error)
 // received the webhook. A handler must not share one static gate across
 // tenants; a factory that builds one per (tenant, key) is the intended shape.
 //
-// ThreadSynced takes the key-prefixed external thread ID
-// ("slack:C0123:1727.9"). A router that can't tell yet returns an error: the
-// webhook answers 500 so the platform sends the event again, rather than
-// storing every channel's events while a name is unknown.
+// The gate receives the tenant and entry key, because a tenant may run several
+// connections and each has its own mappings and thread records. A gate that
+// can't tell yet returns an error: the webhook answers 500 so the platform
+// sends the event again, rather than storing every channel's events while a
+// name is unknown.
 type Gate interface {
 	Routes(ctx context.Context, tenant string, key Key, channel string) (bool, error)
 	ThreadSynced(ctx context.Context, tenant string, key Key, thread string) (bool, error)

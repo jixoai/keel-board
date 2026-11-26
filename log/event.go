@@ -40,6 +40,13 @@ const (
 	EventTaskUnblocked   EventType = "task.unblocked"
 	EventTaskCanceled    EventType = "task.canceled"
 	EventTaskReopened    EventType = "task.reopened"
+
+	// Sync facts. They are ordinary board events, projected onto the message
+	// they concern; raw platform events stay in the sync inbox.
+	EventThreadSynced       EventType = "thread.synced"
+	EventMessageSynced      EventType = "message.synced"
+	EventMessageFilesSynced EventType = "message.files_synced"
+	EventMessageSyncFailed  EventType = "message.sync_failed"
 )
 
 // Event is one fact in the board log.
@@ -69,6 +76,14 @@ func ConcernedMessageID(event Event) uint64 {
 	case *MessageDeletedPayload:
 		return payload.ID
 	case *ReactionPayload:
+		return payload.ID
+	case *ThreadSyncedPayload:
+		return payload.ID
+	case *MessageSyncedPayload:
+		return payload.ID
+	case *MessageFilesSyncedPayload:
+		return payload.ID
+	case *MessageSyncFailedPayload:
 		return payload.ID
 	case *LabelsChangedPayload:
 		return payload.ID
@@ -113,9 +128,14 @@ type MessagePostedPayload struct {
 	By      Author            `json:"by"`
 	From    *string           `json:"from"`
 	Blind   bool              `json:"blind,omitempty"`
+	// Origin is where an imported message came from: a platform's own IDs.
+	Origin *MessageOrigin `json:"origin,omitempty"`
 	// Attachments are the files the message carries, as the board stored
 	// them when it bound them. Empty for a message with none.
 	Attachments []protocol.Attachment `json:"attachments,omitempty"`
+	// Links are platform messages this one links to. Metadata only: the board
+	// never fetches a platform URL.
+	Links []protocol.LinkView `json:"links,omitempty"`
 	// Along is how many events right after this post, in its append, are
 	// about it: what made a new thread a task.
 	Along int `json:"along,omitempty"`

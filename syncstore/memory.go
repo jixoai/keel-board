@@ -784,6 +784,60 @@ func (m *Memory) CopyForMessage(_ context.Context, tenant string, key boardsync.
 	return out, nil
 }
 
+// CopyByExternal implements Store.
+func (m *Memory) CopyByExternal(_ context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, externalMessage string) (Copy, bool, error) {
+	if err := validTenant(tenant); err != nil {
+		return Copy{}, false, err
+	}
+	if err := expectKey(key); err != nil {
+		return Copy{}, false, err
+	}
+	if err := target.Validate(); err != nil {
+		return Copy{}, false, err
+	}
+	if target.Key != key {
+		return Copy{}, false, fmt.Errorf("%w: target key isn't the lookup key", boardsync.ErrBadRequest)
+	}
+	if externalMessage == "" || len(externalMessage) > 1200 {
+		return Copy{}, false, fmt.Errorf("%w: an external message ID is required", boardsync.ErrBadRequest)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, copy := range m.tenantLocked(tenant).copies {
+		if copy.Key == key && copy.ExternalMessage == externalMessage && copy.Target == target {
+			return copy, true, nil
+		}
+	}
+	return Copy{}, false, nil
+}
+
+// CopyByExternalMessage implements Store.
+func (m *Memory) CopyByExternalMessage(_ context.Context, tenant string, key boardsync.Key, externalMessage string) (Copy, bool, error) {
+	if err := validTenant(tenant); err != nil {
+		return Copy{}, false, err
+	}
+	if err := expectKey(key); err != nil {
+		return Copy{}, false, err
+	}
+	if externalMessage == "" || len(externalMessage) > 1200 {
+		return Copy{}, false, fmt.Errorf("%w: an external message ID is required", boardsync.ErrBadRequest)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var found Copy
+	matched := false
+	for _, copy := range m.tenantLocked(tenant).copies {
+		if copy.Key != key || copy.ExternalMessage != externalMessage {
+			continue
+		}
+		if matched {
+			return Copy{}, false, fmt.Errorf("%w: external message %q has several copies", boardsync.ErrBadRequest, externalMessage)
+		}
+		found, matched = copy, true
+	}
+	return found, matched, nil
+}
+
 // TargetFailures implements Store.
 func (m *Memory) TargetFailures(_ context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
 	if err := validTenant(tenant); err != nil {
@@ -1014,6 +1068,7 @@ func (m *Memory) PruneNonces(_ context.Context, tenant string, before time.Time)
 
 func (m *Memory) saveCopyLocked(tenant string, copy Copy, now time.Time) {
 	copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
+	copy.Files = append([]string(nil), copy.Files...)
 	data := m.tenantLocked(tenant)
 	if existing, ok := data.copies[copy.ID]; ok {
 		copy.CreatedAt = existing.CreatedAt

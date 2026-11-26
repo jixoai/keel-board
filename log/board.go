@@ -1096,6 +1096,14 @@ func decodeEvent(record store.Record) (Event, error) {
 		payload = &ReactionPayload{}
 	case EventLabelsChanged:
 		payload = &LabelsChangedPayload{}
+	case EventThreadSynced:
+		payload = &ThreadSyncedPayload{}
+	case EventMessageSynced:
+		payload = &MessageSyncedPayload{}
+	case EventMessageFilesSynced:
+		payload = &MessageFilesSyncedPayload{}
+	case EventMessageSyncFailed:
+		payload = &MessageSyncFailedPayload{}
 	case EventTaskCreated:
 		payload = &TaskCreatedPayload{}
 	case EventTaskAssigned:

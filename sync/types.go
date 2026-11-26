@@ -612,10 +612,12 @@ type BoardEvent struct {
 	Cause  string     `json:"cause,omitempty"`
 	// External is a message.synced receipt's platform thread.
 	External *ThreadRef `json:"external,omitempty"`
-	Files    []string   `json:"files,omitempty"`
-	FilesSet bool       `json:"filesSet,omitempty"`
-	Error    string     `json:"error,omitempty"`
-	NoSync   bool       `json:"noSync,omitempty"`
+	// ExternalMessage is a message.synced receipt's platform message ID.
+	ExternalMessage string   `json:"externalMessage,omitempty"`
+	Files           []string `json:"files,omitempty"`
+	FilesSet        bool     `json:"filesSet,omitempty"`
+	Error           string   `json:"error,omitempty"`
+	NoSync          bool     `json:"noSync,omitempty"`
 }
 
 // ImportOptions are the overrides a sync function passes to Import.

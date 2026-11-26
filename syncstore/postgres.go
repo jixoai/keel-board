@@ -765,15 +765,19 @@ func (p *Postgres) AckOutbox(ctx context.Context, tenant, deliveryID, lease stri
 				_, err = tx.Exec(ctx, `
 					INSERT INTO board_sync_copies
 						(tenant_id, id, board_message, board_thread, sync_key, platform,
-						 channel, thread, subthread, kind, external_thread, external_message)
-					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+						 channel, thread, subthread, kind, external_thread, external_message,
+						 files, files_set)
+					VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 					ON CONFLICT (tenant_id, id) DO UPDATE
 					SET external_thread = EXCLUDED.external_thread,
 						external_message = EXCLUDED.external_message,
+						files = EXCLUDED.files,
+						files_set = EXCLUDED.files_set,
 						updated_at = now()`,
 					tenant, copy.ID, copy.BoardMessage, copy.BoardThread, copy.Key,
 					copy.Target.Platform, copy.Target.Channel, copy.Target.Thread,
-					copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage)
+					copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage,
+					nonNilFiles(copy.Files), copy.FilesSet)
 				if err != nil {
 					return err
 				}
@@ -931,7 +935,8 @@ func (p *Postgres) OutboxDepth(ctx context.Context, tenant string) (OutboxDepth,
 }
 
 const copyColumns = `id, board_message, board_thread, sync_key, platform, channel,
-	thread, subthread, kind, external_thread, external_message, created_at, updated_at`
+	thread, subthread, kind, external_thread, external_message, files, files_set,
+	created_at, updated_at`
 
 func scanCopy(row scanner) (Copy, error) {
 	var (
@@ -944,7 +949,8 @@ func scanCopy(row scanner) (Copy, error) {
 	)
 	err := row.Scan(&copy.ID, &copy.BoardMessage, &copy.BoardThread, &copy.Key,
 		&platform, &channel, &thread, &subthread, &kind,
-		&copy.ExternalThread, &copy.ExternalMessage, &copy.CreatedAt, &copy.UpdatedAt)
+		&copy.ExternalThread, &copy.ExternalMessage, &copy.Files, &copy.FilesSet,
+		&copy.CreatedAt, &copy.UpdatedAt)
 	if err != nil {
 		return Copy{}, err
 	}
@@ -1013,6 +1019,82 @@ func (p *Postgres) CopyForMessage(ctx context.Context, tenant string, key boards
 	return out, nil
 }
 
+// CopyByExternal implements Store.
+func (p *Postgres) CopyByExternal(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, externalMessage string) (Copy, bool, error) {
+	if err := expectKey(key); err != nil {
+		return Copy{}, false, err
+	}
+	if err := target.Validate(); err != nil {
+		return Copy{}, false, err
+	}
+	if target.Key != key {
+		return Copy{}, false, fmt.Errorf("%w: target key isn't the lookup key", boardsync.ErrBadRequest)
+	}
+	if externalMessage == "" || len(externalMessage) > 1200 {
+		return Copy{}, false, fmt.Errorf("%w: an external message ID is required", boardsync.ErrBadRequest)
+	}
+	var copy Copy
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		var err error
+		copy, err = scanCopy(tx.QueryRow(ctx, `
+			SELECT `+copyColumns+` FROM board_sync_copies
+			WHERE tenant_id = $1 AND sync_key = $2 AND platform = $3
+				AND channel = $4 AND thread = $5 AND subthread = $6 AND kind = $7
+				AND external_message = $8
+			ORDER BY updated_at DESC LIMIT 1`,
+			tenant, key, target.Platform, target.Channel, target.Thread,
+			target.Subthread, target.Kind, externalMessage))
+		return err
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Copy{}, false, nil
+	}
+	if err != nil {
+		return Copy{}, false, err
+	}
+	return copy, true, nil
+}
+
+// CopyByExternalMessage implements Store.
+func (p *Postgres) CopyByExternalMessage(ctx context.Context, tenant string, key boardsync.Key, externalMessage string) (Copy, bool, error) {
+	if err := expectKey(key); err != nil {
+		return Copy{}, false, err
+	}
+	if externalMessage == "" || len(externalMessage) > 1200 {
+		return Copy{}, false, fmt.Errorf("%w: an external message ID is required", boardsync.ErrBadRequest)
+	}
+	var copies []Copy
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+copyColumns+` FROM board_sync_copies
+			WHERE tenant_id = $1 AND sync_key = $2 AND external_message = $3
+			ORDER BY updated_at DESC LIMIT 2`, tenant, key, externalMessage)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			copy, err := scanCopy(rows)
+			if err != nil {
+				return err
+			}
+			copies = append(copies, copy)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return Copy{}, false, err
+	}
+	switch len(copies) {
+	case 0:
+		return Copy{}, false, nil
+	case 1:
+		return copies[0], true, nil
+	default:
+		return Copy{}, false, fmt.Errorf("%w: external message %q has several copies", boardsync.ErrBadRequest, externalMessage)
+	}
+}
+
 // SaveCopy implements Store.
 func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error) {
 	if err := copy.Validate(); err != nil {
@@ -1023,15 +1105,19 @@ func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy
 		_, err := tx.Exec(ctx, `
 			INSERT INTO board_sync_copies
 				(tenant_id, id, board_message, board_thread, sync_key, platform,
-				 channel, thread, subthread, kind, external_thread, external_message)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				 channel, thread, subthread, kind, external_thread, external_message,
+				 files, files_set)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 			ON CONFLICT (tenant_id, id) DO UPDATE
 			SET external_thread = EXCLUDED.external_thread,
 				external_message = EXCLUDED.external_message,
+				files = EXCLUDED.files,
+				files_set = EXCLUDED.files_set,
 				updated_at = now()`,
 			tenant, copy.ID, copy.BoardMessage, copy.BoardThread, copy.Key,
 			copy.Target.Platform, copy.Target.Channel, copy.Target.Thread,
-			copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage)
+			copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage,
+			nonNilFiles(copy.Files), copy.FilesSet)
 		return err
 	})
 	if err != nil {

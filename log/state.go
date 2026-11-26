@@ -37,6 +37,12 @@ type Message struct {
 	// Attachments are the files the message carries. A tombstone keeps none.
 	Attachments []protocol.Attachment
 	Links       []any
+
+	// Origin is where an imported message came from: a platform's own IDs.
+	Origin *MessageOrigin
+	// Sync is the message's sync projection: attached targets and delivered
+	// copies. It is nil until a sync fact concerns the message.
+	Sync *SyncState
 }
 
 // Task is the state a task's root carries.
@@ -149,6 +155,14 @@ func (s *State) Apply(event Event) {
 			}
 			message.Version = event.Seq
 		}
+	case *ThreadSyncedPayload:
+		s.applyThreadSynced(event.Seq, payload)
+	case *MessageSyncedPayload:
+		s.applyMessageSynced(event.Seq, payload)
+	case *MessageFilesSyncedPayload:
+		s.applyMessageFilesSynced(event.Seq, payload)
+	case *MessageSyncFailedPayload:
+		s.applyMessageSyncFailed(event.Seq, payload)
 	case *TaskCreatedPayload:
 		s.applyTaskCreated(payload, event.Seq)
 	case *TaskAssignedPayload:
@@ -357,6 +371,8 @@ func (s *State) applyPosted(event Event) {
 		Revision:    event.Seq,
 		Blind:       payload.Blind,
 		Attachments: append([]protocol.Attachment(nil), payload.Attachments...),
+		Origin:      cloneOrigin(payload.Origin),
+		Links:       linksAsAny(payload.Links),
 	}
 	s.Messages[event.Seq] = message
 	if payload.Re != nil {
@@ -485,6 +501,8 @@ func CloneMessage(message *Message) *Message {
 	}
 	copy.Attachments = append([]protocol.Attachment(nil), message.Attachments...)
 	copy.Links = append([]any(nil), message.Links...)
+	copy.Origin = cloneOrigin(message.Origin)
+	copy.Sync = CloneSync(message.Sync)
 	if message.Task != nil {
 		task := *message.Task
 		task.For = copyString(message.Task.For)

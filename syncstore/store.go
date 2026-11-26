@@ -158,8 +158,12 @@ type Copy struct {
 	Target          boardsync.ResolvedTarget `json:"target"`
 	ExternalThread  string                   `json:"externalThread"`
 	ExternalMessage string                   `json:"externalMessage"`
-	CreatedAt       time.Time                `json:"createdAt"`
-	UpdatedAt       time.Time                `json:"updatedAt"`
+	// Files and FilesSet are the receipt's file IDs, kept with the copy so a
+	// receipt retried after a crash can still record them.
+	Files     []string  `json:"files,omitempty"`
+	FilesSet  bool      `json:"filesSet,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // Validate checks a copy before it is stored.
@@ -280,6 +284,13 @@ type Store interface {
 	OutboxDepth(ctx context.Context, tenant string) (OutboxDepth, error)
 	Copy(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error)
 	CopyForMessage(ctx context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error)
+	// CopyByExternal is the inbound reverse lookup: the board message a
+	// platform message copies on one target. An edit, delete, or reaction
+	// arrives with the platform's own message ID and no board ID.
+	CopyByExternal(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, externalMessage string) (Copy, bool, error)
+	// CopyByExternalMessage is CopyByExternal without the target: a Slack
+	// reaction carries the reacted message, not a reply's parent thread.
+	CopyByExternalMessage(ctx context.Context, tenant string, key boardsync.Key, externalMessage string) (Copy, bool, error)
 	// SaveCopy persists a post's copy. The runner calls it before it records
 	// message.synced, so a receipt retry finds the copy and doesn't post again.
 	SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error)
@@ -553,6 +564,8 @@ func copyFromRequest(req boardsync.CopyRequest) *Copy {
 		Target:          req.Target,
 		ExternalThread:  externalThread,
 		ExternalMessage: req.Receipt.Message,
+		Files:           append([]string(nil), req.Receipt.Files...),
+		FilesSet:        req.Receipt.FilesSet,
 	}
 	copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
 	return copy
@@ -581,6 +594,15 @@ func expectKey(key boardsync.Key) error {
 		return fmt.Errorf("%w: %q isn't a sync key", boardsync.ErrBadRequest, key)
 	}
 	return nil
+}
+
+// nonNilFiles writes an empty array rather than NULL, so a copy's file list is
+// always a list.
+func nonNilFiles(files []string) []string {
+	if files == nil {
+		return []string{}
+	}
+	return files
 }
 
 func expectLabel(value, name string, max int) error {

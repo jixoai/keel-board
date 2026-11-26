@@ -58,7 +58,7 @@ func messageView(snapshot *log.Snapshot, message *log.Message, fallback *protoco
 		CreatedAt:   protocol.FormatTime(message.CreatedAt),
 		EditedAt:    protocol.FormatTimePtr(message.EditedAt),
 		Deleted:     message.Deleted,
-		Undelivered: map[string]string{},
+		Undelivered: undeliveredView(message.Sync),
 		Attachments: []protocol.Attachment{},
 		Links:       []protocol.LinkView{},
 		Version:     message.Version,
@@ -68,8 +68,14 @@ func messageView(snapshot *log.Snapshot, message *log.Message, fallback *protoco
 		Blocks:      protocol.BlocksIn(message.Text),
 		By:          actorView(snapshot, message.By.Actor, fallback),
 	}
+	if message.Origin != nil {
+		view.Origin = message.Origin
+	}
 	if len(message.Attachments) > 0 {
 		view.Attachments = append([]protocol.Attachment(nil), message.Attachments...)
+	}
+	if len(message.Links) > 0 {
+		view.Links = linkViews(message.Links)
 	}
 	view.Author = view.By
 	return view
@@ -243,4 +249,32 @@ func optionalRef(id *uint64) *protocol.Ref {
 		return nil
 	}
 	return protocol.RefOf(*id)
+}
+
+// undeliveredView renders the targets a delivery gave up on, by external ID.
+func undeliveredView(state *log.SyncState) map[string]string {
+	out := make(map[string]string)
+	if state == nil {
+		return out
+	}
+	for target, code := range state.Undelivered {
+		out[target] = code
+	}
+	return out
+}
+
+// linkViews turns the board's wire-shaped links into typed views.
+func linkViews(links []any) []protocol.LinkView {
+	out := make([]protocol.LinkView, 0, len(links))
+	for _, link := range links {
+		switch value := link.(type) {
+		case protocol.LinkView:
+			out = append(out, value)
+		case *protocol.LinkView:
+			if value != nil {
+				out = append(out, *value)
+			}
+		}
+	}
+	return out
 }
