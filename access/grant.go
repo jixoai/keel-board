@@ -1,8 +1,11 @@
 package access
 
 import (
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jixoai/keel-board/protocol"
 )
 
 // MaxGrantPrincipals is how many principals one grant may name.
@@ -121,6 +124,22 @@ func ApplyUpdate(grant Grant, update GrantUpdate) (Grant, error) {
 				kept = append(kept, principal)
 			}
 		}
+		for _, removal := range removals {
+			matched := false
+			for _, principal := range next.Principals {
+				if Removes(removal, principal) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return Grant{}, &protocol.Error{
+					Status:  400,
+					Code:    CodeNotInGrant,
+					Message: fmt.Sprintf("the grant names no %s principal to remove", principalLabel(removal)),
+				}
+			}
+		}
 		next.Principals = kept
 	}
 	for _, principal := range update.Add {
@@ -138,6 +157,13 @@ func ApplyUpdate(grant Grant, update GrantUpdate) (Grant, error) {
 		}
 		if !joined {
 			next.Principals = append(next.Principals, added)
+		}
+	}
+	if len(next.Principals) == 0 {
+		return Grant{}, &protocol.Error{
+			Status:  400,
+			Code:    CodeGrantEmpty,
+			Message: "the update would leave the grant naming no principal",
 		}
 	}
 	if update.Can != nil {
@@ -161,11 +187,17 @@ func Removes(removal, principal Principal) bool {
 	case PrincipalProject:
 		return removal.ProjectID != "" && removal.ProjectID == principal.ProjectID
 	case PrincipalGitHub:
-		if removal.RepositoryID != "" && principal.RepositoryID != "" {
-			if removal.RepositoryID != principal.RepositoryID {
+		if removal.RepositoryID != "" {
+			// An ID is the repository's identity: a caller or grant that only
+			// knows its name is a different principal, not a fallback.
+			if principal.RepositoryID == "" || removal.RepositoryID != principal.RepositoryID {
 				return false
 			}
-		} else if removal.Repository != "" && removal.Repository != principal.Repository {
+		} else if removal.Repository != "" {
+			if removal.Repository != principal.Repository {
+				return false
+			}
+		} else {
 			return false
 		}
 		if removal.Workflow != "" && workflowPath(removal.Workflow) != workflowPath(principal.Workflow) {
@@ -263,4 +295,36 @@ func (g Grant) hasEveryone() bool {
 		}
 	}
 	return false
+}
+
+// principalLabel names a principal the way a 400 reads it.
+func principalLabel(principal Principal) string {
+	switch principal.Kind {
+	case PrincipalUser:
+		if principal.UserID != "" {
+			return "user " + principal.UserID
+		}
+	case PrincipalProject:
+		if principal.ProjectID != "" {
+			return "project " + principal.ProjectID
+		}
+	case PrincipalGitHub:
+		if principal.RepositoryID != "" {
+			return "github repository " + principal.RepositoryID
+		}
+		if principal.Repository != "" {
+			return "github repository " + principal.Repository
+		}
+	case PrincipalOIDC:
+		if principal.Issuer != "" {
+			return "oidc issuer " + principal.Issuer
+		}
+	case PrincipalApp:
+		if principal.ClientID != "" {
+			return "app " + principal.ClientID
+		}
+	case PrincipalAllUsers, PrincipalAllProjects, PrincipalAllApps, PrincipalEveryone:
+		return string(principal.Kind)
+	}
+	return string(principal.Kind)
 }

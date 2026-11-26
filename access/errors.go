@@ -21,6 +21,15 @@ const (
 	// manage at a pattern and leave them unable to undo it. The board answers
 	// 409.
 	CodeGrantLockout protocol.Code = "grant_lockout"
+	// CodeInvalidScope is a token narrowing that doesn't parse. The board
+	// answers 400.
+	CodeInvalidScope protocol.Code = "invalid_scope"
+	// CodeNotInGrant is an update removing a principal the grant doesn't name.
+	// The board answers 400.
+	CodeNotInGrant protocol.Code = "not_in_grant"
+	// CodeGrantEmpty is an update that would leave a grant naming no principal.
+	// The board answers 400.
+	CodeGrantEmpty protocol.Code = "grant_empty"
 )
 
 // InvalidCan reports a can, a channel pattern, or a permission that doesn't

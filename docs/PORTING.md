@@ -36,13 +36,15 @@ Implemented, end to end:
   idempotency key plus request digest (persisted with the batch), folds to
   messages/threads/channels/actors/tasks, replay from the store, and SSE with
   `Last-Event-ID` resumption.
-- `Authorize(ctx, actor, channel, permission)` and tenant resolution seams; the
-  development server allows everything and trusts actor headers.
+- `Authorize(ctx, tenant, actor, channel, permission)` and tenant resolution
+  seams; the development server allows everything and trusts actor headers.
 
-Not in phase 1: grants and per-channel access policy (only the seam), sync and
-its receipts, reactions, files and attachments, schedules, schemas and blocks,
-and watchers. Their wire types are not served, and requests that name them are
-refused rather than half-accepted.
+Grant and access HTTP routes are not in phase 1, but the policy is a Go package
+now (`access/`): grants, channel patterns, principal matching, reach,
+admission and lockout checks, and a tenant-aware authorizer. Sync and its
+receipts, reactions, files and attachments, schedules, schemas and blocks, and
+watchers remain outside phase 1; their wire types are not served, and requests
+that name them are refused rather than half-accepted.
 
 ## Deliberate differences
 
@@ -50,6 +52,82 @@ refused rather than half-accepted.
 - The pure task domain exposes `Commit(current, base, next)` so a store can make
   conditional appends explicit.
 - Phase 1 shipped the task/thread/channel core.
+
+## Access
+
+`access/` transposes the per-channel policy of `packages/board/src/server/access.ts`
+and `grants.ts` to plain Go data and functions.
+
+Kept:
+
+- Permissions and implications: `read`, `post`, `react`, `label`, `sync`,
+  `manage`; every message-addressing verb implies `read`, `manage` implies all,
+  `post` implies nothing.
+- Channel patterns: exact, `subtree/`, and `*`; an exact channel wins over the
+  longest subtree, which wins over `*`.
+- Principal levels: principal, group (`all-users`, `all-projects`, `all-apps`),
+  and `everyone`; the closest level at a pattern wins and grants tied there add
+  up. `everyone` never admits a caller by itself.
+- Grants, written `Can`, caps, token scopes, `Explain` (winning pattern, the
+  patterns it won over, level, grants, capped flag, permissions), and the
+  reach/admission/lockout rules of grant changes, including 409
+  `grant_lockout`.
+- The small `x-board-can` helpers: `ParseCan`, `CanText`, 4000-character and
+  64-pattern bounds for headers.
+
+Replaced or simplified:
+
+- Vercel OIDC/team/project/deployment identity → `protocol.Actor`, the
+  `ActorPrincipal` default, and host hooks for `Principal`, `Team`, `Member`,
+  `TeamProject`, `TeamApp`, `Cap`, and scope.
+- Vercel API grant storage → `GrantStore` with a concurrency-safe
+  `MemoryStore`. `GrantService` owns write policy; seed a board's first grants
+  directly through the store (or with an unrestricted owner), since no caller
+  can have manage before a grant gives it.
+- The server's `Authorize` seam now passes the tenant the server resolved, so a
+  multi-tenant board can't authorize against another tenant's grants. A
+  `Tenant` hook may normalize the name but the explicit tenant is what reaches
+  the store.
+- `GrantService.Create`/`Update` force project `TeamID` from `BoardTeam` or
+  `TeamFunc`; a team-scoped grant no longer matches a caller whose token names
+  no team. A project moving teams keeps none of its old team's grants.
+- `Grant.Capped` is recomputed from the writing caller's `Cap`; a client value
+  is not trusted. A grant naming a person is capped when the caller has a cap.
+- Grant listings and explanations are gated: `List` and explaining another
+  caller require manage at `*`. A caller that can't list sees its own
+  permissions for a channel a grant admits it to, but no pattern, level, or
+  grants; an unknown or unreachable target is a uniform 403. This closes the
+  404/403 enumeration oracle.
+- A sandboxed owner (owner with a token scope or cap) still passes reach and
+  admission; only the lockout is waived for an owner.
+- `Removes` compares a GitHub principal by identity: a grant carrying a
+  `repositoryId` matches only that ID, and a caller without an ID doesn't fall
+  back to the repository name. Removing a principal the grant doesn't name is
+  400 `not_in_grant`; removing the last principal is 400 `grant_empty`.
+- `all-projects` accepts any environment name; upstream limits it to
+  production/preview/development. A project's environments still default to
+  production.
+
+Known deviations, deliberately not implemented now:
+
+- No batch grant writes (`createGrants`), no grant HTTP routes, no `/me`, and
+  no `grants/explain` query API. `GrantService` and `Authorizer` are the Go
+  seams.
+- No PostgreSQL store and no version CAS. `MemoryStore` is authoritative for
+  one process, and `GrantService.mu` serializes its own read-check-write. A PG
+  store must make `Update` conditional or run the check in one transaction;
+  the `GrantStore` comment records this.
+- No named-channel 403 distinction: the authorizer can't tell a channel named
+  by a write from a resource looked up by ID, so an unreadable channel answers
+  404 by default. `RevealUnreadable` opts into 403 for hosts that know the
+  channel was named.
+- No `O(channels × grants)` indexing or grant cache; `Authorize` reloads the
+  tenant's grants per check.
+- A bad `x-board-can` is 400 `invalid_scope` when the host uses `ScopeText`; a
+  programmatic `Scope` is trusted host code. A programmatic scope over 64
+  patterns is applied pattern by pattern instead of being rejected, while a
+  parsed header over the limit is 400.
+
 
 ## Sync
 

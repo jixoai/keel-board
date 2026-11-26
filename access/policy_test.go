@@ -302,11 +302,13 @@ func TestCrossTenantGrantsAreIgnored(t *testing.T) {
 		t.Fatalf("a grant from another tenant decided: %+v", explanation)
 	}
 
-	// An unlabeled grant is what a directly built policy uses; a store always
-	// labels what it keeps.
+	// An unlabeled grant is not a wildcard: a store labels what it keeps, and
+	// production matching is fail-closed.
 	unlabeled := otherTenant
 	unlabeled.Grants = []Grant{{Principals: []Principal{alice}, Can: Can{"*": Only(PermissionRead)}}}
-	explanationPermissions(t, unlabeled.Explain(alice, "dev"), PermissionRead)
+	if explanation := unlabeled.Explain(alice, "dev"); explanation.Admitted || len(explanation.Permissions) != 0 {
+		t.Fatalf("an unlabeled grant decided: %+v", explanation)
+	}
 
 	sameTenant := otherTenant
 	sameTenant.Tenant = "b"
@@ -430,8 +432,16 @@ func TestPrincipalKindsMatch(t *testing.T) {
 		}
 		byName := caller
 		byName.RepositoryID = ""
-		if !policy.Can(byName, "ci", PermissionPost) {
-			t.Fatal("without an ID, the repository name should match")
+		if policy.Can(byName, "ci", PermissionPost) {
+			t.Fatal("a grant that keeps a repository ID doesn't match a caller that only knows its name")
+		}
+		nameOnly := Policy{Tenant: "t", Grants: []Grant{{
+			Tenant:     "t",
+			Principals: []Principal{{Kind: PrincipalGitHub, Repository: "acme/web"}},
+			Can:        Can{"*": Only(PermissionPost)},
+		}}}
+		if !nameOnly.Can(byName, "ci", PermissionPost) {
+			t.Fatal("a grant without a repository ID should match by name")
 		}
 	})
 

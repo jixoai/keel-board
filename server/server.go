@@ -179,12 +179,12 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (*request, bool
 
 // can asks the authorizer whether the request may do permission in channel.
 func (req *request) can(s *Server, channel string, permission protocol.Permission) bool {
-	return s.authorize.Authorize(req.ctx, req.actor, channel, permission) == nil
+	return s.authorize.Authorize(req.ctx, req.tenant, req.actor, channel, permission) == nil
 }
 
 // permit asks the authorizer and turns a refusal into an error body.
 func (req *request) permit(s *Server, channel string, permission protocol.Permission) *protocol.Error {
-	if err := s.authorize.Authorize(req.ctx, req.actor, channel, permission); err != nil {
+	if err := s.authorize.Authorize(req.ctx, req.tenant, req.actor, channel, permission); err != nil {
 		return asProtocol(err)
 	}
 	return nil
@@ -194,6 +194,20 @@ func (req *request) permit(s *Server, channel string, permission protocol.Permis
 func asProtocol(err error) *protocol.Error {
 	if boardErr, ok := protocol.AsError(err); ok {
 		return boardErr
+	}
+	// An access refusal carries its own status and code, so a grant_lockout is
+	// a 409 rather than a generic 403, without the server importing access.
+	var provider interface{ ProtocolError() *protocol.Error }
+	if errors.As(err, &provider) {
+		if boardErr := provider.ProtocolError(); boardErr != nil {
+			return boardErr
+		}
+	}
+	if errors.Is(err, context.Canceled) {
+		return &protocol.Error{Status: 499, Code: protocol.Code("canceled"), Message: "request canceled"}
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &protocol.Error{Status: http.StatusServiceUnavailable, Code: protocol.CodeUnavailable, Message: "request timed out"}
 	}
 	return protocol.Forbidden(err.Error())
 }

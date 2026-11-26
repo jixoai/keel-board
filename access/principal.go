@@ -160,7 +160,7 @@ func NormalizePrincipal(principal Principal) (Principal, error) {
 
 	switch principal.Kind {
 	case PrincipalUser:
-		if out.UserID != "" && out.Email != "" && !strings.EqualFold(out.UserID, out.Email) {
+		if out.UserID != "" && out.Email != "" {
 			return Principal{}, invalidGrantf("a user is its email or its userId, not both")
 		}
 		if out.UserID == "" {
@@ -168,6 +168,11 @@ func NormalizePrincipal(principal Principal) (Principal, error) {
 				return Principal{}, invalidGrantf("a user principal names a userId (or an email)")
 			}
 			out.UserID = strings.ToLower(out.Email)
+		}
+		// An email-shaped userId is a login: users are known by it in
+		// lowercase, as what verified them gives it.
+		if strings.Contains(out.UserID, "@") {
+			out.UserID = strings.ToLower(out.UserID)
 		}
 		if len(out.UserID) > 200 || !protocol.Storable(out.UserID) || strings.ContainsAny(out.UserID, " \t\r\n") {
 			return Principal{}, invalidGrantf("a user principal's ID is 1 to 200 characters without spaces, got %q", out.UserID)

@@ -29,17 +29,20 @@ var (
 // every grant with its tenant and returns copies, so a caller can't mutate
 // what it keeps.
 //
-// A PostgreSQL store (not shipped in this phase) implements the same four
-// methods. It should make Update conditional on the grant's version, or run
-// the service's read-check-write in one transaction, since the service's
-// lockout check reads the grants it is about to change.
+// Update takes the grant's whole next state, not a patch, so the service's
+// team and capped normalization is what the store keeps. A PostgreSQL store
+// (not shipped in this phase) implements the same four methods. It should make
+// Update conditional on the grant's version, or run the service's
+// read-check-write in one transaction, since the service's lockout check reads
+// the grants it is about to change.
 type GrantStore interface {
 	// List returns the tenant's grants.
 	List(ctx context.Context, tenant string) ([]Grant, error)
 	// Create stores a grant, assigning an ID when it has none.
 	Create(ctx context.Context, tenant string, grant Grant) (Grant, error)
-	// Update applies update to the grant id and returns the result.
-	Update(ctx context.Context, tenant, id string, update GrantUpdate) (Grant, error)
+	// Update replaces the grant id with grant's principals and can, keeping
+	// its creation time.
+	Update(ctx context.Context, tenant, id string, grant Grant) (Grant, error)
 	// Revoke removes the grant id.
 	Revoke(ctx context.Context, tenant, id string) error
 }
@@ -126,27 +129,37 @@ func (s *MemoryStore) Create(ctx context.Context, tenant string, grant Grant) (G
 }
 
 // Update implements GrantStore.
-func (s *MemoryStore) Update(ctx context.Context, tenant, id string, update GrantUpdate) (Grant, error) {
+func (s *MemoryStore) Update(ctx context.Context, tenant, id string, grant Grant) (Grant, error) {
 	if err := contextError(ctx); err != nil {
 		return Grant{}, err
 	}
 	tenant = tenantName(tenant)
+	if grant.Tenant != "" && grant.Tenant != tenant {
+		return Grant{}, ErrTenantMismatch
+	}
+	if grant.ID != "" && grant.ID != id {
+		return Grant{}, invalidGrantf("a grant update keeps its ID, got %q for %q", grant.ID, id)
+	}
+	next := grant
+	next.ID = id
+	next.Tenant = tenant
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	kept, ok := s.tenants[tenant][id]
 	if !ok {
 		return Grant{}, ErrGrantNotFound
 	}
-	next, err := ApplyUpdate(kept, update)
+	if len(next.Principals) == 0 {
+		return Grant{}, invalidGrantf("a grant names at least one principal")
+	}
+	normalized, err := NormalizeGrant(next)
 	if err != nil {
 		return Grant{}, err
 	}
-	next.ID = kept.ID
-	next.Tenant = tenant
-	next.CreatedAt = kept.CreatedAt
-	next.UpdatedAt = s.clock()
-	s.tenants[tenant][id] = next.Clone()
-	return next, nil
+	normalized.CreatedAt = kept.CreatedAt
+	normalized.UpdatedAt = s.clock()
+	s.tenants[tenant][id] = normalized.Clone()
+	return normalized, nil
 }
 
 // Revoke implements GrantStore.
@@ -175,6 +188,14 @@ func (s *MemoryStore) Revoke(ctx context.Context, tenant, id string) error {
 type GrantService struct {
 	store GrantStore
 	mu    sync.Mutex
+	// BoardTeam is the team every project principal a write names is kept on.
+	// It is the service's source of truth, so a client-written TeamID can't
+	// outlive a project moving teams.
+	BoardTeam string
+	// TeamFunc resolves the board's team for a tenant. When set it wins over
+	// BoardTeam. Configure it before writes: the service reads it while
+	// holding its write lock.
+	TeamFunc func(ctx context.Context, tenant string) (string, error)
 }
 
 // NewGrantService returns a service over store. It panics without one.
@@ -185,9 +206,18 @@ func NewGrantService(store GrantStore) *GrantService {
 	return &GrantService{store: store}
 }
 
-// List returns the tenant's grants.
-func (s *GrantService) List(ctx context.Context, tenant string) ([]Grant, error) {
-	return s.store.List(ctx, tenantName(tenant))
+// List returns the tenant's grants to a caller that may list them: manage at
+// `*`. Anyone else is refused 403 without saying whether a grant exists.
+func (s *GrantService) List(ctx context.Context, tenant string, caller Caller) ([]Grant, error) {
+	tenant = tenantName(tenant)
+	grants, err := s.store.List(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+	if !lists(caller, tenant, grants) {
+		return nil, forbiddenListing()
+	}
+	return grants, nil
 }
 
 // Create makes a grant. caller must be able to manage at every pattern the
@@ -208,6 +238,12 @@ func (s *GrantService) Create(ctx context.Context, tenant string, caller Caller,
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	team, err := s.team(ctx, tenant)
+	if err != nil {
+		return Grant{}, err
+	}
+	normalized = forceTeam(normalized, team)
+	normalized.Capped = cappedFor(normalized, caller)
 	before, err := s.store.List(ctx, tenant)
 	if err != nil {
 		return Grant{}, err
@@ -247,6 +283,12 @@ func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Cal
 	}
 	next.ID = old.ID
 	next.Tenant = tenant
+	team, err := s.team(ctx, tenant)
+	if err != nil {
+		return Grant{}, err
+	}
+	next = forceTeam(next, team)
+	next.Capped = cappedFor(next, caller)
 	after := replaceGrant(before, id, next)
 	// A removal lets no one in, so it is judged by reach alone; adding or
 	// widening is judged by admission too.
@@ -269,7 +311,7 @@ func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Cal
 	if refusal != nil {
 		return Grant{}, refusal
 	}
-	return s.store.Update(ctx, tenant, id, update)
+	return s.store.Update(ctx, tenant, id, next)
 }
 
 // Revoke removes a grant. Lifting what it held back widens whoever it named,
@@ -308,14 +350,108 @@ func (s *GrantService) Revoke(ctx context.Context, tenant, id string, caller Cal
 }
 
 // Explain returns what decides caller's access in channel, from the tenant's
-// current grants.
+// current grants. A caller that may list grants sees the winning pattern and
+// the grants that decided. Anyone else sees only their own permissions: no
+// pattern, level, or grant, so explaining yourself reveals no one else's.
 func (s *GrantService) Explain(ctx context.Context, tenant string, caller Caller, channel string) (Explanation, error) {
 	tenant = tenantName(tenant)
 	grants, err := s.store.List(ctx, tenant)
 	if err != nil {
 		return Explanation{}, err
 	}
-	return Evaluate(caller.facts(tenant, grants), channel), nil
+	explanation := Evaluate(caller.facts(tenant, grants), channel)
+	if lists(caller, tenant, grants) {
+		return explanation, nil
+	}
+	// Without lists, an unadmitted caller and an unreachable channel answer
+	// the same 403: probing can't tell which it was.
+	if !explanation.Admitted || explanation.Pattern == "" {
+		return Explanation{}, protocol.Forbidden("no grant lets this caller into that channel")
+	}
+	return redactExplanation(explanation), nil
+}
+
+// ExplainFor explains another caller's access in channel. It takes manage at
+// `*` to list grants, and answers 403 without a pattern for a caller that
+// can't list or a target no grant admits, so probing reveals nothing.
+func (s *GrantService) ExplainFor(ctx context.Context, tenant string, caller Caller, target Caller, channel string) (Explanation, error) {
+	tenant = tenantName(tenant)
+	grants, err := s.store.List(ctx, tenant)
+	if err != nil {
+		return Explanation{}, err
+	}
+	if !lists(caller, tenant, grants) {
+		return Explanation{}, forbiddenListing()
+	}
+	explanation := Evaluate(target.facts(tenant, grants), channel)
+	if !explanation.Admitted {
+		return Explanation{}, protocol.Forbidden("no grant lets that caller in")
+	}
+	return explanation, nil
+}
+
+// lists reports whether caller may list the tenant's grants: manage at `*`,
+// with its cap and token scope applied. An owner with neither is unconstrained.
+func lists(caller Caller, tenant string, grants []Grant) bool {
+	if caller.Owner && caller.Scope == nil && caller.Cap == nil {
+		return true
+	}
+	facts := caller.facts(tenant, grants)
+	matched := matchGrants(facts, false)
+	if !admits(facts, matched) {
+		return false
+	}
+	return newAccessView(facts, matched).atPattern(ChannelPattern{Kind: PatternAll}).Has(PermissionManage)
+}
+
+func forbiddenListing() *protocol.Error {
+	return protocol.Forbidden("listing grants takes manage everywhere")
+}
+
+func redactExplanation(explanation Explanation) Explanation {
+	return Explanation{
+		Channel:     explanation.Channel,
+		Admitted:    explanation.Admitted,
+		Capped:      explanation.Capped,
+		Permissions: explanation.Permissions,
+	}
+}
+
+func (s *GrantService) team(ctx context.Context, tenant string) (string, error) {
+	if s.TeamFunc != nil {
+		team, err := s.TeamFunc(ctx, tenant)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(team), nil
+	}
+	return strings.TrimSpace(s.BoardTeam), nil
+}
+
+// forceTeam keeps every project principal on team. It clears a client-written
+// TeamID when the board knows no team, as a board that verifies tokens itself
+// names a project by ID alone.
+func forceTeam(grant Grant, team string) Grant {
+	for index, principal := range grant.Principals {
+		if principal.Kind == PrincipalProject {
+			grant.Principals[index].TeamID = team
+		}
+	}
+	return grant
+}
+
+// cappedFor reports whether the grant gives a person something the caller's
+// cap narrows. A grant naming no person isn't capped by a person's role.
+func cappedFor(grant Grant, caller Caller) bool {
+	if caller.Cap == nil {
+		return false
+	}
+	for _, principal := range grant.Principals {
+		if principal.Kind == PrincipalUser || principal.Kind == PrincipalAllUsers {
+			return true
+		}
+	}
+	return false
 }
 
 // GrantChange is a grant write as CheckGrantChange judges it: the grants as
@@ -387,7 +523,11 @@ func (r *Refusal) ProtocolError() *protocol.Error {
 // returns nil when the change may land, or a Refusal naming the reason and
 // the pattern it failed at.
 func CheckGrantChange(change GrantChange) *Refusal {
-	if change.Caller.Owner {
+	// An owner with no token narrowing and no cap is unconstrained. An owner
+	// behind a sandbox token still can't grant past what that token has, and
+	// still can't admit anyone where everyone gets more than it has; it is
+	// only spared the lockout, since an owner can always take a change back.
+	if change.Caller.Owner && change.Caller.Scope == nil && change.Caller.Cap == nil {
 		return nil
 	}
 	tenant := tenantName(change.Tenant)
@@ -434,20 +574,23 @@ func CheckGrantChange(change GrantChange) *Refusal {
 	}
 
 	// Admission: anyone a grant lets in gets what everyone gets, so the
-	// caller must have that too.
+	// caller must have that too. It is judged with the grants as they are
+	// before the change, as upstream does: the change itself can't be what
+	// gives the caller the permission.
 	if len(made) > 0 {
 		gives := everyoneView(tenant, change.After)
 		for _, spot := range spots {
 			for _, permission := range Permissions {
-				if gives.atPattern(spot).Has(permission) && !afterCaller.atPattern(spot).Has(permission) {
+				if gives.atPattern(spot).Has(permission) && !beforeCaller.atPattern(spot).Has(permission) {
 					return &Refusal{Reason: RefusalAdmission, Pattern: spot.String(), Permission: permission}
 				}
 			}
 		}
 	}
 
-	// Lockout: a change you couldn't take back takes saying so.
-	if !change.LockMeOut {
+	// Lockout: a change you couldn't take back takes saying so. An owner is
+	// never locked out.
+	if !change.LockMeOut && !change.Caller.Owner {
 		for _, pattern := range touched {
 			if !afterCaller.atPattern(pattern).Has(PermissionManage) || !afterOwn.atPattern(pattern).Has(PermissionManage) {
 				return &Refusal{Reason: RefusalLockout, Pattern: pattern.String(), Permission: PermissionManage}

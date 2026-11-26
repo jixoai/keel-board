@@ -9,21 +9,23 @@ import (
 )
 
 // Authorizer is the board's access seam. It answers whether actor may do
-// permission in channel, returning nil to allow and a protocol.Error (or any
-// error) to refuse.
+// permission in channel on tenant, returning nil to allow and a protocol.Error
+// (or any error) to refuse.
 //
 // Phase 1 ships AllowAll for development. A deployment plugs in its own policy
-// here without touching the handlers: every read and write asks.
+// here without touching the handlers: every read and write asks. The tenant is
+// the one the server resolved for the request, so a multi-tenant deployment
+// can't authorize a caller against another board's grants.
 type Authorizer interface {
-	Authorize(ctx context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error
+	Authorize(ctx context.Context, tenant string, actor protocol.Actor, channel string, permission protocol.Permission) error
 }
 
 // AuthorizerFunc adapts a function to Authorizer.
-type AuthorizerFunc func(ctx context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error
+type AuthorizerFunc func(ctx context.Context, tenant string, actor protocol.Actor, channel string, permission protocol.Permission) error
 
 // Authorize implements Authorizer.
-func (f AuthorizerFunc) Authorize(ctx context.Context, actor protocol.Actor, channel string, permission protocol.Permission) error {
-	return f(ctx, actor, channel, permission)
+func (f AuthorizerFunc) Authorize(ctx context.Context, tenant string, actor protocol.Actor, channel string, permission protocol.Permission) error {
+	return f(ctx, tenant, actor, channel, permission)
 }
 
 // AllowAll allows every caller every permission. It is for development and
@@ -31,7 +33,7 @@ func (f AuthorizerFunc) Authorize(ctx context.Context, actor protocol.Actor, cha
 type AllowAll struct{}
 
 // Authorize implements Authorizer.
-func (AllowAll) Authorize(context.Context, protocol.Actor, string, protocol.Permission) error {
+func (AllowAll) Authorize(context.Context, string, protocol.Actor, string, protocol.Permission) error {
 	return nil
 }
 

@@ -75,10 +75,9 @@ func TestMemoryStoreCRUD(t *testing.T) {
 	}
 
 	dev := Can{"dev/": Only(PermissionPost)}
-	updated, err := store.Update(ctx, "t", "g1", GrantUpdate{
-		Add:    []Principal{UserPrincipal("bob")},
-		Remove: []Principal{UserPrincipal("alice")},
-		Can:    &dev,
+	updated, err := store.Update(ctx, "t", "g1", Grant{
+		Principals: []Principal{UserPrincipal("bob")},
+		Can:        dev,
 	})
 	if err != nil {
 		t.Fatalf("update: %v", err)
@@ -99,7 +98,7 @@ func TestMemoryStoreCRUD(t *testing.T) {
 	if err := store.Revoke(ctx, "t", "g1"); !errors.Is(err, ErrGrantNotFound) {
 		t.Fatalf("second revoke = %v, want ErrGrantNotFound", err)
 	}
-	if _, err := store.Update(ctx, "t", "missing", GrantUpdate{}); !errors.Is(err, ErrGrantNotFound) {
+	if _, err := store.Update(ctx, "t", "missing", Grant{Principals: []Principal{UserPrincipal("x")}, Can: Can{"*": All()}}); !errors.Is(err, ErrGrantNotFound) {
 		t.Fatalf("update missing = %v", err)
 	}
 	if _, err := store.Create(ctx, "t", Grant{ID: "custom", Principals: []Principal{UserPrincipal("x")}, Can: Can{"*": All()}}); !errors.Is(err, ErrGrantExists) {
@@ -119,7 +118,7 @@ func TestMemoryStoreTenantIsolation(t *testing.T) {
 	if err != nil || len(other) != 0 {
 		t.Fatalf("tenant b list = %+v, %v", other, err)
 	}
-	if _, err := store.Update(ctx, "b", created.ID, GrantUpdate{}); !errors.Is(err, ErrGrantNotFound) {
+	if _, err := store.Update(ctx, "b", created.ID, Grant{Principals: []Principal{UserPrincipal("x")}, Can: Can{"*": All()}}); !errors.Is(err, ErrGrantNotFound) {
 		t.Fatalf("tenant b update = %v, want ErrGrantNotFound", err)
 	}
 	if err := store.Revoke(ctx, "b", created.ID); !errors.Is(err, ErrGrantNotFound) {
@@ -237,15 +236,17 @@ func TestApplyUpdateAddsAndRemoves(t *testing.T) {
 		t.Fatalf("can changed: %+v", kept.Can)
 	}
 
-	// Removing every principal is allowed; a create still refuses one.
-	empty, err := ApplyUpdate(Grant{Principals: []Principal{UserPrincipal("alice")}, Can: Can{"*": All()}}, GrantUpdate{
+	// Removing every principal is refused as an empty grant; removing one the
+	// grant doesn't name is refused as not_in_grant.
+	if _, err := ApplyUpdate(Grant{Principals: []Principal{UserPrincipal("alice")}, Can: Can{"*": All()}}, GrantUpdate{
 		Remove: []Principal{UserPrincipal("alice")},
-	})
-	if err != nil {
-		t.Fatalf("remove all: %v", err)
+	}); err == nil || errorCode(err) != CodeGrantEmpty {
+		t.Fatalf("remove all = %v, want grant_empty", err)
 	}
-	if len(empty.Principals) != 0 {
-		t.Fatalf("principals = %+v", empty.Principals)
+	if _, err := ApplyUpdate(old, GrantUpdate{
+		Remove: []Principal{UserPrincipal("nobody")},
+	}); err == nil || errorCode(err) != CodeNotInGrant {
+		t.Fatalf("remove nobody = %v, want not_in_grant", err)
 	}
 }
 
@@ -523,4 +524,12 @@ func TestGrantServiceReachChecksOwnLimitsUnderThePattern(t *testing.T) {
 	}, false); err != nil {
 		t.Fatalf("create dev/: %v", err)
 	}
+}
+
+func errorCode(err error) protocol.Code {
+	var boardErr *protocol.Error
+	if errors.As(err, &boardErr) {
+		return boardErr.Code
+	}
+	return ""
 }

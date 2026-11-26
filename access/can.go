@@ -11,6 +11,9 @@ import (
 // can is written.
 const MaxCanPatterns = 64
 
+// MaxCanText is the longest x-board-can header a board reads.
+const MaxCanText = 4000
+
 // CanAt is what a can gives at one channel pattern: `all`, a list of
 // permissions, or none. `None` (an empty list) is meaningful: it closes a
 // subtree though it gives nothing.
@@ -123,11 +126,17 @@ type CanEntry struct {
 // rest sorted by name. A can that names no pattern, or one that doesn't
 // parse, is an InvalidCan.
 func (c Can) Entries() ([]CanEntry, error) {
+	return c.entries(MaxCanPatterns)
+}
+
+// entries compiles the can. A limit above zero bounds how many patterns it may
+// name; zero leaves it unbounded, as a programmatic scope is.
+func (c Can) entries(limit int) ([]CanEntry, error) {
 	if len(c) == 0 {
 		return nil, invalidCanf("a grant's can names at least one channel pattern, like {'*': ['read']}")
 	}
-	if len(c) > MaxCanPatterns {
-		return nil, invalidCanf("a can names at most %d channel patterns", MaxCanPatterns)
+	if limit > 0 && len(c) > limit {
+		return nil, invalidCanf("a can names at most %d channel patterns", limit)
 	}
 	entries := make([]CanEntry, 0, len(c))
 	for raw, value := range c {
@@ -192,9 +201,11 @@ func (c Can) Patterns() []string {
 
 // groupsFromCan compiles a can into pattern groups for resolution. A bad can
 // is empty: a scope or token that doesn't parse can only take access away.
+// It doesn't bound the pattern count: a programmatic scope still narrows
+// channel by channel, unlike a header, which ParseCan bounds.
 func groupsFromCan(can Can) map[string]*patternGroup {
 	groups := make(map[string]*patternGroup, len(can))
-	entries, err := can.Entries()
+	entries, err := can.entries(0)
 	if err != nil {
 		return groups
 	}
@@ -212,6 +223,9 @@ func groupsFromCan(can Can) map[string]*patternGroup {
 // `*=all`, or `*=` for none. It is the shape a proxy's x-board-can narrows a
 // caller with.
 func parseCanText(value string) (Can, error) {
+	if len(value) > MaxCanText {
+		return nil, invalidCanf("a can is longer than %d characters", MaxCanText)
+	}
 	if strings.TrimSpace(value) == "" {
 		return nil, invalidCanf("a can is empty: write pattern=permissions, like dev/=read,post")
 	}
@@ -254,6 +268,9 @@ func parseCanText(value string) (Can, error) {
 	}
 	if len(out) == 0 {
 		return nil, invalidCanf("a can is empty: write pattern=permissions, like dev/=read,post")
+	}
+	if len(out) > MaxCanPatterns {
+		return nil, invalidCanf("a can names at most %d channel patterns", MaxCanPatterns)
 	}
 	return out, nil
 }

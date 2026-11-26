@@ -8,7 +8,7 @@ The upstream project is TypeScript and tied to Vercel's API, OIDC, Connect and
 deployment model. This repository keeps the parts that make the board a
 standard — one durable log, channels and threads, tasks with claims and
 leases, needs and labels — and replaces the backend with a plain Go library,
-an append-only log and HTTP/SSE. Watchers, per-channel grants, files and
+an append-only log and HTTP/SSE. Watchers, grant HTTP routes, files and
 two-way sync follow in later phases.
 
 - Upstream pin: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0`
@@ -41,6 +41,7 @@ again once, and an SSE cursor ahead of the log is refused rather than clamped.
 | `protocol/` | Wire types, validation, error codes and HTTP status mapping |
 | `log/` | Append-only board log, conditional appends, idempotency, folds and projections |
 | `store/` | `EventStore` seam, in-memory and PostgreSQL stores, migrations |
+| `access/` | Per-channel permissions, grants, patterns and the authorizer |
 | `server/` | HTTP API, SSE feed, authorizer and tenant seams |
 | `cmd/board/` | Standalone dev server (`board serve`, memory or `--dsn`) |
 

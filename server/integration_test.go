@@ -510,7 +510,7 @@ func TestNeeds(t *testing.T) {
 func TestOwnershipAssignmentAndHolds(t *testing.T) {
 	// A policy that leaves bob without `manage`: ownership is what decides
 	// his writes, as it is for any project or app with narrowed access.
-	h := newHarness(t, server.Options{Authorize: server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, _ string, permission protocol.Permission) error {
+	h := newHarness(t, server.Options{Authorize: server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, _ string, permission protocol.Permission) error {
 		if actor.ID == "local:user:bob" && permission == protocol.PermissionManage {
 			return protocol.Forbidden("bob may not manage")
 		}
@@ -836,7 +836,7 @@ func TestTenantIsolation(t *testing.T) {
 }
 
 func TestAuthorizerSeam(t *testing.T) {
-	denyRead := server.AuthorizerFunc(func(_ context.Context, _ protocol.Actor, channel string, permission protocol.Permission) error {
+	denyRead := server.AuthorizerFunc(func(_ context.Context, _ string, _ protocol.Actor, channel string, permission protocol.Permission) error {
 		if channel == "secret" && permission == protocol.PermissionRead {
 			return protocol.Forbidden("no access to secret")
 		}
@@ -1048,7 +1048,7 @@ func TestFailAndReopen(t *testing.T) {
 }
 
 func TestBlockUnblockWithNeeds(t *testing.T) {
-	h := newHarness(t, server.Options{Authorize: server.AuthorizerFunc(func(_ context.Context, actor protocol.Actor, _ string, permission protocol.Permission) error {
+	h := newHarness(t, server.Options{Authorize: server.AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, _ string, permission protocol.Permission) error {
 		if actor.ID == "local:user:bob" && permission == protocol.PermissionManage {
 			return protocol.Forbidden("bob may not manage")
 		}

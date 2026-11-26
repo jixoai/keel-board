@@ -200,10 +200,10 @@ func matchGrants(facts Facts, own bool) []matchedGrant {
 }
 
 // tenantMatches reports whether a grant belongs to the tenant being decided.
-// An unlabeled grant, as a caller builds for a test or a one-board
-// deployment, matches; a store labels every grant it keeps.
+// Both sides must name the same tenant: an unlabeled grant is not a wildcard,
+// so a store that forgets to label one cannot leak it into another board.
 func tenantMatches(grantTenant, tenant string) bool {
-	return grantTenant == "" || tenant == "" || grantTenant == tenant
+	return grantTenant == tenant
 }
 
 // admits reports whether anything but everyone lets the caller in: a grant,
@@ -259,8 +259,10 @@ func matchPrincipal(principal Principal, facts Facts) (Level, bool) {
 			return "", false
 		}
 		repositoryMatches := false
-		if principal.RepositoryID != "" && caller.RepositoryID != "" {
-			repositoryMatches = principal.RepositoryID == caller.RepositoryID
+		if principal.RepositoryID != "" {
+			// A grant that keeps the repository's ID matches that identity only:
+			// another repository with the same name is not it.
+			repositoryMatches = caller.RepositoryID != "" && principal.RepositoryID == caller.RepositoryID
 		} else {
 			repositoryMatches = principal.Repository != "" && principal.Repository == caller.Repository
 		}
@@ -297,7 +299,12 @@ func matchPrincipal(principal Principal, facts Facts) (Level, bool) {
 }
 
 func teamsMatch(grantTeam, callerTeam string) bool {
-	return grantTeam == "" || callerTeam == "" || grantTeam == callerTeam
+	// A grant scoped to a team names only that team's projects; a caller whose
+	// token names no team is not it.
+	if grantTeam == "" {
+		return true
+	}
+	return callerTeam != "" && grantTeam == callerTeam
 }
 
 // groupMatches resolves matched grants into one group per pattern: the
