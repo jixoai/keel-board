@@ -1,0 +1,168 @@
+package syncstore
+
+import (
+	"errors"
+	"log/slog"
+	"net/http"
+	"strings"
+
+	boardsync "github.com/jixoai/keel-board/sync"
+)
+
+// TenantFunc resolves the tenant a webhook belongs to. The server supplies it
+// from its own authentication; the handler never trusts a tenant named by the
+// platform's payload or a header by itself.
+type TenantFunc func(*http.Request) (string, error)
+
+// WebhookConfig configure a webhook handler.
+type WebhookConfig struct {
+	// Registry holds the sync entries and their providers. Required.
+	Registry *boardsync.Registry
+	// Store is the durable inbox. Required.
+	Store Store
+	// Tenant resolves the board a request is on. Required.
+	Tenant TenantFunc
+	// Gate decides which channels and threads a webhook keeps. nil keeps every
+	// record the provider emits.
+	Gate boardsync.Gate
+	// MaxBodyBytes caps the request body before a provider parses it. Zero
+	// means one MiB.
+	MaxBodyBytes int64
+	// Logger receives failures. Zero uses slog.Default.
+	Logger *slog.Logger
+}
+
+// WebhookHandler serves POST /webhooks/{key}. It is independent of the board
+// server's route table: the server mounts it when it is ready.
+//
+// The handler resolves the tenant and the persisted entry first, so a key that
+// belongs to another tenant (or is disabled) is a 404 before the body is read.
+// A deployment must UpsertEntry for a tenant before serving its webhooks.
+// It then delegates to Registry.HandleWebhook, which verifies and normalizes
+// through the provider, gates the records, and stores them before the handler
+// answers. A store failure becomes a 500 and the platform retries; the handler
+// never answers 2xx before the inbox commit.
+type WebhookHandler struct {
+	registry *boardsync.Registry
+	store    Store
+	tenant   TenantFunc
+	gate     boardsync.Gate
+	maxBody  int64
+	logger   *slog.Logger
+}
+
+// NewWebhookHandler validates cfg and returns a handler.
+func NewWebhookHandler(cfg WebhookConfig) (*WebhookHandler, error) {
+	if cfg.Registry == nil {
+		return nil, errors.New("syncstore: a webhook handler needs a registry")
+	}
+	if cfg.Store == nil {
+		return nil, errors.New("syncstore: a webhook handler needs a store")
+	}
+	if cfg.Tenant == nil {
+		return nil, errors.New("syncstore: a webhook handler needs a tenant resolver")
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 1 << 20
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.Default()
+	}
+	return &WebhookHandler{
+		registry: cfg.Registry,
+		store:    cfg.Store,
+		tenant:   cfg.Tenant,
+		gate:     cfg.Gate,
+		maxBody:  cfg.MaxBodyBytes,
+		logger:   cfg.Logger,
+	}, nil
+}
+
+// ServeHTTP implements http.Handler.
+func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeStatus(w, http.StatusMethodNotAllowed)
+		return
+	}
+	tenant, err := h.tenant(r)
+	if err != nil {
+		h.logger.Warn("sync webhook tenant refused", "error", ErrorCode(err))
+		writeStatus(w, http.StatusUnauthorized)
+		return
+	}
+	if err := validTenant(tenant); err != nil {
+		h.logger.Warn("sync webhook tenant is not usable", "error", ErrorCode(err))
+		writeStatus(w, http.StatusInternalServerError)
+		return
+	}
+	key, ok := webhookKey(r)
+	if !ok {
+		writeStatus(w, http.StatusNotFound)
+		return
+	}
+	entry, found, err := h.store.Entry(r.Context(), tenant, key)
+	if err != nil {
+		h.logger.Error("sync webhook entry lookup failed", "tenant", tenant, "key", key, "error", ErrorCode(err))
+		writeStatus(w, http.StatusInternalServerError)
+		return
+	}
+	if !found || !entry.Enabled {
+		// An unknown key and another tenant's key answer the same, so a caller
+		// can't probe which connections exist.
+		writeStatus(w, http.StatusNotFound)
+		return
+	}
+	request, err := boardsync.NewWebhookRequest(r, h.maxBody)
+	if err != nil {
+		writeStatus(w, http.StatusRequestEntityTooLarge)
+		return
+	}
+	response, err := h.registry.HandleWebhook(r.Context(), key, request, h.gate,
+		NewTenantInbox(h.store, tenant, "webhook"))
+	if err != nil {
+		status := response.Status
+		if status == 0 {
+			status = boardsync.StatusCode(err)
+		}
+		if status < 400 {
+			status = http.StatusInternalServerError
+		}
+		// The body is a generic status: a provider or store error may carry a
+		// platform payload, and none of it belongs in a response.
+		h.logger.Warn("sync webhook failed",
+			"tenant", tenant, "key", key, "status", status, "error", ErrorCode(err))
+		writeStatus(w, status)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	response.WriteTo(w)
+}
+
+// webhookKey reads the {key} path segment. PathValue is used when the handler
+// is mounted with a pattern; the trailing segment is accepted when it is
+// mounted behind a plain prefix such as /webhooks/.
+func webhookKey(r *http.Request) (boardsync.Key, bool) {
+	value := r.PathValue("key")
+	if value == "" {
+		const prefix = "/webhooks/"
+		if !strings.HasPrefix(r.URL.Path, prefix) {
+			return "", false
+		}
+		value = strings.TrimPrefix(r.URL.Path, prefix)
+	}
+	if value == "" || strings.Contains(value, "/") {
+		return "", false
+	}
+	key := boardsync.Key(value)
+	if !key.Valid() {
+		return "", false
+	}
+	return key, true
+}
+
+func writeStatus(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+}
