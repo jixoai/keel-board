@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -32,6 +33,7 @@ type syncHarness struct {
 	registry *boardsync.Registry
 	provider *fake.Provider
 	server   *server.Server
+	wrapped  syncstore.Store
 	posts    atomic.Int64
 	cancel   context.CancelFunc
 	workers  sync.WaitGroup
@@ -47,6 +49,10 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		// uses the one-minute default this overrides.
 		LeaseTTL: 200 * time.Millisecond,
 	})
+	serverStore := syncstore.Store(store)
+	if opts.wrapStore != nil {
+		serverStore = opts.wrapStore(store)
+	}
 	if err != nil {
 		t.Fatalf("new memory store: %v", err)
 	}
@@ -94,7 +100,8 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		tenant = func(*http.Request) (string, error) { return "t1", nil }
 	}
 	srv := server.New(server.Options{
-		Board: board,
+		Board:     board,
+		Authorize: opts.authorize,
 		Tenant: func(r *http.Request) (string, error) {
 			if tenant := strings.TrimSpace(r.Header.Get("X-Board-Tenant")); tenant != "" {
 				return tenant, nil
@@ -103,14 +110,15 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		},
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sync: &server.SyncOptions{
-			Store: store, Registry: registry, Tenant: tenant,
+			Store: serverStore, Registry: registry, Tenant: tenant,
 			Owned:         []server.SyncKey{{Tenant: "t1", Key: "slack"}},
-			StartChannels: map[boardsync.Key][]string{"slack": {"C0123"}},
+			StartChannels: map[server.SyncKey][]string{{Tenant: "t1", Key: "slack"}: {"C0123"}},
 			FileHosts:     []string{"files.example.test"},
 			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		},
 	})
 	h.server = srv
+	h.wrapped = serverStore
 	httpServer := httptest.NewServer(srv)
 	h.http = httpServer
 	t.Cleanup(httpServer.Close)
@@ -118,6 +126,15 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		h.startWorkers(t)
 	}
 	return h
+}
+
+// serverStore is the store the server and workers use (the wrapped one when a
+// test injects failures); h.store is always the concrete memory store.
+func (h *syncHarness) serverStore() syncstore.Store {
+	if h.wrapped != nil {
+		return h.wrapped
+	}
+	return h.store
 }
 
 // startWorkers starts the process's consumers: one inbound worker, one
@@ -137,7 +154,7 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 		t.Fatal("sync runner missing")
 	}
 	worker, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
-		Store: h.store, Registry: h.registry, Runner: runner, Host: h.server.SyncHost(),
+		Store: h.serverStore(), Registry: h.registry, Runner: runner, Host: h.server.SyncHost(),
 		Tenant: "t1", Keys: []boardsync.Key{"slack"},
 		PollInterval: 10 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -147,7 +164,7 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 	h.workers.Add(1)
 	go func() { defer h.workers.Done(); _ = worker.Run(ctx) }()
 	inbound, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
-		Store: h.store, Registry: h.registry, Runner: runner, Tenant: "t1", Key: "slack",
+		Store: h.serverStore(), Registry: h.registry, Runner: runner, Tenant: "t1", Key: "slack",
 		PollInterval: 10 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
@@ -174,6 +191,10 @@ type syncHarnessOptions struct {
 	mirrorChannels bool
 	startWorkers   bool
 	tenant         syncstore.TenantFunc
+	authorize      server.Authorizer
+	// wrapStore lets a test inject one failure into the server's store while
+	// the harness keeps the concrete memory store for assertions.
+	wrapStore func(syncstore.Store) syncstore.Store
 }
 
 func (h *syncHarness) request(method, path string, body any, extra map[string]string) (int, []byte) {
@@ -397,6 +418,7 @@ func TestSyncAttachChannelPostsRootAndBackfills(t *testing.T) {
 	h.provider.ReceiveFunc = nil
 	root := h.postMessage(map[string]any{"channel": "unmapped", "text": "hello"})
 	reply := h.postMessage(map[string]any{"re": root.ID, "text": "earlier reply"})
+	h.postMessage(map[string]any{"re": root.ID, "text": "private reply", "noSync": true})
 	// A board channel that no entry maps: attach explicitly.
 	if code, body := h.request(http.MethodPost, server.APIPrefix+"/sync/threads", map[string]any{
 		"key": "slack", "thread": root.ID, "target": "C0123",
@@ -416,6 +438,11 @@ func TestSyncAttachChannelPostsRootAndBackfills(t *testing.T) {
 	}
 	if posts[1].Msg.Markdown != "**dev**: earlier reply" {
 		t.Fatalf("backfill text = %q", posts[1].Msg.Markdown)
+	}
+	for _, post := range posts {
+		if strings.Contains(post.Msg.Markdown, "private reply") {
+			t.Fatalf("a noSync reply was backfilled: %+v", post)
+		}
 	}
 	// Duplicate attach is idempotent: no new post.
 	if code, body := h.request(http.MethodPost, server.APIPrefix+"/sync/threads", map[string]any{
@@ -647,8 +674,9 @@ func TestSyncManagementRequiresManage(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := server.New(server.Options{
-		Board: board, Authorize: deny,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Board:     board,
+		Authorize: deny,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sync: &server.SyncOptions{
 			Store: store, Registry: registry,
 			Tenant: func(*http.Request) (string, error) { return "t1", nil },
@@ -706,4 +734,260 @@ func waitFor(t *testing.T, condition func() bool) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("condition never held")
+}
+
+type failSecondSetCursorStore struct {
+	syncstore.Store
+	calls atomic.Int32
+}
+
+func (s *failSecondSetCursorStore) SetCursor(ctx context.Context, tenant string, key boardsync.Key, source, cursor string) error {
+	if s.calls.Add(1) == 2 {
+		return errors.New("injected cursor failure")
+	}
+	return s.Store.SetCursor(ctx, tenant, key, source, cursor)
+}
+
+func TestSyncThreadTargetFutureOnlyAcrossRestart(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{startWorkers: true, mirrorChannels: true})
+	root := h.postMessage(map[string]any{"channel": "unmapped", "text": "old root"})
+	old := h.postMessage(map[string]any{"re": root.ID, "text": "old reply"})
+	waitFor(t, func() bool {
+		depth, err := h.store.OutboxDepth(t.Context(), "t1")
+		return err == nil && depth.Pending == 0 && depth.Leased == 0
+	})
+	h.stopWorkers()
+	code, body := h.request(http.MethodPost, server.APIPrefix+"/sync/threads", map[string]any{
+		"key": "slack", "thread": root.ID, "target": "C0123:1727.9",
+	}, nil)
+	if code != http.StatusOK {
+		t.Fatalf("attach thread = %d %s", code, body)
+	}
+	thread, found, err := h.store.ThreadByTarget(t.Context(), "t1", "slack", boardsync.ResolvedTarget{
+		Key: "slack", Platform: "slack", Channel: "C0123", Thread: "C0123:1727.9", Kind: boardsync.TargetThread,
+	})
+	if err != nil || !found || thread.Since == 0 {
+		t.Fatalf("thread mapping = %+v, %v, %v", thread, found, err)
+	}
+	// Rewind the subscription so it replays the old messages: the persisted
+	// since is what keeps them from being delivered.
+	if err := h.store.SetCursor(t.Context(), "t1", "slack", "board-events", "0"); err != nil {
+		t.Fatal(err)
+	}
+	h.startWorkers(t)
+	time.Sleep(300 * time.Millisecond)
+	if got := h.posts.Load(); got != 0 {
+		t.Fatalf("a message before attach was delivered: %d", got)
+	}
+	h.postMessage(map[string]any{"re": root.ID, "text": "new reply"})
+	h.waitPosts(1)
+	posts := h.provider.Posts()
+	if len(posts) != 1 || posts[0].Msg.Markdown != "**dev**: new reply" {
+		t.Fatalf("future-only posts = %+v", posts)
+	}
+	_ = old
+}
+
+func TestSyncDeletePropagatesToAllChannelCopies(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{startWorkers: true, mirrorChannels: true})
+	root := h.postMessage(map[string]any{"channel": "unmapped", "text": "root"})
+	for _, channel := range []string{"C1", "C2"} {
+		code, body := h.request(http.MethodPost, server.APIPrefix+"/sync/threads", map[string]any{
+			"key": "slack", "thread": root.ID, "target": channel,
+		}, nil)
+		if code != http.StatusOK {
+			t.Fatalf("attach %s = %d %s", channel, code, body)
+		}
+	}
+	h.waitPosts(2)
+	if code, body := h.request(http.MethodPost, server.APIPrefix+"/messages/"+root.ID+"/edit", map[string]any{"text": "edited root"}, nil); code != http.StatusOK {
+		t.Fatalf("edit = %d %s", code, body)
+	}
+	waitFor(t, func() bool { return len(h.provider.Edits()) == 2 })
+	if code, body := h.request(http.MethodPost, server.APIPrefix+"/messages/"+root.ID+"/reactions", map[string]any{"emoji": "eyes"}, nil); code != http.StatusOK {
+		t.Fatalf("react = %d %s", code, body)
+	}
+	waitFor(t, func() bool { return len(h.provider.Reactions()) == 2 })
+	if code, body := h.request(http.MethodPost, server.APIPrefix+"/messages/"+root.ID+"/delete", map[string]any{}, nil); code != http.StatusOK {
+		t.Fatalf("delete = %d %s", code, body)
+	}
+	waitFor(t, func() bool { return len(h.provider.Deletes()) >= 2 })
+	deletes := h.provider.Deletes()
+	if len(deletes) != 2 {
+		t.Fatalf("deletes = %+v, want one per channel copy", deletes)
+	}
+	copies, err := h.store.CopyForMessage(t.Context(), "t1", "slack", mustRef(t, root.ID))
+	if err != nil || len(copies) != 0 {
+		t.Fatalf("copies after delete = %+v, %v", copies, err)
+	}
+}
+
+func TestSyncSubscriptionRestartsAfterStoreError(t *testing.T) {
+	flaky := &failSecondSetCursorStore{}
+	h := newSyncHarness(t, syncHarnessOptions{
+		startWorkers: true, mirrorChannels: true,
+		wrapStore: func(store syncstore.Store) syncstore.Store {
+			flaky.Store = store
+			return flaky
+		},
+	})
+	root := h.postMessage(map[string]any{"channel": "support", "text": "survives"})
+	h.waitPosts(1)
+	// The first cursor write after PrepareSync fails; one-shot supervision
+	// would end here. A reply must still be delivered after the restart.
+	h.postMessage(map[string]any{"re": root.ID, "text": "after the failure"})
+	h.waitPosts(2)
+	if flaky.calls.Load() < 3 {
+		t.Fatalf("the subscription wasn't restarted: cursor writes = %d", flaky.calls.Load())
+	}
+}
+
+func TestSyncSelfAuthoredWebhookProducesNoRecord(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{startWorkers: true, mirrorChannels: true})
+	h.provider.SelfIDsValue = []string{"slack:user:UAPP"}
+	h.provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+		event := syncEvent("self", "C0123:1727.9")
+		event.Author = boardsync.Author{ID: "slack:user:UAPP", Handle: "app", Name: "app", Bot: true}
+		return boardsync.Intake{
+			Records:  []boardsync.Record{{Dedupe: "self", Event: event}},
+			Response: boardsync.OK(),
+		}, nil
+	}
+	if code, body := h.request(http.MethodPost, "/webhooks/slack", map[string]any{}, nil); code != http.StatusOK {
+		t.Fatalf("webhook = %d %s", code, body)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if err := h.board.Read("t1", func(snapshot *log.Snapshot) error {
+		if messages := snapshot.MessagesInChannel("support"); len(messages) != 0 {
+			t.Fatalf("self message imported: %+v", messages)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.posts.Load(); got != 0 {
+		t.Fatalf("self message posted: %d", got)
+	}
+}
+
+func TestSyncAttachRequiresManage(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{
+		mirrorChannels: true,
+		authorize: server.AuthorizerFunc(func(_ context.Context, _ string, _ protocol.Actor, _ string, permission protocol.Permission) error {
+			if permission == protocol.PermissionManage {
+				return protocol.Forbidden("no manage")
+			}
+			return nil
+		}),
+	})
+	root := h.postMessage(map[string]any{"channel": "unmapped", "text": "root"})
+	code, body := h.request(http.MethodPost, server.APIPrefix+"/sync/threads", map[string]any{
+		"key": "slack", "thread": root.ID, "target": "C1",
+	}, nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("attach without manage = %d %s", code, body)
+	}
+	threads, err := h.store.Threads(t.Context(), "t1", mustRef(t, root.ID))
+	if err != nil || len(threads) != 0 {
+		t.Fatalf("a refused attach wrote a mapping: %+v, %v", threads, err)
+	}
+	events, err := h.board.History("t1", 1, ^uint64(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type == log.EventThreadSynced {
+			t.Fatalf("a refused attach wrote thread.synced: %+v", event)
+		}
+	}
+}
+
+func mustRef(t *testing.T, value string) uint64 {
+	t.Helper()
+	var id uint64
+	if _, err := fmt.Sscanf(value, "%d", &id); err != nil {
+		t.Fatalf("ref %q: %v", value, err)
+	}
+	return id
+}
+
+func TestSyncAttachThreadConcurrentConflict(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{mirrorChannels: true})
+	first := h.postMessage(map[string]any{"channel": "support", "text": "one"})
+	second := h.postMessage(map[string]any{"channel": "support", "text": "two"})
+	type outcome struct {
+		status int
+		body   []byte
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
+	start := make(chan struct{})
+	for _, root := range []protocol.MessageView{first, second} {
+		root := root
+		go func() {
+			select {
+			case <-start:
+			case <-time.After(time.Second):
+			}
+			status, body, err := rawRequest(h.http.URL+server.APIPrefix+"/sync/threads", http.MethodPost, map[string]any{
+				"key": "slack", "thread": root.ID, "target": "C0123:1727.9",
+			})
+			outcomes <- outcome{status: status, body: body, err: err}
+		}()
+	}
+	close(start)
+	okCount, conflictCount := 0, 0
+	for i := 0; i < 2; i++ {
+		got := <-outcomes
+		if got.err != nil {
+			t.Fatalf("attach request: %v", got.err)
+		}
+		switch got.status {
+		case http.StatusOK:
+			okCount++
+		case http.StatusConflict:
+			conflictCount++
+		default:
+			t.Fatalf("attach = %d %s", got.status, got.body)
+		}
+	}
+	if okCount != 1 || conflictCount != 1 {
+		t.Fatalf("concurrent attach = %d ok, %d conflict", okCount, conflictCount)
+	}
+	threads, err := h.store.Threads(t.Context(), "t1", mustRef(t, first.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := h.store.Threads(t.Context(), "t1", mustRef(t, second.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(threads)+len(other) != 1 {
+		t.Fatalf("mappings = %d + %d, want one", len(threads), len(other))
+	}
+}
+
+func rawRequest(url, method string, body any) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequest(method, url, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if body != nil {
+		request.Header.Set("content-type", "application/json")
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(response.Body)
+	return response.StatusCode, data, err
 }

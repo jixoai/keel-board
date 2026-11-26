@@ -44,3 +44,26 @@ func TestParseSyncFlags(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildProviderRequiresBotIdentity(t *testing.T) {
+	t.Setenv("KEEL_SYNC_SLACK_SIGNING_SECRET", "signing")
+	slackConfig := &keyConfig{key: "slack", platform: "slack", mirrors: map[string]string{"C1": "support"}}
+	if _, err := buildProvider(slackConfig); err == nil {
+		t.Fatal("slack without a bot identity should be refused")
+	}
+	t.Setenv("KEEL_SYNC_SLACK_BOT_USER_ID", "U1")
+	if _, err := buildProvider(slackConfig); err != nil {
+		t.Fatalf("slack with an identity: %v", err)
+	}
+
+	t.Setenv("KEEL_SYNC_LINEAR_WEBHOOK_SECRET", "signing")
+	t.Setenv("KEEL_SYNC_LINEAR_TEAMS", "ENG")
+	linearConfig := &keyConfig{key: "linear", platform: "linear", mirrors: map[string]string{"ENG": "support"}}
+	if _, err := buildProvider(linearConfig); err == nil {
+		t.Fatal("linear without a bot identity should be refused")
+	}
+	t.Setenv("KEEL_SYNC_LINEAR_BOT_USER_ID", "app-1")
+	if _, err := buildProvider(linearConfig); err != nil {
+		t.Fatalf("linear with an identity: %v", err)
+	}
+}

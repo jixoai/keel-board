@@ -2,9 +2,11 @@ package server_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/jixoai/keel-board/log"
@@ -67,7 +69,7 @@ func TestSyncHostImportRootAndReplyIsIdempotent(t *testing.T) {
 		if message.Text != "hello m1" || message.From == nil || *message.From != "slack" {
 			t.Fatalf("root = %+v", message)
 		}
-		if message.Origin == nil || message.Origin.Thread != "C0123:1727.9" || message.Origin.Message != "m1" {
+		if message.Origin == nil || message.Origin.Thread != "slack:C0123:1727.9" || message.Origin.Message != "m1" {
 			t.Fatalf("origin = %+v", message.Origin)
 		}
 		return nil
@@ -354,6 +356,53 @@ func TestSyncHostRecordThreadAndBackfill(t *testing.T) {
 	}
 }
 
+func TestSyncHostReceiptClearsAnEarlierFailure(t *testing.T) {
+	board, _, host := newSyncHost(t)
+	ctx := t.Context()
+	root := hBoardRoot(t, board, "t1", "support", "root")
+	external := boardsync.ThreadRef{Key: "slack", Platform: "slack", Channel: "C1", Thread: "C1:1"}
+	message := &boardsync.Message{ID: root, Thread: root, Channel: "support"}
+	if err := host.Record(ctx, boardsync.BoardEvent{
+		Tenant: "t1", Type: boardsync.BoardMessageSyncFailed, Thread: root,
+		Message: message, External: &external, Error: "not_in_channel",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := host.Record(ctx, boardsync.BoardEvent{
+		Tenant: "t1", Type: boardsync.BoardMessageSynced, Thread: root,
+		Message: message, External: &external, ExternalMessage: "m1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		state := snapshot.Message(root).Sync
+		if state == nil || len(state.Undelivered) != 0 {
+			t.Fatalf("undelivered after success = %+v", state)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncHostReactionWaitsForCopy(t *testing.T) {
+	_, _, host := newSyncHost(t)
+	ctx := t.Context()
+	root := syncEvent("m1", "C0123:T1")
+	reaction := root
+	reaction.ID, reaction.Kind, reaction.Type = "r1", boardsync.KindReaction, boardsync.TypeReactionAdded
+	reaction.Emoji, reaction.Added = "eyes", true
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "r1", Event: reaction}); err == nil {
+		t.Fatal("a reaction before its copy should be retried")
+	}
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "m1", Channel: "support", Event: root}); err != nil {
+		t.Fatalf("import root: %v", err)
+	}
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "r1", Event: reaction}); err != nil {
+		t.Fatalf("reaction after copy: %v", err)
+	}
+}
+
 func TestSyncHostRecordsFailure(t *testing.T) {
 	board, _, host := newSyncHost(t)
 	ctx := t.Context()
@@ -456,5 +505,185 @@ func TestSyncHostThreadReceiptIgnoresCause(t *testing.T) {
 	depth, err := store.OutboxDepth(ctx, "t1")
 	if err != nil || depth.Pending != 1 {
 		t.Fatalf("outbox depth = %+v, %v", depth, err)
+	}
+}
+
+func TestSyncHostConcurrentRootsCreateOne(t *testing.T) {
+	board, _, host := newSyncHost(t)
+	ctx := t.Context()
+	const events = 8
+	var (
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		mu      sync.Mutex
+		results []boardsync.ImportResult
+		errs    []error
+	)
+	for i := 0; i < events; i++ {
+		event := syncEvent(fmt.Sprintf("m%d", i), "C0123:1727.9")
+		event.Text = fmt.Sprintf("message %d", i)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			result, err := host.Import(ctx, boardsync.ImportRequest{
+				Tenant: "t1", Key: "slack", EventID: event.ID, Channel: "support", Event: event,
+			})
+			mu.Lock()
+			results = append(results, result)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			mu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if len(errs) != 0 {
+		t.Fatalf("import errors = %v", errs)
+	}
+	roots := 0
+	for _, result := range results {
+		if result.CreatedRoot {
+			roots++
+		}
+	}
+	if roots != 1 {
+		t.Fatalf("created roots = %d, want one: %+v", roots, results)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		messages := snapshot.MessagesInChannel("support")
+		if len(messages) != events {
+			t.Fatalf("messages = %d, want %d", len(messages), events)
+		}
+		root := messages[0]
+		if root.Re != nil {
+			t.Fatalf("first message is a reply: %+v", root)
+		}
+		for _, message := range messages[1:] {
+			if message.Re == nil || *message.Re != root.ID {
+				t.Fatalf("message %d isn't a reply to the root: %+v", message.ID, message)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncHostLifecycleRetitledKeepsBodyAndLink(t *testing.T) {
+	board, _, host := newSyncHost(t)
+	ctx := t.Context()
+	root := syncEvent("m1", "acme/www:12")
+	root.Key, root.Platform, root.Channel = "github", "github", "github:acme/www:pulls"
+	imported, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "github", EventID: "m1", Channel: "prs", Event: root})
+	if err != nil {
+		t.Fatalf("import root: %v", err)
+	}
+	base := boardsync.Event{
+		ID: "life1", Key: "github", Platform: "github",
+		Kind: boardsync.KindLifecycle, Type: "pr.edited",
+		Channel: "github:acme/www:pulls", Thread: "acme/www:12", Message: "12",
+		Author: boardsync.Author{ID: "github:user:1", Handle: "ada", Name: "Ada"},
+		Lifecycle: &boardsync.Lifecycle{
+			Type: "pr.edited", Retitled: true,
+			Title: "new title", Body: "new body",
+			URL: "https://files.example.test/pr/12",
+		},
+	}
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "github", EventID: "life1", Event: base}); err != nil {
+		t.Fatalf("retitled lifecycle: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		message := snapshot.Message(imported.Root)
+		if message.Text != "new title\n\nnew body" {
+			t.Fatalf("text = %q", message.Text)
+		}
+		if len(message.Links) != 1 {
+			t.Fatalf("mapped lifecycle URL link = %+v", message.Links)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A lifecycle that opens a root keeps its subject URL as a board link.
+	opened := base
+	opened.ID, opened.Thread, opened.Lifecycle = "life-open", "acme/www:99", &boardsync.Lifecycle{
+		Type: "pr.opened", CreateRoot: true, Title: "opened", URL: "https://files.example.test/pr/99",
+	}
+	result, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "github", EventID: "life-open", Channel: "prs", Event: opened})
+	if err != nil {
+		t.Fatalf("create-root lifecycle: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		message := snapshot.Message(result.Root)
+		if message == nil || len(message.Links) == 0 {
+			t.Fatalf("created root link = %+v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A body-only edit carries no title; it must still replace the text.
+	bodyOnly := base
+	bodyOnly.ID, bodyOnly.Type = "life2", "pr.body"
+	bodyOnly.Lifecycle = &boardsync.Lifecycle{Type: "pr.body", Retitled: true, Body: "body only"}
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "github", EventID: "life2", Event: bodyOnly}); err != nil {
+		t.Fatalf("body-only lifecycle: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		if text := snapshot.Message(imported.Root).Text; text != "body only" {
+			t.Fatalf("body-only text = %q", text)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncHostImportEditDeleteFollowsTaskRules(t *testing.T) {
+	board, _, host := newSyncHost(t)
+	ctx := t.Context()
+	root := syncEvent("m1", "C0123:T1")
+	imported, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "m1", Channel: "support", Event: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		tx.Emit(log.EventTaskCreated, &log.TaskCreatedPayload{
+			ID: imported.Root, Thread: log.ThreadKey(imported.Root),
+			By: protocol.Author{Actor: "local:user:ada", Principal: "local:user:ada"},
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	edit := root
+	edit.ID, edit.Kind, edit.Type, edit.Text = "m1-edit", boardsync.KindEdited, boardsync.TypeMessageEdited, "different"
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: edit.ID, Event: edit}); err != nil {
+		t.Fatalf("edit: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		task := snapshot.Message(imported.Root).Task
+		if task == nil || task.Blocked == nil || task.Blocked.Kind == nil || *task.Blocked.Kind != protocol.EditedHoldKind {
+			t.Fatalf("task after import edit = %+v", task)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	del := root
+	del.ID, del.Kind, del.Type = "m1-del", boardsync.KindDeleted, boardsync.TypeMessageDeleted
+	if _, err := host.Import(ctx, boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: del.ID, Event: del}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		task := snapshot.Message(imported.Root).Task
+		if task == nil || task.State != "canceled" {
+			t.Fatalf("task after import delete = %+v", task)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -28,7 +28,8 @@ worker daemon, and no live platform credential.
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
 | `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies (with file IDs), failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested |
-| `server` sync wiring: `POST /webhooks/{key}`, board-event subscription, thread attach/backfill, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
+| `server` sync wiring: `POST /webhooks/{key}`, supervised board-event subscription, thread attach/backfill with future-only targets, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
+| PostgreSQL end-to-end: Host, copies, mappings, future-only `since_seq`, outbox restart, concurrent root creation, target uniqueness | Implemented and tested with `KEEL_BOARD_TEST_DSN` |
 | Production engine gaps: file bytes, typing, cross-process lease for key ownership, full lifecycle reconciliation | Seams in place; listed under Open items |
 
 The upstream pin keeps all sync code in `packages/board/src/sync/`; the
@@ -496,8 +497,9 @@ overrides. `Host.Import` must:
   that writes in the same order finds its own messages instead of posting
   twice;
 * return the same root/message IDs when retried after success;
-* append the import as its platform author, with `origin` (platform IDs),
-  `from` (the sync key), and the default state labels;
+* append the import as its platform author, with key-prefixed `origin` IDs
+  (`slack:C0123`, `slack:C0123:1727.9`), `from` (the sync key), and the default
+  state labels;
 * not import an event whose platform thread it doesn't sync when the sync
   function passed no channel.
 
@@ -556,8 +558,9 @@ upstream's deployment ownership does.
   200 for a key the tenant doesn't own or has disabled (before reading the
   body), 503 for an enabled key this process hasn't registered yet, and 500 for
   a platform mismatch; only the owning process should mount the route.
-* `StartChannels` lists the platform channels a new board root may start a
-  thread in; the entry's own `Mirror`/`Channels` route still decides.
+* `StartChannels` maps a `(tenant, key)` connection to the platform channels a
+  new board root may start a thread in; the entry's own `Mirror`/`Channels`
+  route still decides.
 * `FileHosts` is the inbound file/link host allowlist. Empty refuses every URL;
   the board never fetches one.
 
@@ -589,6 +592,41 @@ begins at the current head, not at seq 1: a deployment does not dump a board's
 history into platforms. A channel target's root delivery and its reply
 backfill are enqueued from `Host.Record` (the receipt is the trigger), so a
 restart resumes both through the durable outbox.
+
+Thread identity and future-only attachment:
+
+* Root creation is serialized per `(tenant, key, external thread)` with a
+  store target lock, and its log idempotency key is the thread, not the inbox
+  event. Two racing root deliveries produce one root; the loser imports as a
+  reply. The mapping is written in the same locked window.
+* `board_sync_threads` has a partial unique index over
+  `(tenant, key, platform, channel, thread, subthread)` for `kind='thread'`:
+  one external thread maps to one board thread. A channel target may repeat,
+  because several board roots can start threads in one channel.
+* A thread mapping stores `since_seq`, the board sequence at attach. Delivery
+  skips messages at or before it, so attaching a thread is future-only even
+  when the subscription replays from an older cursor or a process restarts.
+  Backfill runs only for a root post that came from a channel target.
+* An attach writes its mapping before `thread.synced`: a refused or conflicting
+  attach leaves no receipt behind. A duplicate attach is idempotent.
+
+Best-effort changes: an edit, delete, or reaction is not a message failure.
+A missing copy is a skip for edits and labels, and a short retry for reactions
+(the copy may still be landing). A dead change writes no
+`message.sync_failed`/`undelivered`; a successful receipt clears an earlier
+failure for the same target. A delete propagates to every copy of the board
+message and removes those copy rows as it goes.
+
+Each connection must also recognize its own platform posts. Slack and Linear
+without a bot identity are refused at `board serve` startup; adapters expose
+`SelfIDs` and the registry drops a matching author before the inbox, beside
+each adapter's own check. The generic Chat SDK bridge still relies on the
+marker, so a platform that strips HTML comments should not mirror through it
+without an identity hook.
+
+The subscription is supervised per key: a board/store error is logged with
+`tenant` and `key` and the consumer restarts with exponential backoff
+(1s to 30s), so a transient store failure cannot silently end sync.
 
 `cmd/board` enables sync only with an explicit `--sync-key key=platform`,
 `--sync-mirror key=platformChannel:boardChannel`, and (optionally)
@@ -984,6 +1022,8 @@ Recorded in `docs/PORTING.md` as well:
   not).
 * Cross-process key ownership: `Owned` is explicit configuration, not a lease.
   A second process must not be configured with the same key.
+* The PostgreSQL restart test replaces process-local stores, board caches,
+  servers, and providers over the same schema; it does not fork an OS process.
 * Platform root recovery: a reply on a thread the board hasn't mapped is a
   new root built from the reply when an import channel is given, rather than a
   `RootFetcher` read of the platform's real root. `FetchRoot` is not called.

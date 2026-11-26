@@ -143,20 +143,20 @@ func TestOutboxPostCopyEditDeleteReact(t *testing.T) {
 			t.Fatalf("edit pass = %+v, %v", result, err)
 		}
 		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
-			boardsync.BoardEvent{ID: 12, Type: boardsync.BoardMessageDeleted, Thread: 101}, edited,
-			[]boardsync.ResolvedTarget{target}); err != nil {
-			t.Fatalf("enqueue delete: %v", err)
-		}
-		if result, err := worker.Process(ctx); err != nil || result.Dead != 0 {
-			t.Fatalf("delete pass = %+v, %v", result, err)
-		}
-		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
-			boardsync.BoardEvent{ID: 13, Type: boardsync.BoardReactionAdded, Thread: 101, Emoji: "thumbsup"}, edited,
+			boardsync.BoardEvent{ID: 12, Type: boardsync.BoardReactionAdded, Thread: 101, Emoji: "thumbsup"}, edited,
 			[]boardsync.ResolvedTarget{target}); err != nil {
 			t.Fatalf("enqueue reaction: %v", err)
 		}
 		if result, err := worker.Process(ctx); err != nil || result.Dead != 0 {
 			t.Fatalf("reaction pass = %+v, %v", result, err)
+		}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
+			boardsync.BoardEvent{ID: 13, Type: boardsync.BoardMessageDeleted, Thread: 101}, edited,
+			[]boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatalf("enqueue delete: %v", err)
+		}
+		if result, err := worker.Process(ctx); err != nil || result.Dead != 0 {
+			t.Fatalf("delete pass = %+v, %v", result, err)
 		}
 		if posts := provider.Posts(); len(posts) != 1 {
 			t.Fatalf("posts = %d, want one", len(posts))
@@ -291,7 +291,7 @@ func TestOutboxFailureDeadThenContinueAndClear(t *testing.T) {
 	})
 }
 
-func TestOutboxMissingCopyIsDeadAndDoesNotBlock(t *testing.T) {
+func TestOutboxMissingCopyIsSkippedAndDoesNotBlock(t *testing.T) {
 	cfg := testConfig()
 	withStores(t, cfg, func(t *testing.T, store syncstore.Store) {
 		ctx := t.Context()
@@ -311,15 +311,14 @@ func TestOutboxMissingCopyIsDeadAndDoesNotBlock(t *testing.T) {
 			t.Fatalf("enqueue post: %v", err)
 		}
 		result, err := worker.Process(ctx)
-		if err != nil || result.Dead != 1 {
+		if err != nil || result.Acked != 1 || result.Skipped != 1 || result.Dead != 0 {
 			t.Fatalf("edit pass = %+v, %v", result, err)
 		}
 		if edits := provider.Edits(); len(edits) != 0 {
 			t.Fatalf("an edit without a copy reached the provider: %+v", edits)
 		}
-		records := host.Records()
-		if len(records) != 1 || records[0].Type != boardsync.BoardMessageSyncFailed || records[0].Error != "permanent" {
-			t.Fatalf("failure receipt = %+v", records)
+		if records := host.Records(); len(records) != 0 {
+			t.Fatalf("a best-effort edit wrote a failure receipt: %+v", records)
 		}
 		result, err = worker.Process(ctx)
 		if err != nil || result.Acked != 1 {
@@ -605,6 +604,70 @@ func TestOutboxAckRejectsCopyForAnotherTarget(t *testing.T) {
 		}
 		if _, err := store.AckOutbox(ctx, "t1", jobs[0].ID, jobs[0].Lease, nil, &good); err != nil {
 			t.Fatalf("good ack after rejected copy: %v", err)
+		}
+	})
+}
+
+func TestOutboxReactionWaitsForCopy(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		provider, host, worker := outboundFixture(t, store, testConfig())
+		target := threadTarget("C0123", "C0123:T1")
+		message := boardMessage(201, 200, "react later")
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
+			boardsync.BoardEvent{ID: 20, Type: boardsync.BoardReactionAdded, Thread: 200, Emoji: "eyes"},
+			message, []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := worker.Process(ctx)
+		if err != nil || result.Retried != 1 || result.Dead != 0 {
+			t.Fatalf("reaction before copy = %+v, %v", result, err)
+		}
+		if len(provider.Reactions()) != 0 || len(host.Records()) != 0 {
+			t.Fatalf("a pending reaction reached the provider or wrote a receipt")
+		}
+		if _, err := store.SaveCopy(ctx, "t1", syncstore.Copy{
+			BoardMessage: 201, BoardThread: 200, Key: "slack", Target: target,
+			ExternalThread: "C0123:T1", ExternalMessage: "copy-201",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		result, err = worker.Process(ctx)
+		if err != nil || result.Acked != 1 {
+			t.Fatalf("reaction after copy = %+v, %v", result, err)
+		}
+		reactions := provider.Reactions()
+		if len(reactions) != 1 || reactions[0].Message != "copy-201" {
+			t.Fatalf("reactions = %+v", reactions)
+		}
+	})
+}
+
+func TestOutboxUnsupportedChangeIsSkippedWithoutReceipt(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		provider, host, worker := outboundFixture(t, store, testConfig())
+		provider.EditFunc = func(context.Context, boardsync.Key, boardsync.ThreadRef, string, boardsync.OutboundMessage) error {
+			return boardsync.ErrUnsupported
+		}
+		target := threadTarget("C0123", "C0123:T1")
+		if _, err := store.SaveCopy(ctx, "t1", syncstore.Copy{
+			BoardMessage: 301, BoardThread: 300, Key: "slack", Target: target,
+			ExternalThread: "C0123:T1", ExternalMessage: "copy-301",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
+			boardsync.BoardEvent{ID: 30, Type: boardsync.BoardMessageEdited, Thread: 300},
+			boardMessage(301, 300, "edited"), []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatal(err)
+		}
+		result, err := worker.Process(ctx)
+		if err != nil || result.Acked != 1 || result.Dead != 0 {
+			t.Fatalf("unsupported edit = %+v, %v", result, err)
+		}
+		if records := host.Records(); len(records) != 0 {
+			t.Fatalf("an unsupported change wrote a receipt: %+v", records)
 		}
 	})
 }
