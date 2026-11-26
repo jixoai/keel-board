@@ -95,4 +95,15 @@ func TestReplayKeySeesAStoreOnlyRequest(t *testing.T) {
 	if err != nil || !found || len(result.MessageIDs) != 1 {
 		t.Fatalf("warm cache replay: %+v, %v, %v", result, found, err)
 	}
+	// The write ReplayKey found is in the cache now, not only in the store's
+	// request row: a read on the same warm board sees the message.
+	if err := warm.Read("default", func(snapshot *log.Snapshot) error {
+		message := snapshot.Message(result.MessageIDs[0])
+		if message == nil || message.Text != "two" {
+			t.Fatalf("the warmed cache lacks the replayed message: %+v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

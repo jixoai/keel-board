@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jixoai/keel-board/blob"
@@ -186,6 +187,7 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (*request, bool
 		writeError(w, asProtocol(err))
 		return nil, false
 	}
+	tenant = strings.TrimSpace(tenant)
 	if tenant == "" {
 		tenant = "default"
 	}

@@ -216,3 +216,125 @@ func TestTxReplayChecksAuthor(t *testing.T) {
 		t.Fatalf("tx replay of another actor's batch: %d %s", status, data)
 	}
 }
+
+// TestTxReplayTaskAuthorAndRead covers the task path: the early ReplayKey
+// misses, Update finds the key in the store and tx.Replay answers. Another
+// actor's task is 404, and the caller's own task in a channel it can't read is
+// 404 too (not a blind 201).
+func TestTxReplayTaskAuthorAndRead(t *testing.T) {
+	memory := store.NewMemory()
+	writer := log.New(log.Options{Store: memory})
+	bob := protocol.Actor{ID: "local:user:bob", Principal: "local:user:bob", Kind: protocol.ActorPerson, Handle: "bob", Name: "bob"}
+	alice := protocol.Actor{ID: "local:user:alice", Principal: "local:user:alice", Kind: protocol.ActorPerson, Handle: "alice", Name: "alice"}
+
+	seed := func(key, digest string, actor protocol.Actor, channel, text string) {
+		t.Helper()
+		err := writer.Update(context.Background(), "default", log.UpdateOptions{Idempotency: &log.Idempotency{
+			Key: key, Digest: digest,
+		}}, func(tx *log.Tx) error {
+			id := tx.NextID(0)
+			tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+				ID: id, Channel: channel, Text: text, Thread: log.ThreadKey(id),
+				Labels: map[string]string{}, By: actor.Actored(),
+			})
+			tx.RecordResult(id)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	authorKey := idemKey("task", "local:user:alice", "tx-task-author")
+	readKey := idemKey("task", "local:user:alice", "tx-task-read")
+	seed(authorKey, writePlaceDigest("work", nil), bob, "work", "bob's task")
+	seed(readKey, writePlaceDigest("secret", nil), alice, "secret", "alice's task")
+
+	proxy := &missRequestOnceStore{Memory: memory}
+	board := log.New(log.Options{Store: proxy})
+	api := New(Options{
+		Board:  board,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Authorize: AuthorizerFunc(func(_ context.Context, _ string, actor protocol.Actor, channel string, permission protocol.Permission) error {
+			if actor.ID == alice.ID && channel == "secret" && permission == protocol.PermissionRead {
+				return protocol.Forbidden("no secret")
+			}
+			return nil
+		}),
+	})
+	httpServer := httptest.NewServer(api)
+	defer httpServer.Close()
+
+	post := func(path string, body any) (int, []byte) {
+		t.Helper()
+		encoded, _ := json.Marshal(body)
+		request, err := http.NewRequest(http.MethodPost, httpServer.URL+APIPrefix+path, bytes.NewReader(encoded))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("content-type", "application/json")
+		request.Header.Set("X-Board-Actor", alice.ID)
+		response, err := httpServer.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, _ := io.ReadAll(response.Body)
+		return response.StatusCode, data
+	}
+
+	status, data := post("/tasks", map[string]any{"channel": "work", "text": "mine", "id": "tx-task-author"})
+	if status != http.StatusNotFound || !bytes.Contains(data, []byte("message_not_found")) {
+		t.Fatalf("tx replay of another actor's task: %d %s", status, data)
+	}
+	status, data = post("/tasks", map[string]any{"channel": "secret", "text": "mine", "id": "tx-task-read"})
+	if status != http.StatusNotFound || !bytes.Contains(data, []byte("message_not_found")) {
+		t.Fatalf("tx replay of an unreadable task: %d %s", status, data)
+	}
+}
+
+// TestTxReplayDigestConflict makes the early ReplayKey miss and the store report
+// the key under another digest. The write must be 409, not a replay of the
+// stored answer.
+func TestTxReplayDigestConflict(t *testing.T) {
+	memory := store.NewMemory()
+	writer := log.New(log.Options{Store: memory})
+	alice := protocol.Actor{ID: "local:user:alice", Principal: "local:user:alice", Kind: protocol.ActorPerson, Handle: "alice", Name: "alice"}
+	key := idemKey("post", "local:user:alice", "tx-digest")
+	err := writer.Update(context.Background(), "default", log.UpdateOptions{Idempotency: &log.Idempotency{
+		Key: key, Digest: "place:channel:work",
+	}}, func(tx *log.Tx) error {
+		id := tx.NextID(0)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: "work", Text: "first", Thread: log.ThreadKey(id),
+			Labels: map[string]string{}, By: alice.Actored(),
+		})
+		tx.RecordResult(id)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	proxy := &missRequestOnceStore{Memory: memory}
+	board := log.New(log.Options{Store: proxy})
+	api := New(Options{Board: board, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	httpServer := httptest.NewServer(api)
+	defer httpServer.Close()
+
+	body, _ := json.Marshal(map[string]any{"channel": "other", "text": "second", "id": "tx-digest"})
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+APIPrefix+"/messages", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("content-type", "application/json")
+	request.Header.Set("X-Board-Actor", alice.ID)
+	response, err := httpServer.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	data, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(data, []byte("duplicate_id")) {
+		t.Fatalf("digest conflict answered %d %s", response.StatusCode, data)
+	}
+}

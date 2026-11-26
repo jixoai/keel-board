@@ -384,17 +384,22 @@ func TestDirectUploads(t *testing.T) {
 	}
 }
 
-// uploadGate is a policy that answers only the anywhere seam.
+// uploadGate is a policy that answers only the anywhere seam, recording the
+// tenant the server passed it.
 type uploadGate struct {
-	post bool
-	sync bool
+	post    bool
+	sync    bool
+	tenants *[]string
 }
 
-func (g uploadGate) Authorize(context.Context, string, protocol.Actor, string, protocol.Permission) error {
+func (g *uploadGate) Authorize(context.Context, string, protocol.Actor, string, protocol.Permission) error {
 	return nil
 }
 
-func (g uploadGate) AuthorizeAnywhere(_ context.Context, _ string, _ protocol.Actor, permission protocol.Permission) error {
+func (g *uploadGate) AuthorizeAnywhere(_ context.Context, tenant string, _ protocol.Actor, permission protocol.Permission) error {
+	if g.tenants != nil {
+		*g.tenants = append(*g.tenants, tenant)
+	}
 	switch permission {
 	case protocol.PermissionPost:
 		if g.post {
@@ -408,32 +413,52 @@ func (g uploadGate) AuthorizeAnywhere(_ context.Context, _ string, _ protocol.Ac
 	return protocol.Forbidden("not anywhere")
 }
 
+// assertGateTenant checks every anywhere call named the request's tenant.
+func assertGateTenant(t *testing.T, seen []string, tenant string) {
+	t.Helper()
+	if len(seen) == 0 {
+		t.Fatal("the anywhere seam was never asked")
+	}
+	for _, got := range seen {
+		if got != tenant {
+			t.Fatalf("anywhere seam saw tenant %q, want %q", got, tenant)
+		}
+	}
+}
+
 func TestUploadsUseAnywhereAuthorizer(t *testing.T) {
 	const alice = "local:user:alice"
+	const tenant = "gate-tenant"
 	t.Run("neither post nor sync", func(t *testing.T) {
 		signer := &signingMemory{Memory: blob.NewMemory()}
-		h := newHarness(t, server.Options{Blobs: signer, Authorize: uploadGate{}})
-		status, data := h.upload(alice, "a.txt", "text/plain", []byte("x"))
+		var seen []string
+		gate := &uploadGate{tenants: &seen}
+		h := newHarness(t, server.Options{Blobs: signer, Authorize: gate})
+		status, data := h.uploadInTenant(alice, tenant, "a.txt", "text/plain", []byte("x"))
 		h.expect(status, data, http.StatusForbidden)
 		status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
 			"name": "a.txt", "size": 1,
-		}, alice, "", nil)
+		}, alice, tenant, nil)
 		h.expect(status, data, http.StatusForbidden)
+		assertGateTenant(t, seen, tenant)
 	})
-	for _, gate := range []uploadGate{{post: true}, {sync: true}} {
-		name := "post anywhere"
-		if gate.sync {
-			name = "sync anywhere"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, allowed := range []struct {
+		name string
+		post bool
+		sync bool
+	}{{"post anywhere", true, false}, {"sync anywhere", false, true}} {
+		t.Run(allowed.name, func(t *testing.T) {
 			signer := &signingMemory{Memory: blob.NewMemory()}
+			var seen []string
+			gate := &uploadGate{post: allowed.post, sync: allowed.sync, tenants: &seen}
 			h := newHarness(t, server.Options{Blobs: signer, Authorize: gate})
-			status, data := h.upload(alice, "a.txt", "text/plain", []byte("x"))
+			status, data := h.uploadInTenant(alice, tenant, "a.txt", "text/plain", []byte("x"))
 			h.expect(status, data, http.StatusCreated)
 			status, data = h.request(http.MethodPost, "/attachments/uploads", map[string]any{
 				"name": "a.txt", "size": 1,
-			}, alice, "", nil)
+			}, alice, tenant, nil)
 			h.expect(status, data, http.StatusCreated)
+			assertGateTenant(t, seen, tenant)
 		})
 	}
 }

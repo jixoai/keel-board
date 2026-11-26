@@ -170,6 +170,9 @@ that name them are refused rather than half-accepted.
 - **`message.by` is an ActorView here.** Upstream's `MessageView.by` is the
   author record (`actor`, `principal`, `profile`) and `author` is the
   ActorView; this port has `by` and `author` both as ActorView.
+- **JSON bodies are capped at 8 MiB here.** `server.decodeBody` accepts up to
+  8 MiB so a 100-task batch fits; main's server caps JSON at 1 MiB. Attachment
+  uploads keep their separate 4 MB raw-body limit.
 - **No message-surface migration.** Every new fact rides the existing
   `payload jsonb` column; the PostgreSQL migration is main's, with no column
   added for reactions, files, edits, or blocks.
