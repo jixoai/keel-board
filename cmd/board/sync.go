@@ -157,6 +157,9 @@ func optionalSecretFromEnv(key boardsync.Key, setting string) boardsync.Secret {
 func buildProvider(config *keyConfig) (boardsync.Provider, error) {
 	switch config.platform {
 	case "slack":
+		if err := requireIdentity(config.key, "BOT_USER_ID", "BOT_ID"); err != nil {
+			return nil, err
+		}
 		signing, err := secretFromEnv(config.key, "SIGNING_SECRET")
 		if err != nil {
 			return nil, err
@@ -184,6 +187,9 @@ func buildProvider(config *keyConfig) (boardsync.Provider, error) {
 			WriteRepos:    splitList(os.Getenv(envName(config.key, "WRITE_REPOS"))),
 		})
 	case "linear":
+		if err := requireIdentity(config.key, "BOT_USER_ID"); err != nil {
+			return nil, err
+		}
 		webhook, err := secretFromEnv(config.key, "WEBHOOK_SECRET")
 		if err != nil {
 			return nil, err
@@ -198,6 +204,28 @@ func buildProvider(config *keyConfig) (boardsync.Provider, error) {
 	default:
 		return nil, fmt.Errorf("sync key %q: platform %q has no built-in adapter (slack, github, linear)", config.key, config.platform)
 	}
+}
+
+// requireIdentity refuses a connection that can't recognize its own posts.
+// Slack and Linear carry no marker the platform hides, so without a bot ID an
+// echo is inevitable.
+func requireIdentity(key boardsync.Key, settings ...string) error {
+	for _, setting := range settings {
+		if strings.TrimSpace(os.Getenv(envName(key, setting))) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("sync key %q needs one of %s so its own posts are not imported",
+		key, strings.Join(prefixEnv(key, settings), " or "))
+}
+
+// prefixEnv names the settings' environment variables for an error message.
+func prefixEnv(key boardsync.Key, settings []string) []string {
+	names := make([]string, len(settings))
+	for i, setting := range settings {
+		names[i] = envName(key, setting)
+	}
+	return names
 }
 
 // splitList splits a comma-separated environment setting.
@@ -252,7 +280,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 		tenant = boardTenant
 	}
 	registry := boardsync.NewRegistry()
-	startChannels := make(map[boardsync.Key][]string, len(configs))
+	startChannels := make(map[server.SyncKey][]string, len(configs))
 	owned := make([]server.SyncKey, 0, len(configs))
 	for _, config := range configs {
 		provider, err := buildProvider(config)
@@ -278,7 +306,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 			closeStore()
 			return nil, err
 		}
-		startChannels[config.key] = append([]string(nil), config.starts...)
+		startChannels[server.SyncKey{Tenant: tenant, Key: config.key}] = append([]string(nil), config.starts...)
 		owned = append(owned, server.SyncKey{Tenant: tenant, Key: config.key})
 	}
 	return &serverSyncRuntime{
@@ -294,7 +322,7 @@ type serverSyncRuntime struct {
 	registry      *boardsync.Registry
 	tenant        string
 	owned         []server.SyncKey
-	startChannels map[boardsync.Key][]string
+	startChannels map[server.SyncKey][]string
 }
 
 // startSyncWorkers runs one inbound and one outbound worker per owned key and
