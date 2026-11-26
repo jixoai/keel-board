@@ -1,0 +1,15 @@
+{
+  "action": "opened",
+  "issue": {
+    "number": 45,
+    "title": "blank export page",
+    "body": "the export page is blank",
+    "html_url": "https://github.com/acme/www/issues/45",
+    "state": "open",
+    "user": { "login": "ada", "id": 1001, "type": "User" },
+    "labels": [{ "name": "bug" }],
+    "assignees": [{ "login": "julian", "id": 1002 }]
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "ada", "id": 1001, "type": "User" }
+}

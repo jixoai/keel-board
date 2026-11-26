@@ -2,11 +2,14 @@ package github
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +17,10 @@ import (
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
+
+// MaxCommentLength is GitHub's comment body limit, in characters. A longer
+// outbound body is clamped; the hidden marker is kept.
+const MaxCommentLength = 65536
 
 // Config configures a GitHub App adapter.
 type Config struct {
@@ -25,6 +32,15 @@ type Config struct {
 	BotUserID int64
 	// BotLogin is the app's login, used when no ID is known.
 	BotLogin string
+	// InstallationID, when set, binds this entry to one GitHub App
+	// installation. A webhook whose installation is missing or different is
+	// dropped before normalization: an entry must never import another
+	// installation's private events.
+	InstallationID int64
+	// DetectViewer resolves the token's own user once (GET /user) and treats
+	// its comments as the app's own. BotUserID avoids the extra request; a
+	// failed lookup leaves the marker and BotLogin as the echo guards.
+	DetectViewer bool
 	// Repos is the inbound allowlist: only these "owner/repo" names are read.
 	// It is required unless AllowAllRepos is set.
 	Repos         []string
@@ -37,11 +53,28 @@ type Config struct {
 	// second line of defence against echo; keep them on unless a platform's
 	// rendering breaks.
 	DisableMarker bool
-	APIBaseURL    string
-	HTTPClient    *http.Client
-	Now           func() time.Time
-	MaxBodyBytes  int64
+	// APIBaseURL defaults to https://api.github.com. Plain http is accepted
+	// only for loopback hosts, so a token never crosses a cleartext network.
+	APIBaseURL string
+	// Doer performs REST calls. nil uses an http.Client with a timeout.
+	Doer Doer
+	// Now is a test seam for time-dependent behavior. GitHub webhooks carry no
+	// timestamp; replay identity is X-GitHub-Delivery.
+	Now          func() time.Time
+	MaxBodyBytes int64
 }
+
+// Doer sends one HTTP request. *http.Client implements it; a test may supply a
+// recording or failing implementation without a network.
+type Doer interface {
+	Do(*http.Request) (*http.Response, error)
+}
+
+// DoerFunc adapts a function to Doer.
+type DoerFunc func(*http.Request) (*http.Response, error)
+
+// Do implements Doer.
+func (f DoerFunc) Do(r *http.Request) (*http.Response, error) { return f(r) }
 
 // Validate checks configuration without revealing a secret.
 func (c Config) Validate() error {
@@ -50,6 +83,17 @@ func (c Config) Validate() error {
 	}
 	if c.WebhookSecret.Empty() {
 		return fmt.Errorf("%w: github webhook secret is unset", boardsync.ErrUnauthorized)
+	}
+	if c.InstallationID < 0 {
+		return fmt.Errorf("%w: github installation ID can't be negative", boardsync.ErrBadRequest)
+	}
+	if c.BotUserID < 0 {
+		return fmt.Errorf("%w: github bot user ID can't be negative", boardsync.ErrBadRequest)
+	}
+	if c.APIBaseURL != "" {
+		if err := validateAPIBaseURL(c.APIBaseURL); err != nil {
+			return err
+		}
 	}
 	if !c.AllowAllRepos && len(c.Repos) == 0 {
 		return fmt.Errorf("%w: github needs an inbound repo allowlist (or AllowAllRepos)", boardsync.ErrBadRequest)
@@ -62,12 +106,45 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// validateAPIBaseURL refuses a cleartext base URL for a non-loopback host: the
+// token travels in a header, and a typo must not send it over plain HTTP.
+func validateAPIBaseURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%w: github API base URL: %v", boardsync.ErrBadRequest, err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("%w: github API base URL needs a scheme and host", boardsync.ErrBadRequest)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%w: github API base URL can't carry credentials, a query, or a fragment", boardsync.ErrBadRequest)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" {
+		switch strings.ToLower(parsed.Hostname()) {
+		case "127.0.0.1", "::1", "localhost":
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: github API base URL must be https (http only for loopback)", boardsync.ErrBadRequest)
+}
+
 func validRepo(full string) bool {
 	parts := strings.Split(full, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return false
 	}
+	if len(parts[0]) > 100 || len(parts[1]) > 100 {
+		return false
+	}
 	for _, part := range parts {
+		// "." and ".." satisfy the character set but would traverse a REST
+		// path; a repo name is a name, never a relative segment.
+		if part == "." || part == ".." {
+			return false
+		}
 		for _, c := range part {
 			if !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '-' && c != '_' && c != '.' {
 				return false
@@ -76,6 +153,12 @@ func validRepo(full string) bool {
 	}
 	return true
 }
+
+var deliveryPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// validDelivery reports whether X-GitHub-Delivery is a bounded, printable ID.
+// It is the replay identity a webhook redelivery keeps.
+func validDelivery(delivery string) bool { return deliveryPattern.MatchString(delivery) }
 
 func (c Config) baseURL() string {
 	if c.APIBaseURL != "" {
@@ -98,9 +181,9 @@ func (c Config) maxBody() int64 {
 	return 2 << 20
 }
 
-func (c Config) httpClient() *http.Client {
-	if c.HTTPClient != nil {
-		return c.HTTPClient
+func (c Config) doer() Doer {
+	if c.Doer != nil {
+		return c.Doer
 	}
 	return &http.Client{Timeout: 15 * time.Second}
 }
@@ -223,16 +306,21 @@ type workflowRun struct {
 	} `json:"pull_requests"`
 }
 
+type installation struct {
+	ID int64 `json:"id"`
+}
+
 type payload struct {
-	Action      string       `json:"action"`
-	Number      int          `json:"number"`
-	Repository  repository   `json:"repository"`
-	Sender      user         `json:"sender"`
-	Issue       *issue       `json:"issue"`
-	PullRequest *pullRequest `json:"pull_request"`
-	Comment     *comment     `json:"comment"`
-	Review      *review      `json:"review"`
-	WorkflowRun *workflowRun `json:"workflow_run"`
+	Action       string        `json:"action"`
+	Number       int           `json:"number"`
+	Repository   repository    `json:"repository"`
+	Installation *installation `json:"installation"`
+	Sender       user          `json:"sender"`
+	Issue        *issue        `json:"issue"`
+	PullRequest  *pullRequest  `json:"pull_request"`
+	Comment      *comment      `json:"comment"`
+	Review       *review       `json:"review"`
+	WorkflowRun  *workflowRun  `json:"workflow_run"`
 }
 
 var threadPattern = regexp.MustCompile(`^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+):(issue:)?(\d+)(?::rc:(\d+))?$`)
@@ -248,12 +336,12 @@ type threadInfo struct {
 
 func parseThread(native string) (threadInfo, error) {
 	match := threadPattern.FindStringSubmatch(native)
-	if match == nil {
+	if match == nil || !validRepo(match[1]+"/"+match[2]) {
 		return threadInfo{}, fmt.Errorf("%w: not a github thread: %s", boardsync.ErrBadRequest, native)
 	}
 	number, err := strconv.Atoi(match[4])
-	if err != nil {
-		return threadInfo{}, fmt.Errorf("%w: github thread number: %v", boardsync.ErrBadRequest, err)
+	if err != nil || number <= 0 {
+		return threadInfo{}, fmt.Errorf("%w: github thread number: %s", boardsync.ErrBadRequest, match[4])
 	}
 	info := threadInfo{
 		Owner: match[1], Repo: match[2],
@@ -300,6 +388,15 @@ func authorOf(u user) boardsync.Author {
 		ID: id, Handle: u.Login, Name: name,
 		Avatar: u.AvatarURL, Bot: strings.EqualFold(u.Type, "Bot"),
 	}
+}
+
+// authorFor falls back to the webhook sender when the subject omits its own
+// user (a deleted account, or a review event without a review object).
+func authorFor(primary, sender user) boardsync.Author {
+	if primary.ID == 0 && primary.Login == "" {
+		primary = sender
+	}
+	return authorOf(primary)
 }
 
 // slug is a GitHub label or login as a board label key part: accents dropped,
@@ -373,11 +470,20 @@ func stateOfPull(pr *pullRequest) string {
 	}
 }
 
+// stateOfIssue keeps GitHub's two states and refuses anything else it might
+// send: a label value is data, not a place to smuggle an arbitrary string.
+func stateOfIssue(item *issue) string {
+	if strings.EqualFold(item.State, "closed") {
+		return "closed"
+	}
+	return "open"
+}
+
 func prLabels(pr *pullRequest, repo string) map[string]string {
 	labels := tagLabels(pr.Labels, pr.Assignees)
 	labels["pr"] = fmt.Sprintf("%s#%d", repo, pr.Number)
 	labels["state"] = stateOfPull(pr)
-	if pr.Head.SHA != "" {
+	if validSHA(pr.Head.SHA) {
 		labels["head"] = pr.Head.SHA
 	}
 	return labels
@@ -386,34 +492,52 @@ func prLabels(pr *pullRequest, repo string) map[string]string {
 func issueLabels(item *issue, repo string) map[string]string {
 	labels := tagLabels(item.Labels, item.Assignees)
 	labels["issue"] = fmt.Sprintf("%s#%d", repo, item.Number)
-	state := item.State
-	if state == "" {
-		state = "open"
-	}
-	labels["state"] = state
+	labels["state"] = stateOfIssue(item)
 	return labels
 }
+
+var shaPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
+
+// validSHA accepts the commit hashes GitHub puts in a head label.
+func validSHA(value string) bool { return shaPattern.MatchString(value) }
 
 func ciPrefix(repoID int64, number int) string {
 	return fmt.Sprintf("ci.%d-%d.", repoID, number)
 }
 
+// ciLabelKey bounds a workflow's CI label to the board's 64-character key
+// limit without letting two long workflow names collide: the tail becomes a
+// hash of the full name, while the owned prefix stays intact.
+func ciLabelKey(prefix, workflow string) string {
+	if len(prefix)+len(workflow) <= 64 {
+		return prefix + workflow
+	}
+	sum := sha256.Sum256([]byte(prefix + workflow))
+	suffix := "-" + hex.EncodeToString(sum[:4])
+	budget := 64 - len(prefix) - len(suffix)
+	if budget < 1 {
+		return prefix + suffix
+	}
+	return prefix + workflow[:budget] + suffix
+}
+
 // Client is GitHub's REST client. It is the only place the token is revealed.
 type Client struct {
 	baseURL string
-	http    *http.Client
+	doer    Doer
 	token   boardsync.Secret
 }
 
-// NewClient returns a REST client. baseURL may be empty.
-func NewClient(baseURL string, httpClient *http.Client, token boardsync.Secret) *Client {
+// NewClient returns a REST client. baseURL may be empty; a nil doer uses a
+// default http.Client.
+func NewClient(baseURL string, doer Doer, token boardsync.Secret) *Client {
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+	if doer == nil {
+		doer = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), http: httpClient, token: token}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), doer: doer, token: token}
 }
 
 type commentResponse struct {
@@ -421,19 +545,36 @@ type commentResponse struct {
 	HTMLURL string `json:"html_url"`
 }
 
+// RateLimitError is GitHub asking the caller to slow down. It unwraps to
+// boardsync.ErrRateLimited, so the retry policy retries it, and carries the
+// platform's own delay when one was given.
+type RateLimitError struct {
+	Status     int
+	RetryAfter time.Duration
+}
+
+// Error says what happened without the response body.
+func (e *RateLimitError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("github rate-limited (HTTP %d, retry after %s)", e.Status, e.RetryAfter)
+	}
+	return fmt.Sprintf("github rate-limited (HTTP %d)", e.Status)
+}
+
+// Unwrap makes errors.Is(err, boardsync.ErrRateLimited) true.
+func (e *RateLimitError) Unwrap() error { return boardsync.ErrRateLimited }
+
 func (c *Client) call(ctx context.Context, method, path string, input, output any) error {
 	if c.token.Empty() {
 		return fmt.Errorf("%w: github token is unset", boardsync.ErrUnauthorized)
 	}
-	var bodyReader *strings.Reader
+	var bodyReader io.Reader = http.NoBody
 	if input != nil {
 		data, err := jsonMarshal(input)
 		if err != nil {
 			return err
 		}
 		bodyReader = strings.NewReader(string(data))
-	} else {
-		bodyReader = strings.NewReader("")
 	}
 	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
@@ -441,11 +582,12 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	request.Header.Set("User-Agent", "keel-board-sync")
 	request.Header.Set("Authorization", "Bearer "+c.token.Reveal())
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := c.http.Do(request)
+	response, err := c.doer.Do(request)
 	if err != nil {
 		return boardsync.RedactError(err, c.token)
 	}
@@ -454,21 +596,27 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 	if err != nil {
 		return err
 	}
-	if response.StatusCode == http.StatusTooManyRequests ||
-		(response.StatusCode == http.StatusForbidden && response.Header.Get("X-RateLimit-Remaining") == "0") {
-		return fmt.Errorf("%w: github rate-limited", boardsync.ErrRateLimited)
+	switch response.StatusCode {
+	case http.StatusTooManyRequests:
+		return &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+	case http.StatusForbidden:
+		if rateLimited(response, body) {
+			return &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+		}
+		return fmt.Errorf("%w: github refused the request (HTTP 403)", boardsync.ErrUnauthorized)
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: github HTTP 401", boardsync.ErrUnauthorized)
+	case http.StatusNotFound, http.StatusGone:
+		return fmt.Errorf("%w: github HTTP %d", boardsync.ErrNotFound, response.StatusCode)
+	case http.StatusUnprocessableEntity:
+		return fmt.Errorf("%w: github refused the request (HTTP 422)", boardsync.ErrBadRequest)
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("%w: github HTTP %d", boardsync.ErrUnauthorized, response.StatusCode)
-	}
-	if response.StatusCode == http.StatusNotFound {
-		return fmt.Errorf("%w: github HTTP 404", boardsync.ErrNotFound)
-	}
-	if response.StatusCode == http.StatusUnprocessableEntity {
-		return fmt.Errorf("%w: github refused the request", boardsync.Permanent(errors.New(string(body))))
+	if response.StatusCode >= 500 {
+		// A 5xx is transport-shaped: the retry policy tries again.
+		return fmt.Errorf("github HTTP %d", response.StatusCode)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("github HTTP %d", response.StatusCode)
+		return fmt.Errorf("%w: github HTTP %d", boardsync.ErrBadRequest, response.StatusCode)
 	}
 	if output != nil && len(body) > 0 {
 		if err := jsonUnmarshal(body, output); err != nil {
@@ -476,6 +624,53 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 		}
 	}
 	return nil
+}
+
+// rateLimited recognizes GitHub's secondary rate limit, which arrives as a 403
+// with a Retry-After header or a body that says "rate limit" (never logged).
+func rateLimited(response *http.Response, body []byte) bool {
+	if response.Header.Get("Retry-After") != "" {
+		return true
+	}
+	if response.Header.Get("X-RateLimit-Remaining") == "0" {
+		return true
+	}
+	return bytesContainsFold(body, "rate limit")
+}
+
+func retryAfter(header http.Header) time.Duration {
+	value := strings.TrimSpace(header.Get("Retry-After"))
+	if value == "" {
+		if reset := header.Get("X-RateLimit-Reset"); reset != "" {
+			if seconds, err := strconv.ParseInt(reset, 10, 64); err == nil {
+				if wait := time.Until(time.Unix(seconds, 0)); wait > 0 {
+					return wait
+				}
+			}
+		}
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if wait := time.Until(when); wait > 0 {
+			return wait
+		}
+	}
+	return 0
+}
+
+func bytesContainsFold(data []byte, needle string) bool {
+	return strings.Contains(strings.ToLower(string(data)), needle)
+}
+
+// Viewer reads the token's own user. A GitHub App installation token answers
+// with the app's bot account; a deployment stores that ID as BotUserID.
+func (c *Client) Viewer(ctx context.Context) (user, error) {
+	var out user
+	err := c.call(ctx, http.MethodGet, "/user", nil, &out)
+	return out, err
 }
 
 // CreateIssueComment comments on a PR or issue conversation.

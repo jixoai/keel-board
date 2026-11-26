@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,17 +11,27 @@ import (
 )
 
 // normalize turns one GitHub webhook payload into normalized records. It does
-// not check the signature or the allowlist; Receive does both first.
-func (p *Provider) normalize(key boardsync.Key, eventName, delivery string, body []byte, pl payload) ([]boardsync.Record, error) {
+// not check the signature or the delivery ID; Receive does both first. A repo
+// outside the allowlist, an installation that isn't this entry's, or an event
+// type this adapter doesn't speak produces no records: fail closed, never a
+// half-imported event.
+func (p *Provider) normalize(ctx context.Context, key boardsync.Key, eventName, delivery string, body []byte, pl payload) ([]boardsync.Record, error) {
 	repo := pl.Repository.FullName
-	if repo == "" {
+	if repo == "" || !validRepo(repo) {
 		return nil, nil
 	}
 	if !p.cfg.readAllowed(repo) {
 		return nil, nil
 	}
-	if delivery == "" {
-		delivery = boardsync.Hash(string(body))
+	if p.cfg.InstallationID != 0 {
+		if pl.Installation == nil || pl.Installation.ID != p.cfg.InstallationID {
+			return nil, nil
+		}
+	}
+	if p.cfg.DetectViewer {
+		// Resolving the viewer is an optimisation, never a reason to lose an
+		// event: the marker and a configured ID remain the echo guards.
+		_, _ = p.Viewer(ctx)
 	}
 	switch eventName {
 	case "ping":
@@ -79,7 +90,7 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery, eventName strin
 		Key: key, Platform: "github",
 		Channel: info.channel(), Thread: info.thread(), Subthread: info.subthread(),
 		Message: strconv.FormatInt(comment.ID, 10),
-		Author:  authorOf(comment.User),
+		Author:  authorFor(comment.User, pl.Sender),
 		Raw:     append([]byte(nil), body...),
 	}
 	if comment.Path != "" {
@@ -88,9 +99,9 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery, eventName strin
 			line = comment.Original
 		}
 		if line > 0 {
-			event.Context = fmt.Sprintf("%s:%d", comment.Path, line)
+			event.Context = sanitizeContext(fmt.Sprintf("%s:%d", comment.Path, line))
 		} else {
-			event.Context = comment.Path
+			event.Context = sanitizeContext(comment.Path)
 		}
 	}
 	text := boardsync.StripMarker(comment.Body)
@@ -98,7 +109,7 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery, eventName strin
 		text = "(no text)"
 	}
 	event.Text = boardsync.StorableText(text, boardsync.MaxTextBytes)
-	if p.isOwnComment(comment) {
+	if p.isOwnComment(key, comment) {
 		return nil, nil
 	}
 	lane := event.Thread
@@ -134,13 +145,16 @@ func (p *Provider) normalizePullRequest(key boardsync.Key, delivery string, body
 	if pr == nil {
 		return nil, fmt.Errorf("%w: pull_request event has no pull request", boardsync.ErrBadRequest)
 	}
+	if pr.Number <= 0 {
+		return nil, fmt.Errorf("%w: pull_request event has no number", boardsync.ErrBadRequest)
+	}
 	repo := pl.Repository.FullName
 	labels := prLabels(pr, repo)
 	lifecycle := boardsync.Lifecycle{
 		Type:   "pr." + pl.Action,
-		Title:  fmt.Sprintf("PR #%d: %s", pr.Number, pr.Title),
+		Title:  storableTitle("PR #%d: %s", pr.Number, pr.Title),
 		URL:    pr.HTMLURL,
-		Body:   pr.Body,
+		Body:   boardsync.StorableText(pr.Body, boardsync.MaxTextBytes),
 		Labels: labels,
 		Owns:   ownedBy(pr.Labels, pr.Assignees),
 	}
@@ -160,9 +174,10 @@ func (p *Provider) normalizePullRequest(key boardsync.Key, delivery string, body
 		lifecycle.CreateRoot = true
 		lifecycle.Reply = "reopened by " + loginOrSomeone(login)
 	case "synchronize":
+		lifecycle.Type = "pr.synchronized"
 		lifecycle.Owns = append(lifecycle.Owns, ciPrefix(pl.Repository.ID, pr.Number))
 		delete(lifecycle.Labels, "head")
-		if pr.Head.SHA != "" {
+		if validSHA(pr.Head.SHA) {
 			lifecycle.Labels["head"] = pr.Head.SHA
 		}
 	case "closed":
@@ -183,42 +198,40 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 	if item == nil {
 		return nil, fmt.Errorf("%w: issues event has no issue", boardsync.ErrBadRequest)
 	}
+	if item.Number <= 0 {
+		return nil, fmt.Errorf("%w: issues event has no number", boardsync.ErrBadRequest)
+	}
 	repo := pl.Repository.FullName
-	// An `issues` event can carry a pull request's issue view. Route it to the
-	// PR thread so labels and state land with the conversation.
+	// An `issues` event can carry a pull request's issue view. Lifecycle
+	// actions (open/close/reopen) also arrive through `pull_request`, which
+	// alone knows `merged`; importing both would race two states and duplicate
+	// replies. Keep the issue view for what it uniquely carries here: GitHub
+	// label and assignee reconciliation on the PR thread.
 	if item.PullRequest != nil {
-		pr := &pullRequest{
-			Number: item.Number, Title: item.Title, Body: item.Body,
-			HTMLURL: item.HTMLURL, State: item.State,
-			User: item.User, Labels: item.Labels, Assignees: item.Assignees,
-		}
-		labels := prLabels(pr, repo)
-		lifecycle := boardsync.Lifecycle{
-			Type: "pr." + pl.Action, Title: fmt.Sprintf("PR #%d: %s", item.Number, item.Title),
-			URL: item.HTMLURL, Body: item.Body, Labels: labels,
-			Owns: ownedBy(item.Labels, item.Assignees),
-		}
 		switch pl.Action {
-		case "opened":
-			lifecycle.CreateRoot = true
-		case "edited":
-			lifecycle.Retitled = true
-		case "reopened":
-			lifecycle.CreateRoot = true
-			lifecycle.Reply = "reopened by " + loginOrSomeone(pl.Sender.Login)
-		case "closed":
-			lifecycle.Reply = "closed by " + loginOrSomeone(pl.Sender.Login)
 		case "labeled", "unlabeled", "assigned", "unassigned":
 		default:
 			return nil, nil
+		}
+		labels := tagLabels(item.Labels, item.Assignees)
+		labels["pr"] = fmt.Sprintf("%s#%d", repo, item.Number)
+		lifecycle := boardsync.Lifecycle{
+			Type:   "pr." + pl.Action,
+			Title:  storableTitle("PR #%d: %s", item.Number, item.Title),
+			URL:    item.HTMLURL,
+			Labels: labels,
+			Owns:   ownedBy(item.Labels, item.Assignees),
 		}
 		return []boardsync.Record{lifecycleRecord(key, delivery, body, lifecycle, authorOf(pl.Sender), repo, item.Number)}, nil
 	}
 	labels := issueLabels(item, repo)
 	lifecycle := boardsync.Lifecycle{
-		Type: "issue." + pl.Action, Title: fmt.Sprintf("Issue #%d: %s", item.Number, item.Title),
-		URL: item.HTMLURL, Body: item.Body, Labels: labels,
-		Owns: ownedBy(item.Labels, item.Assignees),
+		Type:   "issue." + pl.Action,
+		Title:  storableTitle("Issue #%d: %s", item.Number, item.Title),
+		URL:    item.HTMLURL,
+		Body:   boardsync.StorableText(item.Body, boardsync.MaxTextBytes),
+		Labels: labels,
+		Owns:   ownedBy(item.Labels, item.Assignees),
 	}
 	switch pl.Action {
 	case "opened":
@@ -246,9 +259,12 @@ func (p *Provider) normalizeReview(key boardsync.Key, delivery string, body []by
 	}
 	repo := pl.Repository.FullName
 	pr := pl.PullRequest
+	if pr.Number <= 0 {
+		return nil, fmt.Errorf("%w: review event has no pull request number", boardsync.ErrBadRequest)
+	}
 	lifecycle := boardsync.Lifecycle{
 		Type:   "review.submitted",
-		Title:  fmt.Sprintf("PR #%d: %s", pr.Number, pr.Title),
+		Title:  storableTitle("PR #%d: %s", pr.Number, pr.Title),
 		URL:    pr.HTMLURL,
 		Labels: map[string]string{},
 	}
@@ -271,10 +287,11 @@ func (p *Provider) normalizeReview(key boardsync.Key, delivery string, body []by
 		if pl.Review.Body != "" {
 			lifecycle.Reply += "\n\n" + pl.Review.Body
 		}
+		lifecycle.Reply = boardsync.StorableText(lifecycle.Reply, boardsync.MaxTextBytes)
 	default:
 		return nil, nil
 	}
-	return []boardsync.Record{lifecycleRecord(key, delivery, body, lifecycle, authorOf(pl.Review.User), repo, pr.Number)}, nil
+	return []boardsync.Record{lifecycleRecord(key, delivery, body, lifecycle, authorFor(pl.Review.User, pl.Sender), repo, pr.Number)}, nil
 }
 
 func (p *Provider) normalizeWorkflowRun(key boardsync.Key, delivery string, body []byte, pl payload) ([]boardsync.Record, error) {
@@ -283,47 +300,53 @@ func (p *Provider) normalizeWorkflowRun(key boardsync.Key, delivery string, body
 		return nil, nil
 	}
 	repo := pl.Repository.FullName
+	if pl.Repository.ID <= 0 {
+		// CI labels are owned per repository number; without one, two repos
+		// could share an "owned" prefix and unset each other's labels.
+		return nil, nil
+	}
 	conclusion := strings.ToLower(run.Conclusion)
 	failed := conclusion == "failure" || conclusion == "timed_out" || conclusion == "startup_failure"
 	if !failed && conclusion != "success" {
 		return nil, nil
 	}
-	file := run.Path
-	if index := strings.LastIndex(file, "/"); index >= 0 {
-		file = file[index+1:]
+	name := run.Path
+	if name == "" {
+		name = run.Name
 	}
-	file = strings.TrimSuffix(strings.TrimSuffix(file, ".yml"), ".yaml")
-	fileSlug := slug(file)
+	if index := strings.LastIndex(name, "/"); index >= 0 {
+		name = name[index+1:]
+	}
+	name = strings.TrimSuffix(strings.TrimSuffix(name, ".yml"), ".yaml")
+	fileSlug := slug(name)
 	if fileSlug == "" {
 		return nil, nil
 	}
 	var records []boardsync.Record
 	for _, pr := range run.PullRequests {
+		if pr.Number <= 0 {
+			continue
+		}
 		if pr.Head.SHA != "" && run.HeadSHA != "" && pr.Head.SHA != run.HeadSHA {
 			continue
 		}
+		prefix := ciPrefix(pl.Repository.ID, pr.Number)
+		keyName := ciLabelKey(prefix, fileSlug)
 		labels := map[string]string{}
-		unset := []string{}
-		keyName := (ciPrefix(pl.Repository.ID, pr.Number) + fileSlug)
-		if len(keyName) > 64 {
-			keyName = keyName[:64]
-		}
 		lifecycle := boardsync.Lifecycle{
 			Type:  "ci.passed",
-			Title: fmt.Sprintf("PR #%d", pr.Number),
+			Title: storableTitle("PR #%d", pr.Number),
 			URL:   run.HTMLURL,
-			Owns:  []string{ciPrefix(pl.Repository.ID, pr.Number)},
-			Unset: unset,
+			Owns:  []string{prefix},
 		}
 		if failed {
 			lifecycle.Type = "ci.failed"
 			labels[keyName] = conclusion
-			lifecycle.Reply = fmt.Sprintf("%s %s on %s#%d at %s%s",
-				run.Name, conclusion, strings.TrimPrefix(repo, pl.Repository.Owner.Login+"/"), pr.Number,
-				shortSHA(run.HeadSHA), runLink(run.HTMLURL))
+			lifecycle.Reply = boardsync.StorableText(fmt.Sprintf("%s %s on %s#%d at %s%s",
+				run.Name, conclusion, repoDisplay(repo, pl.Repository.Owner.Login), pr.Number,
+				shortSHA(run.HeadSHA), runLink(run.HTMLURL)), boardsync.MaxTextBytes)
 		} else {
-			unset = append(unset, keyName)
-			lifecycle.Unset = unset
+			lifecycle.Unset = []string{keyName}
 		}
 		lifecycle.Labels = labels
 		author := boardsync.Author{ID: "github:user:41898282", Handle: "github-actions[bot]", Name: "github-actions[bot]", Bot: true}
@@ -350,15 +373,25 @@ func lifecycleRecord(key boardsync.Key, delivery string, body []byte, lifecycle 
 	return boardsync.Record{Dedupe: event.ID, Event: event, Raw: body}
 }
 
-func (p *Provider) isOwnComment(comment *comment) bool {
+func (p *Provider) isOwnComment(key boardsync.Key, comment *comment) bool {
 	if p.cfg.BotUserID != 0 && comment.User.ID == p.cfg.BotUserID {
 		return true
 	}
 	if p.cfg.BotLogin != "" && strings.EqualFold(comment.User.Login, p.cfg.BotLogin) {
 		return true
 	}
+	if id, login, known := p.viewer(); known {
+		if id != 0 && comment.User.ID == id {
+			return true
+		}
+		if login != "" && strings.EqualFold(comment.User.Login, login) {
+			return true
+		}
+	}
 	if !p.cfg.DisableMarker {
-		if marker, ok := boardsync.ParseMarker(comment.Body); ok && string(marker.Key) == string(p.cfg.Key) && p.cfg.Key != "" {
+		// A marker for this entry is fail-closed: a copied marker loses one
+		// genuine comment, an echoed one would loop forever.
+		if boardsync.IsOwnMarker(comment.Body, key) {
 			return true
 		}
 	}
@@ -370,6 +403,39 @@ func loginOrSomeone(login string) string {
 		return "someone"
 	}
 	return login
+}
+
+// storableTitle bounds a lifecycle title. GitHub titles are short; the bound is
+// defensive, not an expected truncation.
+func storableTitle(format string, args ...any) string {
+	return boardsync.StorableText(fmt.Sprintf(format, args...), 1024)
+}
+
+// sanitizeContext names a review comment's code location without letting a
+// payload smuggle newlines or control characters into a board field.
+func sanitizeContext(value string) string {
+	value = boardsync.StorableText(value, 300)
+	value = strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20 || r == 0x7f:
+			return -1
+		default:
+			return r
+		}
+	}, value)
+	return strings.TrimSpace(value)
+}
+
+// repoDisplay is "owner/repo" without the owner, for a short reply line.
+func repoDisplay(repo, owner string) string {
+	if owner != "" {
+		if trimmed := strings.TrimPrefix(repo, owner+"/"); trimmed != repo {
+			return trimmed
+		}
+	}
+	return repo
 }
 
 func parseTime(value string) time.Time {
@@ -395,9 +461,4 @@ func runLink(url string) string {
 		return ""
 	}
 	return ": " + url
-}
-
-// markerFor is the hidden comment marker for an outbound comment.
-func markerFor(key boardsync.Key, msg boardsync.OutboundMessage, target boardsync.ResolvedTarget) boardsync.Marker {
-	return boardsync.Marker{Key: key, Message: msg.BoardMessage, Thread: target.External()}
 }

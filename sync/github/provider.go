@@ -2,10 +2,14 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -14,7 +18,17 @@ import (
 type Provider struct {
 	cfg    Config
 	client *Client
+
+	viewerMu    sync.Mutex
+	viewerUser  user
+	viewerKnown bool
+	viewerErr   error
+	viewerErrAt time.Time
 }
+
+// viewerRetry bounds how often a failed viewer lookup is retried: an app that
+// can't read /user must not call it once per webhook.
+const viewerRetry = time.Minute
 
 // New returns a GitHub provider. It validates the allowlists and builds the
 // REST client; it performs no network I/O.
@@ -24,7 +38,7 @@ func New(cfg Config) (*Provider, error) {
 	}
 	return &Provider{
 		cfg:    cfg,
-		client: NewClient(cfg.baseURL(), cfg.httpClient(), cfg.Token),
+		client: NewClient(cfg.baseURL(), cfg.doer(), cfg.Token),
 	}, nil
 }
 
@@ -37,8 +51,9 @@ func (p *Provider) Capabilities() boardsync.Capabilities {
 	return boardsync.Capabilities{StartThreads: false, Edits: true, Deletes: true, Reactions: true}
 }
 
-// Receive verifies X-Hub-Signature-256, checks the repo allowlist, and
-// normalizes comments, PRs, issues, reviews, and CI runs.
+// Receive verifies X-Hub-Signature-256, checks the delivery ID, the repo
+// allowlist, and (when configured) the installation, and normalizes comments,
+// PRs, issues, reviews, and CI runs.
 func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsync.WebhookRequest) (boardsync.Intake, error) {
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return boardsync.Intake{}, fmt.Errorf("%w: entry %q isn't this github app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
@@ -56,11 +71,15 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 	if eventName == "" {
 		return boardsync.Intake{}, fmt.Errorf("%w: github request has no event header", boardsync.ErrBadRequest)
 	}
+	delivery := req.Header.Get(DeliveryHeader)
+	if !validDelivery(delivery) {
+		return boardsync.Intake{}, fmt.Errorf("%w: github request has no usable delivery ID", boardsync.ErrBadRequest)
+	}
 	var pl payload
 	if err := jsonUnmarshal(req.Body, &pl); err != nil {
 		return boardsync.Intake{}, fmt.Errorf("%w: github payload: %v", boardsync.ErrBadRequest, err)
 	}
-	records, err := p.normalize(key, eventName, req.Header.Get(DeliveryHeader), req.Body, pl)
+	records, err := p.normalize(ctx, key, eventName, delivery, req.Body, pl)
 	if err != nil {
 		return boardsync.Intake{}, err
 	}
@@ -70,6 +89,41 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 	return boardsync.Intake{Response: boardsync.OK(), Records: records}, nil
 }
 
+// Viewer reports the account the token authenticates as, fetching it once.
+// A deployment can call it at startup to learn BotUserID; an inbound comment
+// by that account is then skipped as the app's own.
+func (p *Provider) Viewer(ctx context.Context) (boardsync.Author, error) {
+	p.viewerMu.Lock()
+	defer p.viewerMu.Unlock()
+	if p.viewerKnown {
+		return authorOf(p.viewerUser), nil
+	}
+	now := p.cfg.now()
+	if p.viewerErr != nil && now.Sub(p.viewerErrAt) < viewerRetry {
+		return boardsync.Author{}, p.viewerErr
+	}
+	account, err := p.client.Viewer(ctx)
+	if err != nil {
+		p.viewerErr = err
+		p.viewerErrAt = now
+		return boardsync.Author{}, err
+	}
+	p.viewerErr = nil
+	if account.ID == 0 && account.Login == "" {
+		return boardsync.Author{}, fmt.Errorf("github answered an empty viewer")
+	}
+	p.viewerUser = account
+	p.viewerKnown = true
+	return authorOf(account), nil
+}
+
+// viewer returns the cached viewer identity without doing I/O.
+func (p *Provider) viewer() (id int64, login string, known bool) {
+	p.viewerMu.Lock()
+	defer p.viewerMu.Unlock()
+	return p.viewerUser.ID, p.viewerUser.Login, p.viewerKnown
+}
+
 // ResolveChannel accepts "owner/repo", "owner/repo:pulls", or
 // "owner/repo:issues". A bare repo resolves to its pulls channel, which is
 // only useful for routing; GitHub can't start a thread there.
@@ -77,14 +131,15 @@ func (p *Provider) ResolveChannel(_ context.Context, key boardsync.Key, name str
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return "", fmt.Errorf("%w: entry %q isn't this github app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
 	}
-	if strings.HasSuffix(name, ":pulls") || strings.HasSuffix(name, ":issues") {
-		if !validRepo(strings.TrimSuffix(strings.TrimSuffix(name, ":pulls"), ":issues")) {
-			return "", fmt.Errorf("%w: not a github repo channel: %s", boardsync.ErrBadRequest, name)
-		}
-		return name, nil
+	repo := strings.TrimSuffix(strings.TrimSuffix(name, ":pulls"), ":issues")
+	if !validRepo(repo) {
+		return "", fmt.Errorf("%w: not a github repo channel: %s", boardsync.ErrBadRequest, name)
 	}
-	if !validRepo(name) {
-		return "", fmt.Errorf("%w: not a github repo: %s", boardsync.ErrBadRequest, name)
+	if !p.cfg.readAllowed(repo) {
+		return "", fmt.Errorf("%w: %s is not in the inbound repo allowlist", boardsync.ErrNotFound, repo)
+	}
+	if strings.HasSuffix(name, ":pulls") || strings.HasSuffix(name, ":issues") {
+		return name, nil
 	}
 	return name + ":pulls", nil
 }
@@ -104,12 +159,18 @@ func (p *Provider) ResolveTarget(_ context.Context, key boardsync.Key, target st
 		if !validRepo(target) {
 			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: not a github repo: %s", boardsync.ErrBadRequest, target)
 		}
+		if !p.cfg.readAllowed(target) {
+			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: %s is not in the inbound repo allowlist", boardsync.ErrNotFound, target)
+		}
 		resolved := boardsync.ResolvedTarget{Key: key, Platform: "github", Channel: target + ":pulls", Kind: boardsync.TargetChannel}
 		return resolved, resolved.Validate()
 	}
 	info, err := parseThread(target)
 	if err != nil {
 		return boardsync.ResolvedTarget{}, err
+	}
+	if !p.cfg.readAllowed(info.Full) {
+		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: %s is not in the inbound repo allowlist", boardsync.ErrNotFound, info.Full)
 	}
 	resolved := boardsync.ResolvedTarget{
 		Key: key, Platform: "github",
@@ -136,24 +197,33 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	if target.Key != key {
 		return boardsync.Posted{}, fmt.Errorf("%w: target belongs to %q", boardsync.ErrBadRequest, target.Key)
 	}
+	if len(msg.Files) > 0 {
+		return boardsync.Posted{}, fmt.Errorf("%w: github comment files are not implemented", boardsync.ErrUnsupported)
+	}
+	if strings.TrimSpace(msg.Markdown) == "" {
+		return boardsync.Posted{}, fmt.Errorf("%w: github comment has no text", boardsync.ErrBadRequest)
+	}
 	info, err := parseThread(target.Thread)
 	if err != nil {
 		return boardsync.Posted{}, err
+	}
+	if target.Channel != "" && target.Channel != info.channel() {
+		return boardsync.Posted{}, fmt.Errorf("%w: channel %s doesn't hold %s", boardsync.ErrBadRequest, target.Channel, target.Thread)
 	}
 	if target.Subthread != "" {
 		sub, err := parseThread(target.Subthread)
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
+		if sub.Full != info.Full || sub.Number != info.Number || sub.ReviewID == 0 {
+			return boardsync.Posted{}, fmt.Errorf("%w: review sub-thread %s isn't inside %s", boardsync.ErrBadRequest, target.Subthread, target.Thread)
+		}
 		info.ReviewID = sub.ReviewID
 	}
 	if !p.cfg.writeAllowed(info.Full) {
 		return boardsync.Posted{}, fmt.Errorf("%w: writes to %s are not allowed; set WriteRepos", boardsync.ErrUnsupported, info.Full)
 	}
-	body := msg.Markdown
-	if !p.cfg.DisableMarker {
-		body = boardsync.WithMarker(body, markerFor(key, msg, target))
-	}
+	body := p.commentBody(key, target.Ref(), msg)
 	var response commentResponse
 	if info.ReviewID != 0 {
 		response, err = p.client.CreateReviewReply(ctx, info.Full, info.Number, info.ReviewID, body)
@@ -169,32 +239,70 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	return boardsync.Posted{Thread: info.thread(), Message: strconv.FormatInt(response.ID, 10)}, nil
 }
 
+// commentBody renders and bounds a comment, keeping the hidden marker intact.
+// GitHub accepts at most MaxCommentLength characters; a longer board message is
+// cut at a rune boundary with an ellipsis rather than failing delivery.
+func (p *Provider) commentBody(key boardsync.Key, thread boardsync.ThreadRef, msg boardsync.OutboundMessage) string {
+	body := boardsync.StorableText(msg.Markdown, boardsync.MaxTextBytes)
+	if p.cfg.DisableMarker {
+		return clampComment(body, MaxCommentLength)
+	}
+	marker := boardsync.Marker{Key: key, Message: msg.BoardMessage, Thread: thread.External()}
+	reserve := utf8.RuneCountInString(marker.String()) + 2
+	return boardsync.WithMarker(clampComment(body, MaxCommentLength-reserve), marker)
+}
+
+// clampComment bounds a body by GitHub's character limit. An already short
+// body is returned unchanged.
+func clampComment(body string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(body) <= max {
+		return body
+	}
+	runes := []rune(body)
+	if max == 1 {
+		return "…"
+	}
+	return string(runes[:max-1]) + "…"
+}
+
 // Edit replaces a delivered comment's body.
 func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string, msg boardsync.OutboundMessage) error {
 	info, commentID, err := p.commentWhere(key, thread, message)
 	if err != nil {
 		return err
 	}
-	body := msg.Markdown
-	if !p.cfg.DisableMarker {
-		body = boardsync.WithMarker(body, boardsync.Marker{Key: key, Message: msg.BoardMessage, Thread: thread.External()})
+	if len(msg.Files) > 0 {
+		return fmt.Errorf("%w: github comments carry no files", boardsync.ErrUnsupported)
 	}
+	if strings.TrimSpace(msg.Markdown) == "" {
+		return fmt.Errorf("%w: github comment has no text", boardsync.ErrBadRequest)
+	}
+	body := p.commentBody(key, thread, msg)
 	if info.ReviewID != 0 {
 		return p.client.UpdateReviewComment(ctx, info.Full, commentID, body)
 	}
 	return p.client.UpdateIssueComment(ctx, info.Full, commentID, body)
 }
 
-// Delete deletes a delivered comment.
+// Delete deletes a delivered comment. A comment that is already gone is a
+// success: the board's goal is that it no longer exists.
 func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string) error {
 	info, commentID, err := p.commentWhere(key, thread, message)
 	if err != nil {
 		return err
 	}
 	if info.ReviewID != 0 {
-		return p.client.DeleteReviewComment(ctx, info.Full, commentID)
+		err = p.client.DeleteReviewComment(ctx, info.Full, commentID)
+	} else {
+		err = p.client.DeleteIssueComment(ctx, info.Full, commentID)
 	}
-	return p.client.DeleteIssueComment(ctx, info.Full, commentID)
+	if errors.Is(err, boardsync.ErrNotFound) {
+		return nil
+	}
+	return err
 }
 
 // React adds a reaction. GitHub has no simple remove without a reaction ID,
@@ -245,7 +353,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 			return nil, err
 		}
 		return &boardsync.RootDraft{
-			Text:   fmt.Sprintf("Issue #%d: %s\n%s\n\n%s", item.Number, item.Title, item.HTMLURL, item.Body),
+			Text:   boardsync.StorableText(fmt.Sprintf("Issue #%d: %s\n%s\n\n%s", item.Number, item.Title, item.HTMLURL, item.Body), boardsync.MaxTextBytes),
 			Labels: issueLabels(&item, repo),
 			Author: authorOf(item.User),
 		}, nil
@@ -255,21 +363,26 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 		return nil, err
 	}
 	return &boardsync.RootDraft{
-		Text:   fmt.Sprintf("PR #%d: %s\n%s\n\n%s", pr.Number, pr.Title, pr.HTMLURL, pr.Body),
+		Text:   boardsync.StorableText(fmt.Sprintf("PR #%d: %s\n%s\n\n%s", pr.Number, pr.Title, pr.HTMLURL, pr.Body), boardsync.MaxTextBytes),
 		Labels: prLabels(&pr, repo),
 		Author: authorOf(pr.User),
 	}, nil
 }
 
-var githubURLPattern = regexp.MustCompile(`^https://github\.com/([^/\s]+)/([^/\s]+)/(pull|issues)/(\d+)(?:[^#\s]*#(issuecomment-|discussion_r)(\d+))?$`)
+var githubURLPattern = regexp.MustCompile(`^https://github\.com/([^/\s]+)/([^/\s]+)/(pull|issues)/(\d+)(?:[^#\s]*#(issuecomment-|discussion_r|r)(\d+))?$`)
 
 // Locate reads a PR, issue, or comment URL as its native thread and message.
+// Review comments are accepted by their conversation anchor
+// (#discussion_r…) and by the files-view short anchor (#r…).
 func (p *Provider) Locate(link string) (string, string, bool) {
 	match := githubURLPattern.FindStringSubmatch(strings.TrimSpace(link))
 	if match == nil {
 		return "", "", false
 	}
 	owner, repo, kind, number := match[1], match[2], match[3], match[4]
+	if !validRepo(owner + "/" + repo) {
+		return "", "", false
+	}
 	thread := fmt.Sprintf("%s/%s:%s", owner, repo, number)
 	if kind == "issues" {
 		thread = fmt.Sprintf("%s/%s:issue:%s", owner, repo, number)
@@ -277,7 +390,7 @@ func (p *Provider) Locate(link string) (string, string, bool) {
 	if match[5] == "" {
 		return thread, "", true
 	}
-	if match[5] == "discussion_r" && kind != "pull" {
+	if (match[5] == "discussion_r" || match[5] == "r") && kind != "pull" {
 		return "", "", false
 	}
 	return thread, match[6], true
@@ -314,6 +427,9 @@ func (p *Provider) threadWhere(key boardsync.Key, thread boardsync.ThreadRef) (t
 	if err != nil {
 		return threadInfo{}, err
 	}
+	if thread.Channel != "" && thread.Channel != info.channel() {
+		return threadInfo{}, fmt.Errorf("%w: channel %s doesn't hold %s", boardsync.ErrBadRequest, thread.Channel, thread.Thread)
+	}
 	if !p.cfg.writeAllowed(info.Full) {
 		return threadInfo{}, fmt.Errorf("%w: writes to %s are not allowed", boardsync.ErrUnsupported, info.Full)
 	}
@@ -321,6 +437,9 @@ func (p *Provider) threadWhere(key boardsync.Key, thread boardsync.ThreadRef) (t
 		sub, err := parseThread(thread.Subthread)
 		if err != nil {
 			return threadInfo{}, err
+		}
+		if sub.Full != info.Full || sub.Number != info.Number || sub.ReviewID == 0 {
+			return threadInfo{}, fmt.Errorf("%w: sub-thread %s isn't a review thread inside %s", boardsync.ErrBadRequest, thread.Subthread, thread.Thread)
 		}
 		info.ReviewID = sub.ReviewID
 	}

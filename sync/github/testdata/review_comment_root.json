@@ -1,0 +1,16 @@
+{
+  "action": "created",
+  "pull_request": { "number": 123, "title": "checkout retry", "html_url": "https://github.com/acme/www/pull/123" },
+  "comment": {
+    "id": 345,
+    "body": "this path can hang",
+    "user": { "login": "ada", "id": 1001, "type": "User" },
+    "path": "src/auth.ts",
+    "line": 42,
+    "html_url": "https://github.com/acme/www/pull/123#discussion_r345",
+    "created_at": "2026-01-02T03:04:05Z",
+    "updated_at": "2026-01-02T03:04:05Z"
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "ada", "id": 1001, "type": "User" }
+}

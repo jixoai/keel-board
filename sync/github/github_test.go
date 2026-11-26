@@ -415,6 +415,23 @@ func TestLocateAndURL(t *testing.T) {
 	if !ok || thread != "acme/www:issue:45" || message != "9001" {
 		t.Fatalf("Locate issue = %q, %q, %v", thread, message, ok)
 	}
+	thread, message, ok = p.Locate("https://github.com/acme/www/pull/123/files#r345")
+	if !ok || thread != "acme/www:123" || message != "345" {
+		t.Fatalf("Locate files anchor = %q, %q, %v", thread, message, ok)
+	}
+	thread, message, ok = p.Locate("https://github.com/acme/www/pull/123")
+	if !ok || thread != "acme/www:123" || message != "" {
+		t.Fatalf("Locate PR = %q, %q, %v", thread, message, ok)
+	}
+	if _, _, ok := p.Locate("https://evil.example/acme/www/pull/123"); ok {
+		t.Fatal("Locate accepted a non-GitHub host")
+	}
+	if _, _, ok := p.Locate("https://github.com/../www/pull/123"); ok {
+		t.Fatal("Locate accepted a traversal owner")
+	}
+	if _, _, ok := p.Locate("https://github.com/acme/www/issues/45#discussion_r1"); ok {
+		t.Fatal("Locate accepted a review anchor on an issue")
+	}
 	link, err := p.URL("acme/www:123", "345")
 	if err != nil || link != "https://github.com/acme/www/pull/123#issuecomment-345" {
 		t.Fatalf("URL = %q, %v", link, err)

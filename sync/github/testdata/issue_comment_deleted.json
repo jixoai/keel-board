@@ -1,0 +1,22 @@
+{
+  "action": "deleted",
+  "issue": {
+    "number": 45,
+    "title": "blank export page",
+    "html_url": "https://github.com/acme/www/issues/45",
+    "state": "open",
+    "user": { "login": "ada", "id": 1001, "type": "User" },
+    "labels": [],
+    "assignees": []
+  },
+  "comment": {
+    "id": 9001,
+    "body": "",
+    "user": { "login": "julian", "id": 1002, "type": "User" },
+    "html_url": "https://github.com/acme/www/issues/45#issuecomment-9001",
+    "created_at": "2026-01-02T03:04:05Z",
+    "updated_at": "2026-01-03T04:05:06Z"
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "julian", "id": 1002, "type": "User" }
+}
