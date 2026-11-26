@@ -829,6 +829,15 @@ func lastMessageID(ids []uint64) uint64 {
 
 func uint64Ptr(value uint64) *uint64 { return &value }
 
+// messageThread is the board thread a receipt's message belongs to: its
+// recorded thread, or its own ID when it is a root.
+func messageThread(message *boardsync.Message) uint64 {
+	if message.Thread != 0 {
+		return message.Thread
+	}
+	return message.ID
+}
+
 func stringPtr(value string) *string { return &value }
 
 // Record appends a receipt sync produces. thread.synced is idempotent per
@@ -879,7 +888,12 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 		ID: root.ID, Thread: root.Thread, Target: target, Cause: event.Cause,
 	}
 	key := "sync:thread:" + target.Key + ":" + target.External() + ":" + strconv.FormatUint(root.ID, 10)
-	result, err := h.appendSync(ctx, event.Tenant, key, payload, func(tx *log.Tx) {
+	digest := struct {
+		ID     uint64
+		Thread string
+		Target log.SyncTarget
+	}{ID: payload.ID, Thread: payload.Thread, Target: payload.Target}
+	result, err := h.appendSync(ctx, event.Tenant, key, digest, payload, func(tx *log.Tx) {
 		tx.Emit(log.EventThreadSynced, payload)
 	})
 	if err != nil {
@@ -899,11 +913,11 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 	if kind != boardsync.TargetChannel {
 		return nil
 	}
-	return h.enqueueRoot(ctx, event.Tenant, boardsync.Key(target.Key), result.FirstSeq, root, target, event.Cause)
+	return h.enqueueRoot(ctx, event.Tenant, boardsync.Key(target.Key), result.FirstSeq, root, target)
 }
 
 // enqueueRoot queues the root post that starts a channel target's thread.
-func (h *SyncHost) enqueueRoot(ctx context.Context, tenant string, key boardsync.Key, eventID uint64, root *log.Message, target log.SyncTarget, cause string) error {
+func (h *SyncHost) enqueueRoot(ctx context.Context, tenant string, key boardsync.Key, eventID uint64, root *log.Message, target log.SyncTarget) error {
 	message, err := h.messageFor(tenant, root)
 	if err != nil {
 		return err
@@ -916,9 +930,12 @@ func (h *SyncHost) enqueueRoot(ctx context.Context, tenant string, key boardsync
 		Key: key, Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
 		Thread: target.Thread, Subthread: target.Subthread, Kind: boardsync.TargetChannel,
 	}
+	// Cause stays out of the outbox fact: the same root and target are one
+	// delivery whether the attachment came from configuration or an explicit
+	// attach. The log receipt keeps the cause for readers.
 	_, err = h.store.EnqueueOutbox(ctx, tenant, key, boardsync.BoardEvent{
 		Tenant: tenant, ID: eventID, Type: boardsync.BoardThreadSynced,
-		Thread: root.ID, Target: &ref, Cause: cause,
+		Thread: root.ID, Target: &ref,
 	}, message, []boardsync.ResolvedTarget{resolved})
 	return err
 }
@@ -934,7 +951,7 @@ func (h *SyncHost) recordMessageSynced(ctx context.Context, event boardsync.Boar
 		return fmt.Errorf("%w: message.synced has an invalid external thread", boardsync.ErrBadRequest)
 	}
 	message := event.Message
-	root, err := h.rootMessage(ctx, event.Tenant, message.Thread)
+	root, err := h.rootMessage(ctx, event.Tenant, messageThread(message))
 	if err != nil {
 		return err
 	}
@@ -975,7 +992,14 @@ func (h *SyncHost) recordMessageSynced(ctx context.Context, event boardsync.Boar
 		Files: append([]string(nil), files...), FilesSet: filesSet,
 	}
 	receiptKey := "sync:synced:" + target.Key + ":" + target.External() + ":" + strconv.FormatUint(message.ID, 10)
-	if _, err := h.appendSync(ctx, event.Tenant, receiptKey, payload, func(tx *log.Tx) {
+	digest := struct {
+		ID              uint64
+		Thread          string
+		Target          log.SyncTarget
+		ExternalThread  string
+		ExternalMessage string
+	}{payload.ID, payload.Thread, payload.Target, payload.ExternalThread, payload.ExternalMessage}
+	if _, err := h.appendSync(ctx, event.Tenant, receiptKey, digest, payload, func(tx *log.Tx) {
 		tx.Emit(log.EventMessageSynced, payload)
 	}); err != nil {
 		return err
@@ -1038,7 +1062,7 @@ func (h *SyncHost) recordFilesSynced(ctx context.Context, event boardsync.BoardE
 	if !target.Valid() {
 		return fmt.Errorf("%w: message.files_synced has an invalid external thread", boardsync.ErrBadRequest)
 	}
-	root, err := h.rootMessage(ctx, event.Tenant, event.Message.Thread)
+	root, err := h.rootMessage(ctx, event.Tenant, messageThread(event.Message))
 	if err != nil {
 		return err
 	}
@@ -1047,7 +1071,7 @@ func (h *SyncHost) recordFilesSynced(ctx context.Context, event boardsync.BoardE
 		Files: append([]string(nil), event.Files...), FilesSet: event.FilesSet,
 	}
 	key := "sync:files:" + target.Key + ":" + target.External() + ":" + strconv.FormatUint(event.Message.ID, 10)
-	_, err = h.appendSync(ctx, event.Tenant, key, payload, func(tx *log.Tx) {
+	_, err = h.appendSync(ctx, event.Tenant, key, payload, payload, func(tx *log.Tx) {
 		tx.Emit(log.EventMessageFilesSynced, payload)
 	})
 	return err
@@ -1062,7 +1086,7 @@ func (h *SyncHost) recordSyncFailed(ctx context.Context, event boardsync.BoardEv
 	if !target.Valid() {
 		return fmt.Errorf("%w: message.sync_failed has an invalid external thread", boardsync.ErrBadRequest)
 	}
-	root, err := h.rootMessage(ctx, event.Tenant, event.Message.Thread)
+	root, err := h.rootMessage(ctx, event.Tenant, messageThread(event.Message))
 	if err != nil {
 		return err
 	}
@@ -1077,7 +1101,12 @@ func (h *SyncHost) recordSyncFailed(ctx context.Context, event boardsync.BoardEv
 		ID: event.Message.ID, Thread: root.Thread, Target: target, Error: code,
 	}
 	key := "sync:failed:" + target.Key + ":" + target.External() + ":" + strconv.FormatUint(event.Message.ID, 10)
-	_, err = h.appendSync(ctx, event.Tenant, key, payload, func(tx *log.Tx) {
+	digest := struct {
+		ID     uint64
+		Thread string
+		Target log.SyncTarget
+	}{payload.ID, payload.Thread, payload.Target}
+	_, err = h.appendSync(ctx, event.Tenant, key, digest, payload, func(tx *log.Tx) {
 		tx.Emit(log.EventMessageSyncFailed, payload)
 	})
 	return err
@@ -1086,10 +1115,10 @@ func (h *SyncHost) recordSyncFailed(ctx context.Context, event boardsync.BoardEv
 // appendSync appends one sync event under a stable idempotency key. The digest
 // is the payload's, so a retry with the same fact replays and a different fact
 // under one key is refused.
-func (h *SyncHost) appendSync(ctx context.Context, tenant, key string, payload any, emit func(*log.Tx)) (log.AppendResult, error) {
+func (h *SyncHost) appendSync(ctx context.Context, tenant, key string, digestValue, payload any, emit func(*log.Tx)) (log.AppendResult, error) {
 	var result log.AppendResult
 	err := h.board.Update(ctx, tenant, log.UpdateOptions{
-		Idempotency: &log.Idempotency{Key: key, Digest: digestOf(payload)},
+		Idempotency: &log.Idempotency{Key: key, Digest: digestOf(digestValue)},
 	}, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
 			result = replay

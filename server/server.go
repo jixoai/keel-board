@@ -40,6 +40,7 @@ type Server struct {
 	logger    *slog.Logger
 	blobs     blob.Store
 	now       func() time.Time
+	sync      *syncService
 }
 
 // Options configure a Server.
@@ -64,6 +65,9 @@ type Options struct {
 	Blobs blob.Store
 	// Now is the server's clock for upload tickets. Default: time.Now.
 	Now func() time.Time
+	// Sync mounts the platform webhook route, the board-event subscription and
+	// the sync management API. nil serves no sync.
+	Sync *SyncOptions
 }
 
 // New returns a server. It panics if no board is given: a server without a
@@ -100,6 +104,16 @@ func New(opts Options) *Server {
 		logger:    opts.Logger,
 		blobs:     opts.Blobs,
 		now:       opts.Now,
+	}
+	if opts.Sync != nil {
+		if opts.Sync.Logger == nil {
+			opts.Sync.Logger = opts.Logger
+		}
+		service, err := newSyncService(opts.Board, *opts.Sync)
+		if err != nil {
+			panic("server: " + err.Error())
+		}
+		server.sync = service
 	}
 	server.routes()
 	return server
@@ -143,6 +157,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+base+"/attachments/uploads", s.handleUploadStart)
 	s.mux.HandleFunc("POST "+base+"/attachments/uploads/{id}", s.handleUploadFinish)
 	s.mux.HandleFunc("GET "+base+"/events", s.handleEvents)
+	if s.sync != nil {
+		s.mux.Handle("POST /webhooks/{key}", s.sync.webhook)
+		s.mux.HandleFunc("GET "+base+"/sync/entries", s.handleSyncEntries)
+		s.mux.HandleFunc("GET "+base+"/sync/status", s.handleSyncStatus)
+		s.mux.HandleFunc("GET "+base+"/sync/inbox", s.handleSyncInbox)
+		s.mux.HandleFunc("POST "+base+"/sync/inbox/{id}/retry", s.handleSyncRetryInbox)
+		s.mux.HandleFunc("GET "+base+"/sync/outbox/failures", s.handleSyncFailures)
+		s.mux.HandleFunc("POST "+base+"/sync/outbox/{id}/retry", s.handleSyncRetryOutbox)
+		s.mux.HandleFunc("GET "+base+"/sync/threads", s.handleSyncThreads)
+		s.mux.HandleFunc("POST "+base+"/sync/threads", s.handleSyncAttach)
+	}
 	// Anything else answers the board's own error shape.
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeNotFound, "no such route"))

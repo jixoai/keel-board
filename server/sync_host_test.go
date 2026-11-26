@@ -382,3 +382,79 @@ func TestSyncHostRecordsFailure(t *testing.T) {
 }
 
 func uint64Ptr(value uint64) *uint64 { return &value }
+
+func TestSyncHostReceiptIDigestIgnoresFiles(t *testing.T) {
+	board, _, host := newSyncHost(t)
+	ctx := t.Context()
+	root := hBoardRoot(t, board, "t1", "support", "root")
+	external := boardsync.ThreadRef{Key: "slack", Platform: "slack", Channel: "C1", Thread: "C1:1"}
+	message := &boardsync.Message{ID: root, Thread: root, Channel: "support"}
+	if err := host.Record(ctx, boardsync.BoardEvent{
+		Tenant: "t1", Type: boardsync.BoardMessageSynced, Thread: root,
+		Message: message, External: &external, ExternalMessage: "m1",
+		Files: []string{"f1"}, FilesSet: true,
+	}); err != nil {
+		t.Fatalf("first receipt: %v", err)
+	}
+	// The retry has no files; the digest is the same fact, so it replays and
+	// keeps what landed.
+	if err := host.Record(ctx, boardsync.BoardEvent{
+		Tenant: "t1", Type: boardsync.BoardMessageSynced, Thread: root,
+		Message: message, External: &external, ExternalMessage: "m1",
+	}); err != nil {
+		t.Fatalf("retry receipt: %v", err)
+	}
+	if err := host.Record(ctx, boardsync.BoardEvent{
+		Tenant: "t1", Type: boardsync.BoardMessageFilesSynced, Thread: root,
+		Message: message, External: &external, Files: []string{"f1", "f2"}, FilesSet: true,
+	}); err != nil {
+		t.Fatalf("files receipt: %v", err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		state := snapshot.Message(root).Sync
+		if state == nil || len(state.Copies) != 1 {
+			t.Fatalf("copies = %+v", state)
+		}
+		if !state.Copies[0].FilesSet || len(state.Copies[0].Files) != 2 {
+			t.Fatalf("files = %+v", state.Copies[0])
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func hBoardRoot(t *testing.T, board *log.Board, tenant, channel, text string) uint64 {
+	t.Helper()
+	var id uint64
+	if err := board.Update(t.Context(), tenant, log.UpdateOptions{}, func(tx *log.Tx) error {
+		id = tx.NextID(0)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: channel, Text: text, Thread: log.ThreadKey(id),
+			Labels: map[string]string{},
+			By:     protocol.Author{Actor: "local:user:ada", Principal: "local:user:ada"},
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestSyncHostThreadReceiptIgnoresCause(t *testing.T) {
+	board, store, host := newSyncHost(t)
+	ctx := t.Context()
+	root := hBoardRoot(t, board, "t1", "support", "root")
+	target := boardsync.ThreadRef{Key: "slack", Platform: "slack", Channel: "C1"}
+	for _, cause := range []string{"config", "attach"} {
+		if err := host.Record(ctx, boardsync.BoardEvent{
+			Tenant: "t1", Type: boardsync.BoardThreadSynced, Thread: root, Target: &target, Cause: cause,
+		}); err != nil {
+			t.Fatalf("record %s: %v", cause, err)
+		}
+	}
+	depth, err := store.OutboxDepth(ctx, "t1")
+	if err != nil || depth.Pending != 1 {
+		t.Fatalf("outbox depth = %+v, %v", depth, err)
+	}
+}
