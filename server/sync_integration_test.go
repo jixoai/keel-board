@@ -43,6 +43,9 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 	store, err := syncstore.NewMemory(syncstore.Config{
 		InboundRetry:  boardsync.RetryPolicy{MaxAttempts: 2, BaseDelay: 0, MaxDelay: 0, Jitter: 0},
 		OutboundRetry: boardsync.RetryPolicy{MaxAttempts: 2, BaseDelay: 0, MaxDelay: 0, Jitter: 0},
+		// A stopped worker's lease must expire quickly in a test; production
+		// uses the one-minute default this overrides.
+		LeaseTTL: 200 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("new memory store: %v", err)
@@ -605,6 +608,12 @@ func TestSyncRestartRecoversPendingDelivery(t *testing.T) {
 	h := newSyncHarness(t, syncHarnessOptions{startWorkers: true})
 	root := h.postMessage(map[string]any{"channel": "support", "text": "before restart"})
 	h.waitPosts(1)
+	// Let the worker finish its receipt and ack before the simulated crash;
+	// otherwise the stop leaves a live lease that must expire first.
+	waitFor(t, func() bool {
+		depth, err := h.store.OutboxDepth(t.Context(), "t1")
+		return err == nil && depth.Done >= 1 && depth.Leased == 0
+	})
 	h.stopWorkers()
 	// A reply lands while nothing runs; the subscription's durable cursor and
 	// the outbox's pending row must deliver it after a restart.
