@@ -27,8 +27,9 @@ worker daemon, and no live platform credential.
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery | Skeleton; comment payloads without an issue object, links, reaction removal are open |
 | `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
-| `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies, failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested; server route wiring and board-event subscription are pending |
-| Production engine: subscription, backfill, files, typing, permissions, key ownership | Not in this phase; the seams are defined below |
+| `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies (with file IDs), failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested |
+| `server` sync wiring: `POST /webhooks/{key}`, board-event subscription, thread attach/backfill, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
+| Production engine gaps: file bytes, typing, cross-process lease for key ownership, full lifecycle reconciliation | Seams in place; listed under Open items |
 
 The upstream pin keeps all sync code in `packages/board/src/sync/`; the
 `src/sync-slack/`, `src/sync-github/`, `src/sync-linear/`, and
@@ -542,6 +543,59 @@ tenants may both run `slack` with different providers and credentials. The full
 service still needs a lease or registration for cross-process ownership, as
 upstream's deployment ownership does.
 
+### Server wiring in this repository
+
+`server.SyncOptions` mounts sync on a board server:
+
+* `Store` and `Registry` are the process's durable state and connections.
+* `Tenant` resolves the board a webhook belongs to and **must** come from the
+  deployment's authentication (a fixed tenant or a verified token), never from
+  a header the platform can set.
+* `Owned` lists the `(tenant, key)` connections whose workers and subscription
+  this process runs. A key is owned by one process. The webhook handler answers
+  200 for a key the tenant doesn't own or has disabled (before reading the
+  body), 503 for an enabled key this process hasn't registered yet, and 500 for
+  a platform mismatch; only the owning process should mount the route.
+* `StartChannels` lists the platform channels a new board root may start a
+  thread in; the entry's own `Mirror`/`Channels` route still decides.
+* `FileHosts` is the inbound file/link host allowlist. Empty refuses every URL;
+  the board never fetches one.
+
+Routes:
+
+| Route | Purpose |
+| --- | --- |
+| `POST /webhooks/{key}` | `syncstore.WebhookHandler`: tenant, entry, gate, store-before-ack |
+| `GET /v1/board/sync/entries` | connections, enabled/owned, no secrets |
+| `GET /v1/board/sync/status` | per-key inbox depth and the tenant's outbox depth |
+| `GET /v1/board/sync/inbox?key=` | dead-lettered inbound events (IDs, thread, attempts) |
+| `GET /v1/board/sync/outbox/failures?key=` | dead deliveries (message, target, attempts, error class) |
+| `POST /v1/board/sync/inbox/{id}/retry?key=` | retry a dead inbound event |
+| `POST /v1/board/sync/outbox/{id}/retry` | retry a dead delivery |
+| `GET /v1/board/sync/threads?thread=` | a board thread's attachment rows |
+| `POST /v1/board/sync/threads` | attach `{key, thread, target}`; a channel target posts the root and backfills, a thread target receives only future messages |
+
+Every management route needs `manage` at `*`; the attach route also needs
+`read` on the board thread's channel. Another tenant's thread, a missing one,
+and one the caller can't read all answer 404. Management views carry no
+platform credential (the store holds none), no message text and no raw
+payload.
+
+The subscription follows each owned key's durable `board-events` cursor,
+delivers only `message.posted/edited/deleted`, `reaction.added/removed`, and
+`labels.changed`, and skips every receipt (`thread.synced`,
+`message.synced`, `message.files_synced`, `message.sync_failed`). A first start
+begins at the current head, not at seq 1: a deployment does not dump a board's
+history into platforms. A channel target's root delivery and its reply
+backfill are enqueued from `Host.Record` (the receipt is the trigger), so a
+restart resumes both through the durable outbox.
+
+`cmd/board` enables sync only with an explicit `--sync-key key=platform`,
+`--sync-mirror key=platformChannel:boardChannel`, and (optionally)
+`--sync-start`. Credentials come from `KEEL_SYNC_<KEY>_*` environment
+variables. One process must own each key; a second process serving the same
+DSN must not be given the key.
+
 ## Adapters
 
 ### Slack
@@ -921,13 +975,23 @@ Recorded in `docs/PORTING.md` as well:
 ## Open items
 
 * SQLite durable `Inbox`/`Outbox` stores. PostgreSQL and memory are in
-  `syncstore` with the same lease/lane semantics as `MemoryInbox`/`Outbox`;
-  the server's route wiring and board-event subscription are the remaining
-  integration work.
-* A full sync engine: subscription, target backfill, `undelivered`
-  projection, key ownership, and `syncedHere`.
-* Files both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
-  attachments), typing, and on-demand source reads/joins.
+  `syncstore` with the same lease/lane semantics as `MemoryInbox`/`Outbox`.
+* File bytes both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
+  attachments). Inbound files are safe metadata only: size, scheme, and host
+  are checked, `FetchMetadata` is dropped, and no URL is fetched. Outbound
+  attachments are listed on the message but not uploaded.
+* Typing status, and link snapshots (a safe link URL is kept; the snapshot is
+  not).
+* Cross-process key ownership: `Owned` is explicit configuration, not a lease.
+  A second process must not be configured with the same key.
+* Full lifecycle reconciliation: labels and a reply are imported, and a root
+  can be created, but `Owns` prefixes, review conversations, and issue moves
+  are not reconciled.
+* Slack reaction parent-thread lookup: the adapter anchors a reaction at
+  `channel:item.ts`; `Host.Import` falls back to the single copy for that
+  external message, but a message copied to several targets is ambiguous.
+* Management `clear`: retrying a dead letter is implemented; clearing its
+  history is not. `syncedHere` is not projected.
 * Full Slack mrkdwn ↔ Markdown conversion and sender/avatar/scope checks.
 * GitHub reaction removal (needs a reaction ID lookup), review-thread
   conversation resolution, and review-comment URLs from the board.
