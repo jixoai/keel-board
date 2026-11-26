@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/sync/slack"
@@ -171,12 +173,17 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		})
 		_, _ = w.Write(payload)
 	case "/chat.postMessage":
+		text, markdown := r.PostForm.Get("text"), r.PostForm.Get("markdown_text")
+		if code := fakeTextError(text, markdown); code != "" {
+			_, _ = w.Write([]byte(`{"ok":false,"error":"` + code + `"}`))
+			return
+		}
 		channel := r.PostForm.Get("channel")
 		ts := f.nextTS()
 		threadTS := r.PostForm.Get("thread_ts")
 		posted := &fakeMessage{
 			TS: ts, Channel: channel, ThreadTS: threadTS, User: "UAPP123",
-			Text: r.PostForm.Get("text"), Username: r.PostForm.Get("username"),
+			Text: fakeBody(text, markdown), Username: r.PostForm.Get("username"),
 			Reactions: map[string]bool{},
 		}
 		f.messages[channel] = append(f.messages[channel], posted)
@@ -191,8 +198,13 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(`{"ok":false,"error":"message_not_found"}`))
 			return
 		}
+		text, markdown := r.PostForm.Get("text"), r.PostForm.Get("markdown_text")
+		if code := fakeTextError(text, markdown); code != "" {
+			_, _ = w.Write([]byte(`{"ok":false,"error":"` + code + `"}`))
+			return
+		}
 		previous := message.Text
-		message.Text = r.PostForm.Get("text")
+		message.Text = fakeBody(text, markdown)
 		f.emit(map[string]any{
 			"type": "message", "subtype": "message_changed", "channel": message.Channel,
 			"message": map[string]any{
@@ -244,6 +256,11 @@ func (f *fakeSlack) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := json.Unmarshal([]byte(r.PostForm.Get("files")), &refs); err != nil {
 			_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_arguments"}`))
+			return
+		}
+		comment := r.PostForm.Get("initial_comment")
+		if utf8.RuneCountInString(comment) > 12000 {
+			_, _ = w.Write([]byte(`{"ok":false,"error":"text_too_long"}`))
 			return
 		}
 		channel := r.PostForm.Get("channel_id")
@@ -326,6 +343,29 @@ func fakeMessagesJSON(messages []*fakeMessage) []map[string]any {
 		})
 	}
 	return out
+}
+
+// fakeTextError mirrors Slack's text/markdown contract: one of the two, and
+// at most 12000 characters.
+func fakeTextError(text, markdown string) string {
+	if text != "" && markdown != "" {
+		return "markdown_text_conflict"
+	}
+	count := utf8.RuneCountInString(text)
+	if markdown != "" {
+		count = utf8.RuneCountInString(markdown)
+	}
+	if count > 12000 {
+		return "markdown_text_too_long"
+	}
+	return ""
+}
+
+func fakeBody(text, markdown string) string {
+	if markdown != "" {
+		return markdown
+	}
+	return text
 }
 
 func signedEvent(t *testing.T, event map[string]any, eventID string) []byte {
@@ -541,5 +581,36 @@ func TestSlackEndToEnd(t *testing.T) {
 	}
 	if echoes := fake.drainWebhooks(t, p); len(echoes) != 0 {
 		t.Fatalf("own webhooks looped back: %+v", echoes)
+	}
+}
+
+func TestFakeSlackTextContract(t *testing.T) {
+	fake := newFakeSlack(t)
+	post := func(values url.Values) string {
+		response, err := http.PostForm(fake.server.URL+"/chat.postMessage", values)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		var body struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body.OK {
+			return ""
+		}
+		return body.Error
+	}
+	if code := post(url.Values{"channel": {"C0123ABC"}, "text": {"a"}, "markdown_text": {"b"}}); code != "markdown_text_conflict" {
+		t.Fatalf("conflict code = %q", code)
+	}
+	if code := post(url.Values{"channel": {"C0123ABC"}, "markdown_text": {strings.Repeat("x", 12001)}}); code != "markdown_text_too_long" {
+		t.Fatalf("too-long code = %q", code)
+	}
+	if code := post(url.Values{"channel": {"C0123ABC"}, "markdown_text": {strings.Repeat("x", 12000)}}); code != "" {
+		t.Fatalf("12000-char markdown was refused: %q", code)
 	}
 }

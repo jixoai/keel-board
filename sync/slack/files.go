@@ -286,17 +286,18 @@ func humanBytes(size int64) string {
 // download, so a text file with a developer extension gets .txt appended and
 // is previewed. The board keeps the file's own name.
 func uploadFilename(filename, mimeType string) string {
+	filename = cleanText(filename)
 	if filename == "" {
-		return "file"
+		filename = "file"
 	}
-	if !isTextMIME(mimeType) {
-		return filename
+	suffix := ""
+	if isTextMIME(mimeType) {
+		extension := strings.ToLower(strings.TrimPrefix(path.Ext(filename), "."))
+		if !textExtensions[extension] {
+			suffix = ".txt"
+		}
 	}
-	extension := strings.ToLower(strings.TrimPrefix(path.Ext(filename), "."))
-	if textExtensions[extension] {
-		return filename
-	}
-	return filename + ".txt"
+	return truncateRunes(filename, 200-len([]rune(suffix))) + suffix
 }
 
 func isTextMIME(mimeType string) bool {

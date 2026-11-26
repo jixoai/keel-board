@@ -14,7 +14,7 @@ const maxLinksPerMessage = 10
 
 // slackPermalinkSource matches a Slack message permalink anywhere in text.
 // The query is optional and may carry thread_ts.
-const slackPermalinkSource = `https://([a-z0-9][a-z0-9-]*(?:\.enterprise)?\.slack\.com)/archives/([A-Z][A-Z0-9]+)/p([0-9]{10})([0-9]{6})(?:\?([^\s<>|]*))?`
+const slackPermalinkSource = `https://([a-z0-9][a-z0-9-]*(?:\.enterprise)?\.slack\.com)/archives/([CG][A-Z0-9]+)/p([0-9]{10})([0-9]{6})(?:\?([^\s<>|]*))?`
 
 var (
 	slackPermalinkAny  = regexp.MustCompile(slackPermalinkSource)
@@ -95,7 +95,7 @@ func linksOf(key boardsync.Key, text string, attachments []slackAttachment, _ Co
 		identity := found.Channel + ":" + found.TS
 		if at, ok := index[identity]; ok {
 			if links[at].Snapshot == nil && attachment != nil {
-				links[at].Snapshot = snapshotOf(attachment, found)
+				links[at].Snapshot = snapshotOf(key, attachment, found)
 				if links[at].Snapshot != nil {
 					links[at].Available = true
 					links[at].Why = ""
@@ -109,7 +109,7 @@ func linksOf(key boardsync.Key, text string, attachments []slackAttachment, _ Co
 			Message: found.TS,
 		}
 		if attachment != nil {
-			link.Snapshot = snapshotOf(attachment, found)
+			link.Snapshot = snapshotOf(key, attachment, found)
 			if link.Snapshot != nil {
 				link.Available = true
 			}
@@ -178,7 +178,7 @@ func attachmentPermalink(attachment *slackAttachment) (permalink, bool) {
 }
 
 // snapshotOf is what a linked message said when Slack unfurled it.
-func snapshotOf(attachment *slackAttachment, found permalink) *boardsync.LinkSnapshot {
+func snapshotOf(key boardsync.Key, attachment *slackAttachment, found permalink) *boardsync.LinkSnapshot {
 	if attachment == nil {
 		return nil
 	}
@@ -191,7 +191,7 @@ func snapshotOf(attachment *slackAttachment, found permalink) *boardsync.LinkSna
 	}
 	snapshot := &boardsync.LinkSnapshot{
 		Author: boardsync.StorableText(cleanText(author), 256),
-		Text:   boardsync.StorableText(mrkdwnToMarkdown(attachment.Text), 16<<10),
+		Text:   boardsync.StorableText(mrkdwnToMarkdown(key, attachment.Text), 16<<10),
 		Files:  linkFilesOf(attachment.Files),
 	}
 	if at := tsToTime(attachment.TS); !at.IsZero() {

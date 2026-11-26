@@ -160,7 +160,7 @@ func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cf
 		rootTS = event.TS
 	}
 	thread := event.Channel + ":" + rootTS
-	text := mrkdwnToMarkdown(event.Text)
+	text := mrkdwnToMarkdown(key, event.Text)
 	if isOwnText(text, key) {
 		return boardsync.Record{}, false, nil
 	}
@@ -183,7 +183,7 @@ func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cf
 			Message: event.TS,
 			IsRoot:  event.ThreadTS == "" || event.ThreadTS == event.TS,
 			Text:    boardsync.StorableText(text, boardsync.MaxTextBytes),
-			Author:  authorOf(event.User, event.BotID),
+			Author:  authorOf(key, event.User, event.BotID),
 			Files:   files,
 			Links:   links,
 		},
@@ -226,7 +226,7 @@ func normalizeEdited(key boardsync.Key, occurrence string, event slackEvent, cfg
 		rootTS = message.TS
 	}
 	thread := message.Channel + ":" + rootTS
-	text := mrkdwnToMarkdown(message.Text)
+	text := mrkdwnToMarkdown(key, message.Text)
 	if isOwnText(text, key) {
 		return boardsync.Record{}, false, nil
 	}
@@ -260,7 +260,7 @@ func normalizeEdited(key boardsync.Key, occurrence string, event slackEvent, cfg
 			Message: message.TS,
 			IsRoot:  rootTS == message.TS,
 			Text:    boardsync.StorableText(text, boardsync.MaxTextBytes),
-			Author:  authorOf(message.User, message.BotID),
+			Author:  authorOf(key, message.User, message.BotID),
 			Links:   links,
 		},
 	}
@@ -322,7 +322,7 @@ func normalizeDeleted(key boardsync.Key, occurrence string, event slackEvent, cf
 			Key: key, Platform: "slack",
 			Kind: boardsync.KindDeleted, Type: boardsync.TypeMessageDeleted,
 			Channel: channel, Thread: thread, Message: ts,
-			Author: authorOf(user, botID),
+			Author: authorOf(key, user, botID),
 		},
 	}
 	return record, true, nil
@@ -369,7 +369,7 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 			Key: key, Platform: "slack",
 			Kind: boardsync.KindReaction, Type: typeName,
 			Channel: channel, Thread: thread, Message: event.Item.TS,
-			Emoji: emoji, Added: added, Author: authorOf(event.User, ""),
+			Emoji: emoji, Added: added, Author: authorOf(key, event.User, ""),
 		},
 	}
 	return record, true, nil
@@ -396,7 +396,7 @@ func isOwnText(text string, key boardsync.Key) bool {
 	return text != "" && boardsync.IsOwnMarker(text, key)
 }
 
-func authorOf(user, botID string) boardsync.Author {
+func authorOf(key boardsync.Key, user, botID string) boardsync.Author {
 	if user == "" {
 		user = botID
 	}
@@ -404,7 +404,7 @@ func authorOf(user, botID string) boardsync.Author {
 		return boardsync.Author{}
 	}
 	return boardsync.Author{
-		ID: "slack:user:" + user, Handle: user, Name: user,
+		ID: string(key) + ":user:" + user, Handle: user, Name: user,
 		Bot: botID != "",
 	}
 }
@@ -488,9 +488,13 @@ var (
 // Slack's HTML escapes, user mentions, channel mentions, links, and
 // broadcasts. Slack's *bold*, _italic_, and ~strike~ are left as written;
 // a full converter belongs in the adapter, not in the board.
-func mrkdwnToMarkdown(text string) string {
-	text = html.UnescapeString(text)
-	text = userMention.ReplaceAllString(text, "@[slack:user:$1]")
+func mrkdwnToMarkdown(key boardsync.Key, text string) string {
+	// Parse Slack's real markup first, then unescape what is left. Unescaping
+	// first would turn an escaped &lt;!channel&gt; inside code into a mention.
+	text = userMention.ReplaceAllStringFunc(text, func(match string) string {
+		parts := userMention.FindStringSubmatch(match)
+		return "@[" + string(key) + ":user:" + parts[1] + "]"
+	})
 	text = channelMention.ReplaceAllStringFunc(text, func(match string) string {
 		parts := channelMention.FindStringSubmatch(match)
 		if len(parts) > 2 && parts[2] != "" {
@@ -506,6 +510,7 @@ func mrkdwnToMarkdown(text string) string {
 		return parts[1]
 	})
 	text = slackBroadcast.ReplaceAllString(text, "@$1")
+	text = html.UnescapeString(text)
 	return cleanText(strings.TrimSpace(text))
 }
 

@@ -71,7 +71,7 @@ func TestExternalTextIsInert(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			text := got.Get("text")
+			text := formBody(got)
 			for _, want := range tc.want {
 				if !strings.Contains(text, want) {
 					t.Fatalf("text = %q, missing %q", text, want)
@@ -101,7 +101,7 @@ func TestFileNamesAreInert(t *testing.T) {
 	if posted.Files == nil || len(posted.Files) != 0 {
 		t.Fatalf("posted = %+v", posted)
 	}
-	text := got.Get("text")
+	text := formBody(got)
 	if !strings.Contains(text, "&lt;@U999&gt; &lt;!channel&gt;") {
 		t.Fatalf("text = %q", text)
 	}
@@ -211,8 +211,8 @@ func TestFileFailureEditsNotes(t *testing.T) {
 			if cap.posts.Load() != 1 || cap.updates.Load() != 1 {
 				t.Fatalf("posts=%d updates=%d", cap.posts.Load(), cap.updates.Load())
 			}
-			if !strings.Contains(cap.update.Get("text"), "📎 a.png") || !strings.Contains(cap.update.Get("text"), "on the board: #812") {
-				t.Fatalf("text = %q", cap.update.Get("text"))
+			if !strings.Contains(formBody(cap.update), "📎 a.png") || !strings.Contains(formBody(cap.update), "on the board: #812") {
+				t.Fatalf("text = %q", formBody(cap.update))
 			}
 		})
 	}
@@ -332,8 +332,8 @@ func TestFileCompleteFailureDegrades(t *testing.T) {
 	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || cap.deletes.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
 		t.Fatalf("posts=%d updates=%d deletes=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), cap.deletes.Load(), posted)
 	}
-	if !strings.Contains(cap.update.Get("text"), "📎 a.png") {
-		t.Fatalf("text = %q", cap.update.Get("text"))
+	if !strings.Contains(formBody(cap.update), "📎 a.png") {
+		t.Fatalf("text = %q", formBody(cap.update))
 	}
 }
 
@@ -426,8 +426,8 @@ func TestTextThenFilesFailureIsPartialSuccess(t *testing.T) {
 	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
 		t.Fatalf("posts=%d updates=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), posted)
 	}
-	if !strings.Contains(cap.update.Get("text"), "📎 a.png") || !strings.Contains(cap.update.Get("text"), "on the board: #812") {
-		t.Fatalf("text = %q", cap.update.Get("text"))
+	if !strings.Contains(formBody(cap.update), "📎 a.png") || !strings.Contains(formBody(cap.update), "on the board: #812") {
+		t.Fatalf("text = %q", formBody(cap.update))
 	}
 }
 

@@ -113,7 +113,7 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 		messages = messages[:limit]
 	}
 	read.More = more
-	read.Messages = sourceMessages(resolved.Channel, messages, p.cfg)
+	read.Messages = sourceMessages(key, resolved.Channel, messages, p.cfg)
 	return read, nil
 }
 
@@ -177,7 +177,7 @@ func readableChannel(info Channel) error {
 	}
 }
 
-func sourceMessages(channel string, messages []slackMessage, cfg Config) []SourceMessage {
+func sourceMessages(key boardsync.Key, channel string, messages []slackMessage, cfg Config) []SourceMessage {
 	out := make([]SourceMessage, 0, len(messages))
 	for _, message := range messages {
 		if message.TS == "" {
@@ -199,9 +199,9 @@ func sourceMessages(channel string, messages []slackMessage, cfg Config) []Sourc
 		}
 		authorID := ""
 		if message.User != "" {
-			authorID = "slack:user:" + message.User
+			authorID = string(key) + ":user:" + message.User
 		} else if message.BotID != "" {
-			authorID = "slack:user:" + message.BotID
+			authorID = string(key) + ":user:" + message.BotID
 		}
 		created := ""
 		if at := tsToTime(message.TS); !at.IsZero() {
@@ -212,7 +212,7 @@ func sourceMessages(channel string, messages []slackMessage, cfg Config) []Sourc
 			Thread:    channel + ":" + rootTS,
 			Author:    boardsync.StorableText(cleanText(author), 256),
 			AuthorID:  authorID,
-			Text:      boardsync.StorableText(mrkdwnToMarkdown(message.Text), boardsync.MaxTextBytes),
+			Text:      boardsync.StorableText(mrkdwnToMarkdown(key, message.Text), boardsync.MaxTextBytes),
 			CreatedAt: created,
 			Replies:   message.ReplyCount,
 			Files:     filesOf(message.Files, cfg),

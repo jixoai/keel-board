@@ -48,6 +48,9 @@ type Config struct {
 	MaxFileBytes int64
 	// Sleep is the wait between upload retries. Tests replace it.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Logf receives operational warnings that carry no token or message body
+	// (a failed note edit, a failed orphan cleanup). Nil disables logging.
+	Logf func(format string, args ...any)
 	// JoinChannels opts in to conversations.join for source reads. It is off
 	// by default: joining announces the app in a channel and Slack starts
 	// sending its events.
@@ -232,11 +235,6 @@ var fileRefusals = map[string]bool{
 	"file_uploads_disabled":               true,
 	"file_uploads_except_images_disabled": true,
 	"file_upload_size_restricted":         true,
-}
-
-// isFileRefusal reports whether err is Slack refusing files.
-func isFileRefusal(err error) bool {
-	return errors.Is(err, ErrFileRefused)
 }
 
 // request posts a form to one Slack method and decodes the response.
@@ -425,9 +423,12 @@ func (c *Client) PostMessage(ctx context.Context, req PostMessageRequest) (strin
 	}
 	form := url.Values{
 		"channel":      {req.Channel},
-		"text":         {req.Text},
 		"unfurl_links": {"false"},
 		"unfurl_media": {"false"},
+	}
+	// Slack accepts text or markdown_text, not both (markdown_text_conflict).
+	if req.Text != "" {
+		form.Set("text", req.Text)
 	}
 	if req.MarkdownText != "" {
 		form.Set("markdown_text", req.MarkdownText)
@@ -459,7 +460,14 @@ func (c *Client) UpdateMessage(ctx context.Context, channel, ts, text, markdown 
 	if channel == "" || ts == "" {
 		return fmt.Errorf("%w: slack update needs a channel and ts", boardsync.ErrBadRequest)
 	}
-	form := url.Values{"channel": {channel}, "ts": {ts}, "text": {text}}
+	if text == "" && markdown == "" {
+		return fmt.Errorf("%w: slack update has no text", boardsync.ErrBadRequest)
+	}
+	form := url.Values{"channel": {channel}, "ts": {ts}}
+	// Slack accepts text or markdown_text, not both (markdown_text_conflict).
+	if text != "" {
+		form.Set("text", text)
+	}
 	if markdown != "" {
 		form.Set("markdown_text", markdown)
 	}

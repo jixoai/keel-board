@@ -178,9 +178,9 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 }
 
 // Post posts a message. A channel target starts a thread; a thread target
-// replies in it. A message with files goes as one upload (Slack cannot set a
-// sender name on an upload), and a file Slack refuses becomes a line in the
-// text instead of losing the message.
+// replies in it. A message with files posts its text first, then uploads the
+// files into the same thread, so the receipt is always a real text ts. A file
+// that fails becomes a line in the text instead of losing the message.
 func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync.ResolvedTarget, msg boardsync.OutboundMessage) (boardsync.Posted, error) {
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return boardsync.Posted{}, fmt.Errorf("%w: entry %q isn't this slack app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
@@ -239,24 +239,31 @@ func (p *Provider) postTextThenFiles(ctx context.Context, channel, threadTS, raw
 	}
 	ids, err := p.uploadFiles(ctx, channel, uploadThread, "", plan.files)
 	if err != nil {
-		fallback := append(notes, failureNotes(plan.files, msg.BoardMessage, err)...)
+		// Do not repeat the attachment list the successful text already
+		// carries when the message had no text of its own.
+		fallback := append([]string{}, plan.notes...)
+		fallback = append(fallback, failureNotes(plan.files, msg.BoardMessage, err)...)
 		label := ""
 		if named && msg.Sender != nil {
 			label = cleanText(msg.Sender.Name)
 		}
 		body := p.renderBody(rawText, fallback, msg.External, key, label)
-		markdown := body
-		if msg.External {
-			markdown = ""
-		}
 		// The text is the receipt; a note edit that fails must not make the
 		// delivery retry and post the text again.
-		_ = p.client.UpdateMessage(ctx, channel, ts, body, markdown)
+		if updateErr := p.updateMessage(ctx, channel, ts, body, msg.External); updateErr != nil {
+			p.logf("slack: couldn't add file notes to message %s: %v", ts, updateErr)
+		}
 		return p.posted(channel, threadTS, ts, true), nil
 	}
 	posted := p.posted(channel, threadTS, ts, true)
 	posted.Files = ids
 	return posted, nil
+}
+
+func (p *Provider) logf(format string, args ...any) {
+	if p.cfg.Logf != nil {
+		p.cfg.Logf(format, args...)
+	}
 }
 
 func (p *Provider) posted(channel, threadTS, ts string, hadFiles bool) boardsync.Posted {
@@ -291,10 +298,11 @@ func (p *Provider) postText(ctx context.Context, channel, threadTS, rawText stri
 	if strings.TrimSpace(body) == "" {
 		return "", false, fmt.Errorf("%w: slack message has no text", boardsync.ErrBadRequest)
 	}
-	request.Text = body
-	if !external {
-		// External text is sent as escaped plain text only: Slack's markdown
-		// field must not get a second chance to revive its control syntax.
+	if external {
+		// External text is escaped plain text only: Slack's markdown field
+		// must not get a second chance to revive its control syntax.
+		request.Text = body
+	} else {
 		request.MarkdownText = body
 	}
 	ts, err := p.client.PostMessage(ctx, request)
@@ -310,13 +318,24 @@ func (p *Provider) postText(ctx context.Context, channel, threadTS, rawText stri
 	request.Username = ""
 	request.IconURL = ""
 	body = p.renderBody(rawText, notes, external, key, "")
-	request.Text = body
+	request.Text = ""
 	request.MarkdownText = ""
-	if !external {
+	if external {
+		request.Text = body
+	} else {
 		request.MarkdownText = body
 	}
 	ts, err = p.client.PostMessage(ctx, request)
 	return ts, false, err
+}
+
+// updateMessage sends exactly one text representation: escaped plain text
+// for external content, markdown_text for board content.
+func (p *Provider) updateMessage(ctx context.Context, channel, ts, body string, external bool) error {
+	if external {
+		return p.client.UpdateMessage(ctx, channel, ts, body, "")
+	}
+	return p.client.UpdateMessage(ctx, channel, ts, "", body)
 }
 
 // Edit replaces a delivered message's text. The label stays unless the
@@ -340,11 +359,7 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 	if strings.TrimSpace(body) == "" {
 		return fmt.Errorf("%w: slack edit has no text after its label", boardsync.ErrBadRequest)
 	}
-	markdown := body
-	if msg.External {
-		markdown = ""
-	}
-	return p.client.UpdateMessage(ctx, channel, ts, body, markdown)
+	return p.updateMessage(ctx, channel, ts, body, msg.External)
 }
 
 // Delete deletes a delivered message.
@@ -405,7 +420,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 		if message.TS != ts {
 			continue
 		}
-		text := mrkdwnToMarkdown(message.Text)
+		text := mrkdwnToMarkdown(key, message.Text)
 		if text == "" && len(message.Files) > 0 {
 			names := make([]string, 0, len(message.Files))
 			for _, file := range message.Files {
@@ -415,7 +430,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 		}
 		root := &boardsync.RootDraft{
 			Text:   boardsync.StorableText(text, boardsync.MaxTextBytes),
-			Author: authorOf(message.User, message.BotID),
+			Author: authorOf(key, message.User, message.BotID),
 		}
 		if raw, err := json.Marshal(message); err == nil {
 			root.Raw = raw

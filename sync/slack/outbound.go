@@ -14,8 +14,10 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
-// maxOutboundText is Slack's message text bound, with room for markup.
-const maxOutboundText = 39000
+// maxSlackText is Slack's per-message text bound, in characters (runes), not
+// bytes. A longer message is cut on a rune boundary without splitting a
+// mention or an escaped entity.
+const maxSlackText = 12000
 
 // customizeScope lets an app set a message's username and icon.
 const customizeScope = "chat:write.customize"
@@ -23,7 +25,30 @@ const customizeScope = "chat:write.customize"
 // outboundText clamps a message to what Slack accepts and strips control
 // characters the board may have carried from another platform.
 func outboundText(markdown string) string {
-	return boardsync.StorableText(cleanText(markdown), maxOutboundText)
+	return truncateSlackText(cleanText(markdown), maxSlackText)
+}
+
+// truncateSlackText cuts text to Slack's character limit. It backs off an
+// incomplete mention (<@U…>), board mention (@[key:user:U…]), or entity
+// (&…;) at the cut, so the visible tail is never half a token.
+func truncateSlackText(text string, max int) string {
+	runes := []rune(text)
+	if len(runes) <= max {
+		return text
+	}
+	cut := string(runes[:max])
+	for _, token := range []struct{ open, close string }{
+		{"@[", "]"}, {"<", ">"}, {"&", ";"},
+	} {
+		at := strings.LastIndex(cut, token.open)
+		if at < 0 {
+			continue
+		}
+		if !strings.Contains(cut[at+len(token.open):], token.close) {
+			cut = cut[:at]
+		}
+	}
+	return cut
 }
 
 // slackControlEscaper neutralizes Slack's control markup: a cross-platform
@@ -59,7 +84,7 @@ func (p *Provider) renderBody(rawText string, notes []string, external bool, key
 			text += "\n\n" + escaped
 		}
 	}
-	return boardsync.StorableText(text, maxOutboundText)
+	return truncateSlackText(text, maxSlackText)
 }
 
 // restoreMentions turns the board's explicit mention token for this entry

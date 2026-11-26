@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -93,21 +92,6 @@ func isSlackUserID(id string) bool {
 		}
 	}
 	return true
-}
-
-// slackMention renders a board mention of a Slack user as `<@U0456>`. Only an
-// ID is enough; anything else stays text, so a mention can't close and open
-// Slack markup.
-func slackMention(actor string) (string, bool) {
-	const prefix = "slack:user:"
-	if !strings.HasPrefix(actor, prefix) {
-		return "", false
-	}
-	id := strings.TrimPrefix(actor, prefix)
-	if !isSlackUserID(id) {
-		return "", false
-	}
-	return "<@" + id + ">", true
 }
 
 var errMalformed = fmt.Errorf("%w: malformed slack payload", boardsync.ErrBadRequest)

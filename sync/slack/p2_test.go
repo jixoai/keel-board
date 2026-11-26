@@ -283,8 +283,8 @@ func TestEscapedTextIsClampedAfterEscaping(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Get("text")) > 39000 {
-		t.Fatalf("text is %d bytes after escaping", len(got.Get("text")))
+	if len([]rune(got.Get("text"))) > 12000 {
+		t.Fatalf("text is %d runes after escaping", len([]rune(got.Get("text"))))
 	}
 }
 
@@ -300,8 +300,8 @@ func TestFileNameIsBounded(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	text := got.Get("text")
-	if len(text) > 1000 || strings.Contains(text, name) {
+	text := formBody(got)
+	if len(text) > 2000 || strings.Contains(text, name) {
 		t.Fatalf("file name was not bounded: %d bytes", len(text))
 	}
 }
@@ -417,5 +417,144 @@ func TestFetchRootCleansFileNames(t *testing.T) {
 	}
 	if strings.ContainsRune(root.Text, 0) || root.Text != "📎 ab.txt" {
 		t.Fatalf("root text = %q", root.Text)
+	}
+}
+
+func TestReceiveEscapedMarkupStaysLiteral(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+		bad  string
+	}{
+		{"broadcast", "&lt;!channel&gt;", "<!channel>", "@channel"},
+		{"mention", "&lt;@U0456ABC&gt;", "<@U0456ABC>", "@[slack:user:"},
+		{"link", "&lt;https://example.com|label&gt;", "<https://example.com|label>", "[label](https://example.com)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			if err := json.Unmarshal(fixture(t, "message.json"), &body); err != nil {
+				t.Fatal(err)
+			}
+			body["event"].(map[string]any)["text"] = tc.text
+			data, _ := json.Marshal(body)
+			text := receive(t, provider(t), data).Records[0].Event.Text
+			if text != tc.want {
+				t.Fatalf("text = %q, want %q", text, tc.want)
+			}
+			if strings.Contains(text, tc.bad) {
+				t.Fatalf("escaped markup was revived: %q", text)
+			}
+		})
+	}
+}
+
+func TestMentionNamespaceFollowsEntryKey(t *testing.T) {
+	p, err := slack.New(slack.Config{
+		Key: "support-slack", SigningSecret: testSecret, BotToken: testToken,
+		BotUserID: "UAPP123", Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(fixture(t, "message.json"), &body); err != nil {
+		t.Fatal(err)
+	}
+	body["event"].(map[string]any)["text"] = "hi <@U0999XYZ>"
+	data, _ := json.Marshal(body)
+	intake, err := p.Receive(context.Background(), "support-slack", signedRequest(t, data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := intake.Records[0].Event
+	if event.Author.ID != "support-slack:user:U0456ABC" || !strings.Contains(event.Text, "@[support-slack:user:U0999XYZ]") {
+		t.Fatalf("event = %+v", event)
+	}
+	if strings.Contains(event.Text, "@[slack:user:") {
+		t.Fatalf("hardcoded platform namespace: %q", event.Text)
+	}
+
+	var got url.Values
+	server := capturePostServer(t, &got)
+	defer server.Close()
+	out, err := slack.New(slack.Config{
+		Key: "support-slack", SigningSecret: testSecret, BotToken: testToken,
+		BotUserID: "UAPP123", APIBaseURL: server.URL, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := out.Post(context.Background(), "support-slack", boardsync.ResolvedTarget{
+		Key: "support-slack", Platform: "slack", Channel: "C0123ABC", Kind: boardsync.TargetChannel,
+	}, boardsync.OutboundMessage{
+		Markdown: "@[support-slack:user:U0456ABC] and @[slack:user:U0999XYZ]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	bodyText := formBody(got)
+	if !strings.Contains(bodyText, "<@U0456ABC>") || strings.Contains(bodyText, "<@U0999XYZ>") {
+		t.Fatalf("mention namespace leaked: %q", bodyText)
+	}
+}
+
+func TestUploadFilenameCleanedAndBounded(t *testing.T) {
+	var filename string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
+		case "/files.getUploadURLExternal":
+			_ = r.ParseForm()
+			filename = r.PostForm.Get("filename")
+			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
+		case "/upload/v1/abc":
+			_, _ = w.Write([]byte(`OK`))
+		case "/files.completeUploadExternal":
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, nil)
+	name := "a\u0000b" + strings.Repeat("x", 600)
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Markdown: "file",
+		Files:    []boardsync.OutboundFile{{Data: []byte("x"), Filename: name, MIMEType: "text/plain"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(filename, 0) || len([]rune(filename)) > 204 || !strings.HasSuffix(filename, ".txt") {
+		t.Fatalf("filename = %q", filename)
+	}
+}
+
+func TestFileFailureDoesNotRepeatAttachmentLine(t *testing.T) {
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
+		if r.URL.Path != "/files.getUploadURLExternal" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusForbidden)
+	})
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Files: []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	body := formBody(cap.update)
+	if got := strings.Count(body, "📎 a.png"); got != 1 {
+		t.Fatalf("attachment line appears %d times: %q", got, body)
+	}
+}
+
+func TestLocateRejectsDMPermalink(t *testing.T) {
+	p := newProvider(t, "http://127.0.0.1:1", nil, nil)
+	if _, _, ok := p.Locate("https://acme.slack.com/archives/D0123ABC/p1727000000123456"); ok {
+		t.Fatal("Locate accepted a DM permalink")
+	}
+	if _, err := p.ResolveTarget(context.Background(), "slack", "https://acme.slack.com/archives/D0123ABC/p1727000000123456"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("ResolveTarget = %v", err)
 	}
 }

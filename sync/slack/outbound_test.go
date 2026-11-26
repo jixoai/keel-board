@@ -16,6 +16,15 @@ import (
 	"github.com/jixoai/keel-board/sync/slack"
 )
 
+// formBody is the one text representation a Slack call carries: markdown_text
+// for board content, text for external content.
+func formBody(form url.Values) string {
+	if markdown := form.Get("markdown_text"); markdown != "" {
+		return markdown
+	}
+	return form.Get("text")
+}
+
 func newProvider(t *testing.T, baseURL string, client *http.Client, mutate func(*slack.Config)) *slack.Provider {
 	t.Helper()
 	cfg := slack.Config{
@@ -72,8 +81,8 @@ func TestPostCustomizeDegradesWithoutScope(t *testing.T) {
 	if got.Get("username") != "" || got.Get("icon_url") != "" {
 		t.Fatalf("customized without the scope: %v", got)
 	}
-	if got.Get("text") != "**Ada**: ship it" {
-		t.Fatalf("label was dropped without a sender: %q", got.Get("text"))
+	if formBody(got) != "**Ada**: ship it" {
+		t.Fatalf("label was dropped without a sender: %q", formBody(got))
 	}
 }
 
@@ -103,7 +112,7 @@ func TestPostCustomizeRefusalFallsBack(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 2 || last.Get("username") != "" || last.Get("text") != "**Ada**: ship it" {
+	if calls.Load() != 2 || last.Get("username") != "" || formBody(last) != "**Ada**: ship it" {
 		t.Fatalf("calls=%d form=%v", calls.Load(), last)
 	}
 }
@@ -140,8 +149,8 @@ func TestPostCustomizeUsernameAndIcon(t *testing.T) {
 	if !strings.HasSuffix(username, "…: via support") {
 		t.Fatalf("attribution was cut: %q", username)
 	}
-	if strings.HasPrefix(got.Get("text"), "**") {
-		t.Fatalf("label stayed under a named copy: %q", got.Get("text"))
+	if strings.HasPrefix(formBody(got), "**") {
+		t.Fatalf("label stayed under a named copy: %q", formBody(got))
 	}
 }
 
@@ -241,8 +250,8 @@ func TestPostFileRoot(t *testing.T) {
 	if gotUploadAuth != "" {
 		t.Fatalf("an upload URL got the bot token: %q", gotUploadAuth)
 	}
-	if postForm.Get("text") != "see attached" {
-		t.Fatalf("text = %q", postForm.Get("text"))
+	if formBody(postForm) != "see attached" {
+		t.Fatalf("text = %q", formBody(postForm))
 	}
 	// Files follow the text in its thread; the receipt is the text message.
 	if completeForm.Get("channel_id") != "C0123ABC" || completeForm.Get("thread_ts") != "1727000009.000100" {
@@ -347,11 +356,11 @@ func TestPostFileRefusedFallsBackToText(t *testing.T) {
 	if posted.Message != "1727000009.000100" {
 		t.Fatalf("posted = %+v", posted)
 	}
-	if postForm.Get("text") != "see attached" {
-		t.Fatalf("initial text = %q", postForm.Get("text"))
+	if formBody(postForm) != "see attached" {
+		t.Fatalf("initial text = %q", formBody(postForm))
 	}
-	if !strings.Contains(updateForm.Get("text"), "📎 a.png") || !strings.Contains(updateForm.Get("text"), "on the board: #812") {
-		t.Fatalf("edited text = %q", updateForm.Get("text"))
+	if !strings.Contains(formBody(updateForm), "📎 a.png") || !strings.Contains(formBody(updateForm), "on the board: #812") {
+		t.Fatalf("edited text = %q", formBody(updateForm))
 	}
 }
 
@@ -368,8 +377,8 @@ func TestPostFileSizeAndCountLimits(t *testing.T) {
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
 		case "/chat.postMessage":
 			_ = r.ParseForm()
-			if r.PostForm.Get("text") == "" || !strings.Contains(r.PostForm.Get("text"), "📎") {
-				t.Fatalf("notes missing from text: %q", r.PostForm.Get("text"))
+			if formBody(r.PostForm) == "" || !strings.Contains(formBody(r.PostForm), "📎") {
+				t.Fatalf("notes missing from text: %q", formBody(r.PostForm))
 			}
 			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
 		default:
@@ -442,8 +451,8 @@ func TestEditLabelFollowsTheDeliveredCopy(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if got.Get("text") != tc.want {
-				t.Fatalf("text = %q, want %q", got.Get("text"), tc.want)
+			if formBody(got) != tc.want {
+				t.Fatalf("text = %q, want %q", formBody(got), tc.want)
 			}
 		})
 	}
