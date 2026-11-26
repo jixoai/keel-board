@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,14 +34,26 @@ func fixture(t *testing.T, name string) []byte {
 
 func request(t *testing.T, body []byte) *boardsync.WebhookRequest {
 	t.Helper()
+	return requestWith(t, body, "delivery-1")
+}
+
+func requestWith(t *testing.T, body []byte, delivery string) *boardsync.WebhookRequest {
+	t.Helper()
 	header := http.Header{}
 	header.Set(linear.SignatureHeader, linear.Sign([]byte(testSecret), body))
-	header.Set(linear.DeliveryHeader, "delivery-1")
+	if delivery != "" {
+		header.Set(linear.DeliveryHeader, delivery)
+	}
 	header.Set("Content-Type", "application/json")
 	return &boardsync.WebhookRequest{Method: http.MethodPost, Path: "/webhooks/linear", Header: header, Body: body}
 }
 
 func newProvider(t *testing.T, api string) *linear.Provider {
+	t.Helper()
+	return newProviderWith(t, api, nil)
+}
+
+func newProviderWith(t *testing.T, api string, mutate func(*linear.Config)) *linear.Provider {
 	t.Helper()
 	cfg := linear.Config{
 		Key:           "linear",
@@ -51,6 +64,9 @@ func newProvider(t *testing.T, api string) *linear.Provider {
 	}
 	if api != "" {
 		cfg.APIBaseURL = api
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	p, err := linear.New(cfg)
 	if err != nil {
@@ -74,8 +90,17 @@ func TestSignature(t *testing.T) {
 	if err := linear.VerifySignature([]byte(testSecret), signature, body); err != nil {
 		t.Fatalf("valid: %v", err)
 	}
+	if err := linear.VerifySignature([]byte(testSecret), strings.ToUpper(signature), body); err != nil {
+		t.Fatalf("uppercase hex: %v", err)
+	}
 	if err := linear.VerifySignature([]byte("wrong"), signature, body); !errors.Is(err, boardsync.ErrUnauthorized) {
 		t.Fatalf("wrong secret = %v", err)
+	}
+	if err := linear.VerifySignature([]byte(testSecret), "not-hex", body); !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("malformed = %v", err)
+	}
+	if err := linear.VerifySignature([]byte(testSecret), signature[:len(signature)-2], body); !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("truncated = %v", err)
 	}
 	if err := linear.VerifyTimestamp(0, time.Now(), linear.DefaultTolerance); err != nil {
 		t.Fatalf("zero timestamp: %v", err)
@@ -113,6 +138,14 @@ func TestIssueCreated(t *testing.T) {
 	if !strings.HasPrefix(record.Dedupe, "lifecycle:linear:") {
 		t.Fatalf("dedupe = %q", record.Dedupe)
 	}
+	for _, prefix := range []string{"tag.", "assignee."} {
+		if !contains(lc.Owns, prefix) {
+			t.Fatalf("owns %v is missing %s", lc.Owns, prefix)
+		}
+	}
+	if len(lc.Unset) != 0 {
+		t.Fatalf("unset = %v", lc.Unset)
+	}
 }
 
 func TestIssueUpdated(t *testing.T) {
@@ -129,9 +162,185 @@ func TestIssueUpdated(t *testing.T) {
 	if event.Lifecycle.Labels["state"] != "completed" {
 		t.Fatalf("labels = %+v", event.Lifecycle.Labels)
 	}
-	if strings.Join(event.Lifecycle.Owns, ",") == "" {
-		t.Fatalf("owns = %v", event.Lifecycle.Owns)
+	if event.Lifecycle.Labels["priority"] != "high" {
+		t.Fatalf("labels = %+v", event.Lifecycle.Labels)
 	}
+	if !contains(event.Lifecycle.Unset, "project") {
+		t.Fatalf("unset = %v", event.Lifecycle.Unset)
+	}
+	for _, prefix := range []string{"tag.", "assignee."} {
+		if !contains(event.Lifecycle.Owns, prefix) {
+			t.Fatalf("owns %v is missing %s", event.Lifecycle.Owns, prefix)
+		}
+	}
+}
+
+func TestStateTypes(t *testing.T) {
+	for _, state := range []string{"triage", "backlog", "unstarted", "started", "completed", "canceled"} {
+		t.Run(state, func(t *testing.T) {
+			body := issueUpdateBody(`"state":{"id":"state-1","name":"Whatever","type":"` + state + `"}`)
+			event := receive(t, newProvider(t, ""), body)[0].Event
+			if got := event.Lifecycle.Labels["state"]; got != state {
+				t.Fatalf("state = %q, want %q", got, state)
+			}
+		})
+	}
+	// A workflow state without a type falls back to its lowercased name.
+	body := issueUpdateBody(`"state":{"id":"state-1","name":"In Review"}`)
+	if got := receive(t, newProvider(t, ""), body)[0].Event.Lifecycle.Labels["state"]; got != "in review" {
+		t.Fatalf("state name fallback = %q", got)
+	}
+}
+
+func TestUnknownPropertiesUnset(t *testing.T) {
+	body := issueUpdateBody(`"state":null,"priority":0,"project":null,"labels":[],"assignee":null`)
+	event := receive(t, newProvider(t, ""), body)[0].Event
+	for _, key := range []string{"state", "priority", "project"} {
+		if !contains(event.Lifecycle.Unset, key) {
+			t.Fatalf("unset %v is missing %s", event.Lifecycle.Unset, key)
+		}
+		if _, exists := event.Lifecycle.Labels[key]; exists {
+			t.Fatalf("labels %+v still has %s", event.Lifecycle.Labels, key)
+		}
+	}
+}
+
+func TestOwnIssueDoesNotCreateRoot(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_created.json")), `"type": "user"`, `"type": "application"`))
+	body = []byte(strings.ReplaceAll(string(body), `"id": "user-1"`, `"id": "app-1"`))
+	records := receive(t, newProvider(t, ""), body)
+	if len(records) != 1 {
+		t.Fatalf("records = %+v", records)
+	}
+	if records[0].Event.Lifecycle.CreateRoot {
+		t.Fatal("the app's own issue must not open a second board root")
+	}
+	if !records[0].Event.Author.Bot {
+		t.Fatalf("author = %+v", records[0].Event.Author)
+	}
+}
+
+func TestAutomationUpdateDoesNotCreateRoot(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_updated.json")), `"type": "user"`, `"type": "application"`))
+	if records := receive(t, newProvider(t, ""), body); records[0].Event.Lifecycle.CreateRoot {
+		t.Fatal("an application's edit must not open a root")
+	}
+	archived := []byte(strings.ReplaceAll(string(fixture(t, "issue_updated.json")), `"archivedAt": null`, `"archivedAt": "2026-01-02T04:00:00Z"`))
+	if records := receive(t, newProvider(t, ""), archived); records[0].Event.Lifecycle.CreateRoot {
+		t.Fatal("an archived issue's update must not open a root")
+	}
+}
+
+func TestDuplicateDelivery(t *testing.T) {
+	p := newProvider(t, "")
+	body := fixture(t, "comment_created.json")
+	first := receive(t, p, body)
+	second, err := p.Receive(context.Background(), "linear", requestWith(t, body, "delivery-2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first[0].Dedupe != second.Records[0].Dedupe {
+		t.Fatalf("a redelivery changed identity: %q != %q", first[0].Dedupe, second.Records[0].Dedupe)
+	}
+
+	// Without Linear-Delivery, identity still comes from the payload, not the
+	// subscription's webhookId: two edits of one issue are two occurrences.
+	update := fixture(t, "issue_updated.json")
+	one, err := p.Receive(context.Background(), "linear", requestWith(t, update, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := p.Receive(context.Background(), "linear", requestWith(t, update, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Records[0].Dedupe != two.Records[0].Dedupe {
+		t.Fatal("the same payload without a delivery header changed identity")
+	}
+	changed := []byte(strings.ReplaceAll(string(update), `"title": "Checkout retry v2"`, `"title": "Checkout retry v3"`))
+	three, err := p.Receive(context.Background(), "linear", requestWith(t, changed, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if one.Records[0].Dedupe == three.Records[0].Dedupe {
+		t.Fatal("a different payload reused the fallback identity")
+	}
+}
+
+func TestUnsignedMalformedBody(t *testing.T) {
+	body := []byte(`{`)
+	header := http.Header{}
+	header.Set(linear.SignatureHeader, "deadbeef")
+	req := &boardsync.WebhookRequest{Method: http.MethodPost, Header: header, Body: body}
+	_, err := newProvider(t, "").Receive(context.Background(), "linear", req)
+	if !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("unsigned malformed body = %v", err)
+	}
+}
+
+func TestStaleTimestampRefused(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_created.json")), `"webhookTimestamp": 0`,
+		`"webhookTimestamp": `+strconv.FormatInt(time.Now().Add(-10*time.Minute).UnixMilli(), 10)))
+	_, err := newProvider(t, "").Receive(context.Background(), "linear", request(t, body))
+	if !errors.Is(err, boardsync.ErrUnauthorized) {
+		t.Fatalf("stale webhook = %v", err)
+	}
+}
+
+func TestBodyLimit(t *testing.T) {
+	p := newProviderWith(t, "", func(cfg *linear.Config) { cfg.MaxBodyBytes = 16 })
+	_, err := p.Receive(context.Background(), "linear", request(t, fixture(t, "issue_created.json")))
+	if !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("oversized body = %v", err)
+	}
+}
+
+func TestCommentUnknownTeamDropped(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "comment_created.json")), `"key": "ENG"`, `"key": "OTHER"`))
+	if records := receive(t, newProvider(t, ""), body); len(records) != 0 {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+func TestCommentParentGroupsThread(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "comment_created.json")), `"id": "comment-1",`,
+		`"id": "comment-2", "parentId": "comment-1",`))
+	event := receive(t, newProvider(t, ""), body)[0].Event
+	if event.Message != "comment-2" {
+		t.Fatalf("message = %s", event.Message)
+	}
+	if event.Subthread != "ENG:"+testIssueID+":c:comment-1" {
+		t.Fatalf("subthread = %s", event.Subthread)
+	}
+}
+
+func TestCommentWithoutIssueRefused(t *testing.T) {
+	body := []byte(`{"action":"create","type":"Comment","data":{"id":"comment-1","body":"hi","issueId":"` + testIssueID + `","user":{"id":"user-2","name":"Julian"}},"actor":{"id":"user-2","name":"julian","type":"user"},"webhookTimestamp":0}`)
+	_, err := newProvider(t, "").Receive(context.Background(), "linear", request(t, body))
+	if !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("comment without issue = %v", err)
+	}
+}
+
+func TestTeamAllowlist(t *testing.T) {
+	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_created.json")), `"key": "ENG"`, `"key": "OTHER"`))
+	if records := receive(t, newProvider(t, ""), body); len(records) != 0 {
+		t.Fatalf("records = %+v", records)
+	}
+}
+
+func issueUpdateBody(fields string) []byte {
+	return []byte(`{"action":"update","type":"Issue","data":{"id":"` + testIssueID + `","identifier":"ENG-123","title":"Checkout retry",` +
+		fields + `},"actor":{"id":"user-1","name":"ada","type":"user"},"updatedFrom":{"stateId":"state-0"},"webhookTimestamp":0}`)
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestCommentCreated(t *testing.T) {
@@ -167,13 +376,6 @@ func TestCommentUpdatedAndRemoved(t *testing.T) {
 func TestOwnCommentSkipped(t *testing.T) {
 	if records := receive(t, newProvider(t, ""), fixture(t, "own_comment.json")); len(records) != 0 {
 		t.Fatalf("own comment imported: %+v", records)
-	}
-}
-
-func TestTeamAllowlist(t *testing.T) {
-	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_created.json")), `"key": "ENG"`, `"key": "OTHER"`))
-	if records := receive(t, newProvider(t, ""), body); len(records) != 0 {
-		t.Fatalf("records = %+v", records)
 	}
 }
 
@@ -267,16 +469,158 @@ func TestPostCreateIssue(t *testing.T) {
 	defer server.Close()
 	p := newProvider(t, server.URL)
 	target := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Kind: boardsync.TargetChannel}
-	posted, err := p.Post(context.Background(), "linear", target, boardsync.OutboundMessage{Markdown: "Checkout retry\n\nRetries when the provider times out."})
+	posted, err := p.Post(context.Background(), "linear", target, boardsync.OutboundMessage{Markdown: "**Ada**: Checkout retry\n\nRetries when the provider times out."})
 	if err != nil {
 		t.Fatalf("Post: %v", err)
 	}
-	if posted.Thread != "ENG:issue-new" || posted.Message != "issue-new" {
+	if posted.Thread != "ENG:issue-new" || posted.Message != linear.IssueRootMessage {
 		t.Fatalf("posted = %+v", posted)
 	}
 	if len(queries) != 2 {
 		t.Fatalf("queries = %d", len(queries))
 	}
+}
+
+func TestIssueRootEditDeleteReact(t *testing.T) {
+	var queries []string
+	server := graphServer(t, func(q string, vars map[string]any) any {
+		queries = append(queries, q)
+		if !strings.Contains(q, "issueUpdate") {
+			t.Fatalf("unexpected query %q", q)
+		}
+		if vars["id"] != testIssueID || vars["description"] != "new description" {
+			t.Fatalf("variables = %+v", vars)
+		}
+		return map[string]any{"issueUpdate": map[string]any{"success": true}}
+	})
+	defer server.Close()
+	p := newProvider(t, server.URL)
+	thread := boardsync.ThreadRef{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID}
+	ctx := context.Background()
+	if err := p.Edit(ctx, "linear", thread, linear.IssueRootMessage, boardsync.OutboundMessage{Markdown: "new description"}); err != nil {
+		t.Fatalf("Edit root: %v", err)
+	}
+	if err := p.Delete(ctx, "linear", thread, linear.IssueRootMessage); err != nil {
+		t.Fatalf("Delete root: %v", err)
+	}
+	if err := p.React(ctx, "linear", thread, linear.IssueRootMessage, "thumbsup", true); err != nil {
+		t.Fatalf("React root: %v", err)
+	}
+	if len(queries) != 1 {
+		t.Fatalf("root delete/react must not call linear; queries = %d", len(queries))
+	}
+}
+
+func TestOutboundLimits(t *testing.T) {
+	p := newProvider(t, "")
+	thread := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID, Kind: boardsync.TargetThread}
+	tooLong := boardsync.OutboundMessage{Markdown: strings.Repeat("a", linear.MaxCommentChars+1)}
+	if _, err := p.Post(context.Background(), "linear", thread, tooLong); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("long comment = %v", err)
+	}
+	withFile := boardsync.OutboundMessage{Markdown: "hi", Files: []boardsync.OutboundFile{{Filename: "a.txt"}}}
+	if _, err := p.Post(context.Background(), "linear", thread, withFile); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("file post = %v", err)
+	}
+	empty := boardsync.OutboundMessage{Markdown: "  "}
+	if _, err := p.Post(context.Background(), "linear", thread, empty); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("empty post = %v", err)
+	}
+}
+
+func TestResolveTargetStrict(t *testing.T) {
+	p := newProvider(t, "")
+	ctx := context.Background()
+	if target, err := p.ResolveTarget(ctx, "linear", "eng"); err != nil || target.Channel != "ENG" {
+		t.Fatalf("lowercase team = %+v, %v", target, err)
+	}
+	if _, err := p.ResolveTarget(ctx, "linear", "ENG:"+testIssueID+":c:comment-1"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("comment sub-thread target = %v", err)
+	}
+	if _, err := p.ResolveTarget(ctx, "other", "ENG"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("wrong key = %v", err)
+	}
+}
+
+func TestFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		status int
+		want   error
+	}{
+		{http.StatusUnauthorized, boardsync.ErrUnauthorized},
+		{http.StatusForbidden, boardsync.ErrUnauthorized},
+		{http.StatusNotFound, boardsync.ErrNotFound},
+		{http.StatusBadRequest, boardsync.ErrBadRequest},
+		{http.StatusUnprocessableEntity, boardsync.ErrBadRequest},
+		{http.StatusTooManyRequests, boardsync.ErrRateLimited},
+	} {
+		t.Run(strconv.Itoa(test.status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(test.status)
+			}))
+			defer server.Close()
+			_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("status %d = %v, want %v", test.status, err, test.want)
+			}
+			if boardsync.IsPermanent(err) != (test.status != http.StatusTooManyRequests) {
+				t.Fatalf("status %d permanent = %v", test.status, boardsync.IsPermanent(err))
+			}
+		})
+	}
+	t.Run("server", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		defer server.Close()
+		_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+		if err == nil || boardsync.IsPermanent(err) {
+			t.Fatalf("5xx = %v, permanent = %v", err, boardsync.IsPermanent(err))
+		}
+	})
+	for _, test := range []struct {
+		code string
+		want error
+	}{
+		{"AUTHENTICATION_ERROR", boardsync.ErrUnauthorized},
+		{"RATELIMITED", boardsync.ErrRateLimited},
+		{"INVALID_INPUT", boardsync.ErrBadRequest},
+		{"GRAPHQL_VALIDATION_FAILED", boardsync.ErrBadRequest},
+	} {
+		t.Run(test.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"errors": []any{
+					map[string]any{"message": "nope", "extensions": map[string]any{"code": test.code}},
+				}})
+			}))
+			defer server.Close()
+			_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("%s = %v, want %v", test.code, err, test.want)
+			}
+		})
+	}
+	t.Run("unknown graphql error is permanent", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []any{map[string]any{"message": "bad query"}}})
+		}))
+		defer server.Close()
+		_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+		if !boardsync.IsPermanent(err) {
+			t.Fatalf("unknown graphql error = %v", err)
+		}
+	})
+	t.Run("failed mutation is permanent", func(t *testing.T) {
+		server := graphServer(t, func(q string, vars map[string]any) any {
+			return map[string]any{"commentCreate": map[string]any{"success": false}}
+		})
+		defer server.Close()
+		target := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID, Kind: boardsync.TargetThread}
+		_, err := newProvider(t, server.URL).Post(context.Background(), "linear", target, boardsync.OutboundMessage{Markdown: "hi"})
+		if !boardsync.IsPermanent(err) {
+			t.Fatalf("failed mutation = %v", err)
+		}
+	})
 }
 
 func TestEditDeleteReact(t *testing.T) {

@@ -3,6 +3,7 @@ package linear
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -10,7 +11,13 @@ import (
 
 func (p *Provider) normalize(key boardsync.Key, delivery string, body []byte, wh webhook) ([]boardsync.Record, error) {
 	if delivery == "" {
-		delivery = firstNonEmpty(wh.WebhookID, boardsync.Hash(string(body)))
+		// webhookId names the subscription, not one occurrence, so the
+		// timestamp and body always join it.
+		delivery = strings.Join([]string{
+			wh.WebhookID,
+			strconv.FormatInt(wh.WebhookTimestamp, 10),
+			boardsync.Hash(string(body)),
+		}, ":")
 	}
 	switch wh.Type {
 	case "Issue":
@@ -30,7 +37,7 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 	if err := json.Unmarshal(wh.Data, &item); err != nil {
 		return nil, fmt.Errorf("%w: linear issue data: %v", boardsync.ErrBadRequest, err)
 	}
-	teamKey := item.Team.Key
+	teamKey := strings.ToUpper(item.Team.Key)
 	if teamKey == "" {
 		teamKey = teamOfIdentifier(item.Identifier)
 	}
@@ -44,23 +51,30 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 	if author.ID == "" {
 		author = authorOf(item.Creator)
 	}
+	properties := propertiesOf(&item)
 	lifecycle := boardsync.Lifecycle{
 		Type:   "issue.updated",
 		Title:  item.Identifier + ": " + item.Title,
-		URL:    item.URL,
+		URL:    firstNonEmpty(item.URL, wh.URL),
 		Body:   item.Description,
-		Labels: issueLabelsFor(&item),
-		Owns:   issueOwns(&item),
+		Labels: properties.Labels,
+		Unset:  properties.Unset,
+		Owns:   properties.Owns,
 	}
+	// The app's own events never open a second root: the board already
+	// recorded the issue it created. They still carry the issue's properties,
+	// so an existing thread's labels stay current.
+	own := p.isOwnActor(wh.Actor)
 	switch wh.Action {
 	case "create":
 		lifecycle.Type = "issue.created"
-		lifecycle.CreateRoot = true
+		lifecycle.CreateRoot = !own
 	case "update":
 		lifecycle.Retitled = updatedField(wh.UpdatedFrom, "title") || updatedField(wh.UpdatedFrom, "description")
-		// A person's edit brings an older issue in; Linear's own automations
-		// and archiving don't.
-		lifecycle.CreateRoot = wh.Actor != nil && wh.Actor.Type == "user" && item.ArchivedAt == ""
+		// A person's edit brings an older issue in; Linear's own automations,
+		// an issue the app created, and archiving don't.
+		lifecycle.CreateRoot = !own && !p.isOwnUser(item.Creator) &&
+			wh.Actor != nil && wh.Actor.Type == "user" && item.ArchivedAt == ""
 	case "remove":
 		return nil, nil
 	default:
@@ -85,25 +99,32 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery string, body []b
 	if item.Issue == nil {
 		return nil, fmt.Errorf("%w: linear comment has no issue; fetch the issue or subscribe to issue data", boardsync.ErrBadRequest)
 	}
-	teamKey := item.Issue.Team.Key
+	teamKey := strings.ToUpper(item.Issue.Team.Key)
 	if teamKey == "" {
 		teamKey = teamOfIdentifier(item.Issue.Identifier)
 	}
 	if teamKey == "" || !p.cfg.teamAllowed(teamKey) {
 		return nil, nil
 	}
-	if item.ID == "" || item.Issue.ID == "" {
+	issueID := firstNonEmpty(item.Issue.ID, item.IssueID)
+	if item.ID == "" || issueID == "" {
 		return nil, fmt.Errorf("%w: linear comment has no ID or issue ID", boardsync.ErrBadRequest)
 	}
-	author := authorOf(item.User)
-	if author.ID != "" && p.cfg.BotUserID != "" && strings.TrimPrefix(author.ID, "linear:user:") == p.cfg.BotUserID {
+	if p.isOwnUser(item.User) || p.isOwnActor(wh.Actor) {
 		return nil, nil
 	}
+	author := authorOf(item.User)
 	if author.ID == "" {
 		author = actorAuthor(wh.Actor)
 	}
-	thread := issueThread(teamKey, item.Issue.ID)
-	subthread := commentThread(teamKey, item.Issue.ID, item.ID)
+	if author.ID == "" && wh.Action != "remove" {
+		return nil, fmt.Errorf("%w: linear comment has no author", boardsync.ErrBadRequest)
+	}
+	thread := issueThread(teamKey, issueID)
+	// A reply groups under its parent comment's sub-thread; a top-level one is
+	// its own.
+	root := firstNonEmpty(item.ParentID, item.ID)
+	subthread := commentThread(teamKey, issueID, root)
 	event := boardsync.Event{
 		Key: key, Platform: "linear",
 		Channel: teamKey, Thread: thread, Subthread: subthread,
@@ -131,6 +152,14 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery string, body []b
 		event.Text = "(no text)"
 	}
 	return []boardsync.Record{{Dedupe: event.ID, Event: event, Raw: body}}, nil
+}
+
+func (p *Provider) isOwnActor(a *actor) bool {
+	return a != nil && p.cfg.BotUserID != "" && a.ID == p.cfg.BotUserID
+}
+
+func (p *Provider) isOwnUser(u *user) bool {
+	return u != nil && p.cfg.BotUserID != "" && u.ID == p.cfg.BotUserID
 }
 
 func updatedField(from map[string]any, name string) bool {

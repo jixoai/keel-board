@@ -33,7 +33,9 @@ func Sign(secret []byte, body []byte) string {
 }
 
 // VerifySignature checks Linear-Signature (or X-Linear-Signature) against the
-// raw body.
+// raw body. Both sides are decoded first, so the comparison is over the MAC
+// bytes and constant time; uppercase hex is accepted as long as it names the
+// right MAC.
 func VerifySignature(secret []byte, signature string, body []byte) error {
 	if len(secret) == 0 {
 		return fmt.Errorf("%w: linear signing secret is unset", boardsync.ErrUnauthorized)
@@ -41,8 +43,13 @@ func VerifySignature(secret []byte, signature string, body []byte) error {
 	if signature == "" {
 		return fmt.Errorf("%w: linear request has no signature", boardsync.ErrUnauthorized)
 	}
-	expected := Sign(secret, body)
-	if !hmac.Equal([]byte(expected), []byte(signature)) {
+	provided, err := hex.DecodeString(signature)
+	if err != nil || len(provided) != sha256.Size {
+		return fmt.Errorf("%w: linear signature is malformed", boardsync.ErrUnauthorized)
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	if !hmac.Equal(mac.Sum(nil), provided) {
 		return fmt.Errorf("%w: linear signature didn't verify", boardsync.ErrUnauthorized)
 	}
 	return nil

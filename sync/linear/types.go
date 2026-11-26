@@ -15,6 +15,14 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
+// MaxCommentChars bounds a comment body. Linear documents no limit; ~10k
+// characters is what its API reliably takes, and a longer body is refused
+// before the call rather than failing opaquely.
+const MaxCommentChars = 10000
+
+// MaxTitleChars bounds an issue title. Linear's title field accepts 255.
+const MaxTitleChars = 255
+
 // Config configures a Linear app adapter.
 type Config struct {
 	Key           boardsync.Key
@@ -159,18 +167,24 @@ type issueLabel struct {
 }
 
 // labelList reads Linear's two shapes: an array in some webhook payloads, and
-// a connection's `{ nodes: [...] }` in GraphQL answers.
-type labelList []issueLabel
+// a connection's `{ nodes: [...] }` in GraphQL answers. Present distinguishes
+// an empty list (the issue has no labels, so its old tags go) from a payload
+// that didn't include the field (leave the board's tags alone).
+type labelList struct {
+	Nodes   []issueLabel
+	Present bool
+}
 
 // UnmarshalJSON reads an array or a nodes connection.
 func (l *labelList) UnmarshalJSON(data []byte) error {
+	l.Present = true
 	trimmed := strings.TrimSpace(string(data))
 	if strings.HasPrefix(trimmed, "[") {
 		var items []issueLabel
 		if err := json.Unmarshal(data, &items); err != nil {
 			return err
 		}
-		*l = items
+		l.Nodes = items
 		return nil
 	}
 	var connection struct {
@@ -179,7 +193,7 @@ func (l *labelList) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &connection); err != nil {
 		return err
 	}
-	*l = connection.Nodes
+	l.Nodes = connection.Nodes
 	return nil
 }
 
@@ -195,8 +209,10 @@ type issueData struct {
 	Priority      int           `json:"priority"`
 	PriorityLabel string        `json:"priorityLabel"`
 	Project       *project      `json:"project"`
+	ProjectID     string        `json:"projectId"`
 	Labels        labelList     `json:"labels"`
 	Assignee      *user         `json:"assignee"`
+	AssigneeID    string        `json:"assigneeId"`
 	Creator       *user         `json:"creator"`
 	ArchivedAt    string        `json:"archivedAt"`
 	CreatedAt     string        `json:"createdAt"`
@@ -297,49 +313,69 @@ func commentThread(teamKey, issueID, commentID string) string {
 }
 
 func stateType(state workflowState) string {
-	if state.Type != "" {
-		return strings.ToLower(state.Type)
+	if value := strings.TrimSpace(state.Type); value != "" {
+		return strings.ToLower(value)
 	}
-	return strings.ToLower(state.Name)
+	return strings.ToLower(strings.TrimSpace(state.Name))
+}
+
+// issueProperties is an issue's state and properties as board labels. Unset
+// names single keys the payload says are empty; Owns lists the prefixes whose
+// keys the platform owns, so a tag or assignee it dropped is unset too.
+type issueProperties struct {
+	Labels map[string]string
+	Unset  []string
+	Owns   []string
+}
+
+func propertiesOf(item *issueData) issueProperties {
+	out := issueProperties{Labels: map[string]string{}}
+	if item.Identifier != "" {
+		out.Labels["issue"] = item.Identifier
+	}
+	if state := stateType(item.State); state != "" {
+		out.Labels["state"] = state
+	} else {
+		out.Unset = append(out.Unset, "state")
+	}
+	switch {
+	case item.Priority == 0 || strings.EqualFold(item.PriorityLabel, "No priority"):
+		out.Unset = append(out.Unset, "priority")
+	case item.PriorityLabel != "":
+		out.Labels["priority"] = slug(item.PriorityLabel)
+	default:
+		out.Labels["priority"] = strconv.Itoa(item.Priority)
+	}
+	if item.Project != nil && item.Project.Name != "" {
+		out.Labels["project"] = item.Project.Name
+	} else if item.ProjectID == "" {
+		out.Unset = append(out.Unset, "project")
+	}
+	if item.Labels.Present {
+		out.Owns = append(out.Owns, "tag.")
+		for _, label := range item.Labels.Nodes {
+			key := slug(label.Name)
+			if key != "" {
+				out.Labels["tag."+key] = label.Name
+			}
+		}
+	}
+	if item.Assignee != nil {
+		out.Owns = append(out.Owns, "assignee.")
+		handle := handleOf(item.Assignee)
+		if key := slug(handle); key != "" {
+			out.Labels["assignee."+key] = handle
+		}
+	} else if item.AssigneeID == "" {
+		// Linear leaves an empty assignee out of the payload, sometimes
+		// without a null; no details and no ID means nobody is assigned.
+		out.Owns = append(out.Owns, "assignee.")
+	}
+	return out
 }
 
 func issueLabelsFor(item *issueData) map[string]string {
-	labels := map[string]string{
-		"issue": item.Identifier,
-		"state": stateType(item.State),
-	}
-	if item.PriorityLabel != "" {
-		labels["priority"] = strings.ToLower(item.PriorityLabel)
-	} else if item.Priority != 0 {
-		labels["priority"] = strconv.Itoa(item.Priority)
-	}
-	if item.Project != nil && item.Project.Name != "" {
-		labels["project"] = item.Project.Name
-	}
-	for _, label := range item.Labels {
-		key := slug(label.Name)
-		if key != "" {
-			labels["tag."+key] = label.Name
-		}
-	}
-	if item.Assignee != nil {
-		handle := slug(handleOf(item.Assignee))
-		if handle != "" {
-			labels["assignee."+handle] = handleOf(item.Assignee)
-		}
-	}
-	return labels
-}
-
-func issueOwns(item *issueData) []string {
-	owns := []string{"state", "priority", "project"}
-	if item.Labels != nil {
-		owns = append(owns, "tag.")
-	}
-	if item.Assignee != nil {
-		owns = append(owns, "assignee.")
-	}
-	return owns
+	return propertiesOf(item).Labels
 }
 
 func issueRootText(item *issueData) string {
@@ -410,12 +446,64 @@ type graphqlRequest struct {
 }
 
 type graphqlError struct {
-	Message string `json:"message"`
+	Message    string `json:"message"`
+	Extensions struct {
+		Code string `json:"code"`
+	} `json:"extensions"`
 }
 
 type graphqlResponse struct {
 	Data   json.RawMessage `json:"data"`
 	Errors []graphqlError  `json:"errors"`
+}
+
+// classifyStatus maps a non-2xx GraphQL HTTP answer to the sync error the
+// outbox and webhook path understand. A 5xx and anything unlisted stay plain,
+// so they are retried; 4xx answers are permanent.
+func classifyStatus(status int) error {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return fmt.Errorf("%w: linear HTTP %d", boardsync.ErrUnauthorized, status)
+	case status == http.StatusNotFound:
+		return fmt.Errorf("%w: linear HTTP %d", boardsync.ErrNotFound, status)
+	case status == http.StatusTooManyRequests:
+		return fmt.Errorf("%w: linear rate-limited", boardsync.ErrRateLimited)
+	case status == http.StatusBadRequest || status == http.StatusConflict ||
+		status == http.StatusUnprocessableEntity:
+		return fmt.Errorf("%w: linear refused the request (HTTP %d)", boardsync.ErrBadRequest, status)
+	case status >= 500 && status <= 599:
+		return fmt.Errorf("linear server error HTTP %d", status)
+	case status >= 400 && status <= 499:
+		return boardsync.Permanent(fmt.Errorf("linear HTTP %d", status))
+	default:
+		return fmt.Errorf("linear HTTP %d", status)
+	}
+}
+
+// classifyGraphQL maps a GraphQL error to a sync error. GraphQL answers with
+// HTTP 200 even for a bad query or a refused mutation, so the extension code
+// is the only classification available; unknown codes are permanent because
+// the same query will fail the same way. Linear's message isn't carried: it
+// may quote the input, and an operator reads the code to know what failed.
+func classifyGraphQL(err graphqlError) error {
+	code := strings.ToUpper(strings.TrimSpace(err.Extensions.Code))
+	switch code {
+	case "AUTHENTICATION_ERROR", "AUTHENTICATION_FAILED", "UNAUTHORIZED":
+		return fmt.Errorf("%w: linear authentication failed", boardsync.ErrUnauthorized)
+	case "FORBIDDEN", "ACCESS_DENIED":
+		return fmt.Errorf("%w: linear refused the token's access", boardsync.ErrUnauthorized)
+	case "RATELIMITED", "RATE_LIMITED":
+		return fmt.Errorf("%w: linear rate-limited", boardsync.ErrRateLimited)
+	case "NOT_FOUND", "ENTITY_NOT_FOUND":
+		return fmt.Errorf("%w: linear resource not found", boardsync.ErrNotFound)
+	case "INVALID_INPUT", "BAD_USER_INPUT", "GRAPHQL_VALIDATION_FAILED":
+		return fmt.Errorf("%w: linear rejected the query (%s)", boardsync.ErrBadRequest, code)
+	default:
+		if code == "" {
+			return boardsync.Permanent(errors.New("linear graphql error"))
+		}
+		return boardsync.Permanent(fmt.Errorf("linear graphql error %s", code))
+	}
 }
 
 func (c *Client) do(ctx context.Context, query string, variables map[string]any, output any) error {
@@ -441,24 +529,15 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 	if err != nil {
 		return err
 	}
-	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("%w: linear HTTP %d", boardsync.ErrUnauthorized, response.StatusCode)
-	}
-	if response.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("%w: linear rate-limited", boardsync.ErrRateLimited)
-	}
-	if response.StatusCode == http.StatusBadRequest {
-		return fmt.Errorf("%w: linear refused the query", boardsync.ErrBadRequest)
-	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("linear HTTP %d", response.StatusCode)
+		return classifyStatus(response.StatusCode)
 	}
 	var decoded graphqlResponse
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return fmt.Errorf("linear answered unreadable JSON: %w", err)
 	}
 	if len(decoded.Errors) > 0 {
-		return fmt.Errorf("linear: %s", decoded.Errors[0].Message)
+		return classifyGraphQL(decoded.Errors[0])
 	}
 	if output != nil && len(decoded.Data) > 0 {
 		if err := json.Unmarshal(decoded.Data, output); err != nil {
@@ -525,6 +604,10 @@ func (c *Client) IssueByKey(ctx context.Context, teamKey string, number int) (is
 	return out.Issues.Nodes[0], nil
 }
 
+const issueUpdateMutation = `mutation IssueUpdate($id: String!, $description: String!) {
+  issueUpdate(id: $id, input: { description: $description }) { success }
+}`
+
 // IssueByID reads one issue.
 func (c *Client) IssueByID(ctx context.Context, id string) (issueData, error) {
 	var out struct {
@@ -532,6 +615,9 @@ func (c *Client) IssueByID(ctx context.Context, id string) (issueData, error) {
 	}
 	if err := c.do(ctx, issueByIDQuery, map[string]any{"id": id}, &out); err != nil {
 		return issueData{}, err
+	}
+	if out.Issue.ID == "" {
+		return issueData{}, fmt.Errorf("%w: no linear issue %s", boardsync.ErrNotFound, id)
 	}
 	return out.Issue, nil
 }
@@ -550,7 +636,7 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) (strin
 		return "", err
 	}
 	if !out.CommentCreate.Success || out.CommentCreate.Comment.ID == "" {
-		return "", errors.New("linear commentCreate failed")
+		return "", boardsync.Permanent(errors.New("linear commentCreate failed"))
 	}
 	return out.CommentCreate.Comment.ID, nil
 }
@@ -567,7 +653,7 @@ func (c *Client) CreateIssue(ctx context.Context, teamID, title, description str
 		return issueRef{}, err
 	}
 	if !out.IssueCreate.Success || out.IssueCreate.Issue.ID == "" {
-		return issueRef{}, errors.New("linear issueCreate failed")
+		return issueRef{}, boardsync.Permanent(errors.New("linear issueCreate failed"))
 	}
 	return out.IssueCreate.Issue, nil
 }
@@ -583,7 +669,23 @@ func (c *Client) UpdateComment(ctx context.Context, id, body string) error {
 		return err
 	}
 	if !out.CommentUpdate.Success {
-		return errors.New("linear commentUpdate failed")
+		return boardsync.Permanent(errors.New("linear commentUpdate failed"))
+	}
+	return nil
+}
+
+// UpdateIssue replaces an issue's description for a root the board opened.
+func (c *Client) UpdateIssue(ctx context.Context, id, description string) error {
+	var out struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.do(ctx, issueUpdateMutation, map[string]any{"id": id, "description": description}, &out); err != nil {
+		return err
+	}
+	if !out.IssueUpdate.Success {
+		return boardsync.Permanent(errors.New("linear issueUpdate failed"))
 	}
 	return nil
 }
@@ -599,7 +701,7 @@ func (c *Client) DeleteComment(ctx context.Context, id string) error {
 		return err
 	}
 	if !out.CommentDelete.Success {
-		return errors.New("linear commentDelete failed")
+		return boardsync.Permanent(errors.New("linear commentDelete failed"))
 	}
 	return nil
 }
@@ -615,7 +717,7 @@ func (c *Client) ReactComment(ctx context.Context, commentID, emoji string) erro
 		return err
 	}
 	if !out.ReactionCreate.Success {
-		return errors.New("linear reactionCreate failed")
+		return boardsync.Permanent(errors.New("linear reactionCreate failed"))
 	}
 	return nil
 }

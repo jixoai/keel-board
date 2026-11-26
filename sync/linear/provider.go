@@ -50,15 +50,20 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return boardsync.Intake{}, fmt.Errorf("%w: entry %q isn't this linear app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
 	}
-	if req == nil || len(req.Body) == 0 {
+	if req == nil {
 		return boardsync.Intake{}, fmt.Errorf("%w: empty linear webhook", boardsync.ErrBadRequest)
 	}
 	if int64(len(req.Body)) > p.cfg.maxBody() {
 		return boardsync.Intake{}, fmt.Errorf("%w: linear webhook body is too large", boardsync.ErrBadRequest)
 	}
+	// Verify before parsing, and before an empty body can answer anything but
+	// 401: an unsigned request must not learn whether its shape was valid.
 	signature := signatureFromHeaders(req.Header.Get)
 	if err := VerifySignature([]byte(p.cfg.WebhookSecret.Reveal()), signature, req.Body); err != nil {
 		return boardsync.Intake{}, err
+	}
+	if len(req.Body) == 0 {
+		return boardsync.Intake{}, fmt.Errorf("%w: empty linear webhook", boardsync.ErrBadRequest)
 	}
 	var wh webhook
 	if err := json.Unmarshal(req.Body, &wh); err != nil {
@@ -103,11 +108,11 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 	if target == "" {
 		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: empty linear target", boardsync.ErrBadRequest)
 	}
-	if teamKeyPattern.MatchString(target) {
-		if !p.cfg.teamAllowed(target) {
-			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, target)
+	if upper := strings.ToUpper(target); teamKeyPattern.MatchString(upper) {
+		if !p.cfg.teamAllowed(upper) {
+			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, upper)
 		}
-		resolved := boardsync.ResolvedTarget{Key: key, Platform: "linear", Channel: target, Kind: boardsync.TargetChannel}
+		resolved := boardsync.ResolvedTarget{Key: key, Platform: "linear", Channel: upper, Kind: boardsync.TargetChannel}
 		return resolved, resolved.Validate()
 	}
 	if match := teamKeyFromIdentifier.FindStringSubmatch(target); match != nil {
@@ -115,10 +120,16 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 		if !p.cfg.teamAllowed(teamKey) {
 			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
 		}
-		number, _ := strconv.Atoi(match[2])
+		number, err := strconv.Atoi(match[2])
+		if err != nil {
+			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue number %q", boardsync.ErrBadRequest, match[2])
+		}
 		issue, err := p.client.IssueByKey(ctx, teamKey, number)
 		if err != nil {
 			return boardsync.ResolvedTarget{}, err
+		}
+		if issue.ID == "" {
+			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue %s has no ID", boardsync.ErrNotFound, target)
 		}
 		resolved := boardsync.ResolvedTarget{
 			Key: key, Platform: "linear", Channel: teamKey,
@@ -145,9 +156,15 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 	if err != nil {
 		return boardsync.ResolvedTarget{}, err
 	}
-	teamKey := issue.Team.Key
+	teamKey := strings.ToUpper(issue.Team.Key)
+	if teamKey == "" {
+		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue %s has no team", boardsync.ErrNotFound, target)
+	}
 	if !p.cfg.teamAllowed(teamKey) {
 		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
+	}
+	if issue.ID == "" {
+		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue %s has no ID", boardsync.ErrNotFound, target)
 	}
 	resolved := boardsync.ResolvedTarget{
 		Key: key, Platform: "linear", Channel: teamKey,
@@ -155,6 +172,11 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 	}
 	return resolved, resolved.Validate()
 }
+
+// IssueRootMessage is the copy ID a channel target returns: the issue itself,
+// not a comment. Edits then change the issue's description and a delete leaves
+// the issue in place, because closing it is a person's call.
+const IssueRootMessage = "issue"
 
 // Post comments on an issue, or opens an issue for a channel target. A root's
 // first line is the title and the whole message is the description.
@@ -169,16 +191,17 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 		return boardsync.Posted{}, fmt.Errorf("%w: target belongs to %q", boardsync.ErrBadRequest, target.Key)
 	}
 	if len(msg.Files) > 0 {
-		return boardsync.Posted{}, fmt.Errorf("%w: linear file upload is not implemented in this skeleton", boardsync.ErrUnsupported)
+		return boardsync.Posted{}, fmt.Errorf("%w: linear file upload is not implemented", boardsync.ErrUnsupported)
 	}
 	if strings.TrimSpace(msg.Markdown) == "" {
 		return boardsync.Posted{}, fmt.Errorf("%w: linear message has no text", boardsync.ErrBadRequest)
 	}
 	if target.Kind == boardsync.TargetChannel {
-		if !p.cfg.teamAllowed(target.Channel) {
-			return boardsync.Posted{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, target.Channel)
+		teamKey := strings.ToUpper(target.Channel)
+		if !p.cfg.teamAllowed(teamKey) {
+			return boardsync.Posted{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
 		}
-		teamID, err := p.client.TeamID(ctx, target.Channel)
+		teamID, err := p.client.TeamID(ctx, teamKey)
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
@@ -187,7 +210,7 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
-		return boardsync.Posted{Thread: issueThread(target.Channel, issue.ID), Message: issue.ID}, nil
+		return boardsync.Posted{Thread: issueThread(teamKey, issue.ID), Message: IssueRootMessage}, nil
 	}
 	teamKey, issueID, err := parseIssueThread(target.Thread)
 	if err != nil {
@@ -196,6 +219,9 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	if !p.cfg.teamAllowed(teamKey) {
 		return boardsync.Posted{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
 	}
+	if err := checkCommentBody(msg.Markdown); err != nil {
+		return boardsync.Posted{}, err
+	}
 	commentID, err := p.client.CreateComment(ctx, issueID, msg.Markdown)
 	if err != nil {
 		return boardsync.Posted{}, err
@@ -203,26 +229,45 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	return boardsync.Posted{Thread: issueThread(teamKey, issueID), Message: commentID}, nil
 }
 
-// Edit replaces a delivered comment's body.
+// Edit replaces a delivered comment's body, or an issue the board opened.
 func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string, msg boardsync.OutboundMessage) error {
-	if _, _, err := p.threadWhere(key, thread); err != nil {
+	_, issueID, err := p.threadWhere(key, thread)
+	if err != nil {
+		return err
+	}
+	if len(msg.Files) > 0 {
+		return fmt.Errorf("%w: linear file upload is not implemented", boardsync.ErrUnsupported)
+	}
+	if message == IssueRootMessage {
+		return p.client.UpdateIssue(ctx, issueID, msg.Markdown)
+	}
+	if err := checkCommentBody(msg.Markdown); err != nil {
 		return err
 	}
 	return p.client.UpdateComment(ctx, message, msg.Markdown)
 }
 
-// Delete deletes a delivered comment.
+// Delete deletes a delivered comment. An issue the board opened stays: it is
+// not the root's copy to remove.
 func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string) error {
 	if _, _, err := p.threadWhere(key, thread); err != nil {
 		return err
 	}
+	if message == IssueRootMessage {
+		return nil
+	}
 	return p.client.DeleteComment(ctx, message)
 }
 
-// React adds a reaction to a delivered comment. Linear can't take one back.
+// React adds a reaction to a delivered comment. Linear can't take one back,
+// and an issue isn't a reaction target; both are reported or skipped rather
+// than pretending success.
 func (p *Provider) React(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message, emoji string, added bool) error {
 	if _, _, err := p.threadWhere(key, thread); err != nil {
 		return err
+	}
+	if message == IssueRootMessage {
+		return nil
 	}
 	if !added {
 		return fmt.Errorf("%w: linear reactions can't be removed through the API", boardsync.ErrUnsupported)
@@ -264,31 +309,65 @@ func (p *Provider) threadWhere(key boardsync.Key, thread boardsync.ThreadRef) (s
 	if err != nil {
 		return "", "", err
 	}
+	if thread.Subthread != "" {
+		if !strings.HasPrefix(thread.Subthread, issueThread(teamKey, issueID)+":c:") {
+			return "", "", fmt.Errorf("%w: linear sub-thread %q doesn't extend its issue", boardsync.ErrBadRequest, thread.Subthread)
+		}
+	}
 	if !p.cfg.teamAllowed(teamKey) {
 		return "", "", fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
 	}
 	return teamKey, issueID, nil
 }
 
+// parseIssueThread reads "ENG:<issue UUID>". A comment sub-thread is never a
+// target: its issue is.
 func parseIssueThread(native string) (teamKey, issueID string, err error) {
-	parts := strings.SplitN(native, ":", 2)
-	if len(parts) != 2 || !teamKeyPattern.MatchString(parts[0]) || parts[1] == "" {
+	parts := strings.Split(strings.TrimSpace(native), ":")
+	if len(parts) != 2 {
 		return "", "", fmt.Errorf("%w: not a linear issue thread: %s", boardsync.ErrBadRequest, native)
 	}
-	return parts[0], parts[1], nil
+	teamKey = strings.ToUpper(parts[0])
+	issueID = parts[1]
+	if !teamKeyPattern.MatchString(teamKey) || strings.TrimSpace(issueID) == "" || strings.ContainsAny(issueID, " \t\r\n") {
+		return "", "", fmt.Errorf("%w: not a linear issue thread: %s", boardsync.ErrBadRequest, native)
+	}
+	return teamKey, issueID, nil
 }
 
+func checkCommentBody(markdown string) error {
+	if len([]rune(markdown)) > MaxCommentChars {
+		return fmt.Errorf("%w: linear comment is longer than %d characters", boardsync.ErrBadRequest, MaxCommentChars)
+	}
+	return nil
+}
+
+// splitTitle makes an issue title from a root's first line, without the
+// renderer's "**name**: " label or markdown emphasis.
 func splitTitle(markdown string) (string, string) {
-	lines := strings.SplitN(strings.TrimSpace(markdown), "\n", 2)
-	title := strings.TrimSpace(lines[0])
-	if title == "" {
-		title = "New issue"
+	first := markdown
+	if index := strings.IndexByte(markdown, '\n'); index >= 0 {
+		first = markdown[:index]
 	}
-	if len(title) > 120 {
-		title = title[:120]
+	first = strings.TrimSpace(first)
+	// The default renderer opens with a bold label and a colon.
+	if strings.HasPrefix(first, "**") {
+		if end := strings.Index(first[2:], "**:"); end >= 0 {
+			first = strings.TrimSpace(first[2+end+3:])
+		}
 	}
-	description := markdown
-	return title, description
+	replacer := strings.NewReplacer("**", "", "__", "", "`", "")
+	first = replacer.Replace(first)
+	first = strings.TrimLeft(first, "#> \t")
+	first = strings.Join(strings.Fields(first), " ")
+	if first == "" {
+		first = "Untitled"
+	}
+	runes := []rune(first)
+	if len(runes) > MaxTitleChars {
+		first = string(runes[:MaxTitleChars])
+	}
+	return first, markdown
 }
 
 // Interface checks.
