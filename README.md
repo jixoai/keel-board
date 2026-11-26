@@ -7,26 +7,26 @@ on its own.
 The upstream project is TypeScript and tied to Vercel's API, OIDC, Connect and
 deployment model. This repository keeps the parts that make the board a
 standard — one durable log, channels and threads, tasks with claims and
-leases, needs, labels, watchers, per-channel access and two-way sync — and
-replaces the backend with plain Go, PostgreSQL/SQLite/memory stores and
-HTTP/SSE.
+leases, needs and labels — and replaces the backend with a plain Go library,
+an append-only log and HTTP/SSE. Watchers, per-channel grants, files and
+two-way sync follow in later phases.
 
 - Upstream pin: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0`
 - License: Apache-2.0 (see `LICENSE` and `NOTICE`)
-- Status: phase 1 (core protocol and task domain) in progress
+- Status: phase 1 core implemented: channels, messages and replies, labels,
+  tasks with leases and fencing, needs, claim-ready, and the SSE feed. Grants,
+  sync, files, schedules and reactions are not part of phase 1.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
 | `board/` | Pure task domain: seven states, claim leases/fencing, needs, labels, queue |
-| `protocol/` | Wire types, route table and validation ported from `src/api` |
-| `log/` | Append-only board log, folds and projections |
-| `store/` | PostgreSQL, SQLite and memory stores |
-| `access/` | Principals, channel grants, permissions |
-| `server/` | HTTP API, SSE tail, watcher dispatch |
-| `sync/` | Slack, GitHub, Linear and Chat SDK adapters |
-| `cmd/board/` | Standalone server and CLI |
+| `protocol/` | Wire types, validation, error codes and HTTP status mapping |
+| `log/` | Append-only board log, conditional appends, idempotency, folds and projections |
+| `store/` | `EventStore` seam, in-memory store, PostgreSQL stub and schema |
+| `server/` | HTTP API, SSE feed, authorizer and tenant seams |
+| `cmd/board/` | Standalone dev server (`board serve`) |
 
 The translation is faithful in semantics, not a line-by-line copy. Every
 difference from upstream is recorded in `docs/PORTING.md`.
