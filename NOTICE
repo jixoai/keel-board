@@ -1,0 +1,11 @@
+keel-board
+Copyright 2026 jixoai
+
+This product is a Go translation of the vercel/board standard:
+  https://github.com/vercel/board
+  commit 26428ed4e0661ff362c59abdf1215997c59891b0
+  Copyright Vercel, Inc.
+  Licensed under the Apache License, Version 2.0.
+
+The protocol, task/claim/thread semantics and sync design are derived from
+that work; this repository is an independent Go implementation for keel.
