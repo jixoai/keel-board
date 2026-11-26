@@ -85,11 +85,26 @@ func (p *Postgres) Close() {
 // migrations, so two servers starting together don't race the schema.
 const migrationLockID int64 = 0x6b65656c5f626f61
 
+// ApplyMigrations applies the embedded schema through pool. It is the same
+// run OpenPostgres performs, exported for a package that owns its own pool
+// (syncstore opens one for the sync tables). Migrations are idempotent, so
+// applying them twice changes nothing.
+func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return errors.New("store: a PostgreSQL pool is required")
+	}
+	return migrate(ctx, pool)
+}
+
 // migrate applies every embedded migration, in name order. Each file is
 // idempotent, so a second open changes nothing. One connection holds a session
 // advisory lock for the whole run; migrations each run in their own
 // transaction, so a failure leaves no half-migrated file.
 func (p *Postgres) migrate(ctx context.Context) error {
+	return migrate(ctx, p.pool)
+}
+
+func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	entries, err := fs.ReadDir(migrations, "migrations")
 	if err != nil {
 		return fmt.Errorf("store: reading migrations: %w", err)
@@ -101,7 +116,7 @@ func (p *Postgres) migrate(ctx context.Context) error {
 		}
 	}
 	sort.Strings(names)
-	conn, err := p.pool.Acquire(ctx)
+	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("store: reserving a migration connection: %w", err)
 	}
