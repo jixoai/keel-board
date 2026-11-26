@@ -1,0 +1,18 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "channel": "C0123ABC",
+    "channel_type": "channel",
+    "user": "U0999XYZ",
+    "text": "looks good",
+    "ts": "1727000005.000100",
+    "thread_ts": "1727000000.123456",
+    "event_ts": "1727000005.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0124ABC",
+  "event_time": 1727000005
+}

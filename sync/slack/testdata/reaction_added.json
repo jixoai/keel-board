@@ -1,0 +1,16 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "reaction_added",
+    "user": "U0999XYZ",
+    "reaction": "thumbsup",
+    "item": { "type": "message", "channel": "C0123ABC", "ts": "1727000000.123456" },
+    "item_user": "U0456ABC",
+    "event_ts": "1727000200.000000"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0127ABC",
+  "event_time": 1727000200
+}

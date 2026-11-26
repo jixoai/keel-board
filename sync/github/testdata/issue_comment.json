@@ -1,0 +1,23 @@
+{
+  "action": "created",
+  "issue": {
+    "number": 45,
+    "title": "blank export page",
+    "body": "the export page is blank",
+    "html_url": "https://github.com/acme/www/issues/45",
+    "state": "open",
+    "user": { "login": "ada", "id": 1001, "type": "User", "avatar_url": "https://avatars.example/ada.png" },
+    "labels": [{ "name": "bug" }],
+    "assignees": []
+  },
+  "comment": {
+    "id": 9001,
+    "body": "confirmed on staging",
+    "user": { "login": "julian", "id": 1002, "type": "User", "avatar_url": null },
+    "html_url": "https://github.com/acme/www/issues/45#issuecomment-9001",
+    "created_at": "2026-01-02T03:04:05Z",
+    "updated_at": "2026-01-02T03:04:05Z"
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "julian", "id": 1002, "type": "User" }
+}

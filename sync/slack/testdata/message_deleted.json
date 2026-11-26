@@ -1,0 +1,21 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "subtype": "message_deleted",
+    "channel": "C0123ABC",
+    "deleted_ts": "1727000005.000100",
+    "previous_message": {
+      "type": "message",
+      "user": "U0999XYZ",
+      "text": "looks good",
+      "ts": "1727000005.000100",
+      "thread_ts": "1727000000.123456"
+    }
+  },
+  "type": "event_callback",
+  "event_id": "Ev0126ABC",
+  "event_time": 1727000200
+}

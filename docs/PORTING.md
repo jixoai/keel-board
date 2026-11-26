@@ -49,4 +49,27 @@ refused rather than half-accepted.
 - Go time comparisons use UTC `time.Time`; upstream uses JS Date strings.
 - The pure task domain exposes `Commit(current, base, next)` so a store can make
   conditional appends explicit.
-- Phase 1 ships the task/thread/channel core; sync adapters follow in phase 2.
+- Phase 1 shipped the task/thread/channel core.
+
+## Sync
+
+Phase 2 adds the sync model as Go packages (`sync/`) and adapter skeletons for
+Slack, GitHub, Linear, and a generic Chat SDK bridge. The complete design is in
+[`SYNC.md`](SYNC.md). Deliberate differences from upstream:
+
+- `SyncProvider` becomes a Go `Provider`; the engine's `board-sync` consumer
+  becomes the `Host`/`Runner` seam. The durable inbox/outbox, subscription,
+  backfill, files, typing, and per-key ownership are the server's next phase.
+- Vercel Connect, OIDC, and deployment identity are replaced by adapter-owned
+  secrets and platform webhook verification.
+- The upstream pin keeps every adapter in `src/sync/`; here they are Go
+  packages `sync/slack`, `sync/github`, `sync/linear`, and `sync/chatsdk`.
+- GitHub writes are denied unless `WriteRepos` allows the repo, and GitHub
+  comments carry a hidden marker as a second echo guard. Upstream relies on
+  the app's bot user ID and allows a `mirror` function to write.
+- Slack reaction webhooks don't carry `thread_ts`; the skeleton anchors a
+  reaction at `channel:item.ts` and leaves parent-thread lookup to the host.
+  Upstream reads the parent from the Chat SDK message.
+- The Chat SDK bridge is a Go `Adapter` interface, not a JavaScript runtime.
+- Providers emit platform-native author IDs; a host re-keys them under the
+  entry key with `sync.KeyedID`, as upstream's engine does automatically.

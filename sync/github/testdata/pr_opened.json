@@ -1,0 +1,20 @@
+{
+  "action": "opened",
+  "number": 123,
+  "pull_request": {
+    "number": 123,
+    "title": "checkout retry",
+    "body": "Retries checkout when the provider times out.",
+    "html_url": "https://github.com/acme/www/pull/123",
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "user": { "login": "ada", "id": 1001, "type": "User" },
+    "labels": [{ "name": "bug" }, { "name": "good first issue" }],
+    "assignees": [{ "login": "julian", "id": 1002 }],
+    "head": { "sha": "a1b2c3d4e5f6", "ref": "fix/checkout" },
+    "base": { "ref": "main" }
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "ada", "id": 1001, "type": "User" }
+}

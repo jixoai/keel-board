@@ -1,0 +1,14 @@
+{
+  "action": "create",
+  "type": "Comment",
+  "data": {
+    "id": "comment-2",
+    "body": "the app's own comment",
+    "issueId": "11111111-1111-1111-1111-111111111111",
+    "issue": { "id": "11111111-1111-1111-1111-111111111111", "identifier": "ENG-123", "team": { "key": "ENG" } },
+    "user": { "id": "app-1", "name": "keel-board", "displayName": "keel-board" }
+  },
+  "actor": { "id": "app-1", "name": "keel-board", "type": "application" },
+  "webhookId": "wh-6",
+  "webhookTimestamp": 0
+}

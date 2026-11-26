@@ -1,0 +1,17 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "channel": "C0123ABC",
+    "channel_type": "channel",
+    "user": "U0456ABC",
+    "text": "ship it <@U0999XYZ>, see <https://example.com/doc|the doc>",
+    "ts": "1727000000.123456",
+    "event_ts": "1727000000.123456"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0123ABC",
+  "event_time": 1727000000
+}

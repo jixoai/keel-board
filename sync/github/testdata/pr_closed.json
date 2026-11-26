@@ -1,0 +1,18 @@
+{
+  "action": "closed",
+  "number": 123,
+  "pull_request": {
+    "number": 123,
+    "title": "checkout retry",
+    "html_url": "https://github.com/acme/www/pull/123",
+    "state": "closed",
+    "draft": false,
+    "merged": true,
+    "user": { "login": "ada", "id": 1001, "type": "User" },
+    "labels": [],
+    "assignees": [],
+    "head": { "sha": "a1b2c3d4e5f6" }
+  },
+  "repository": { "id": 1001, "full_name": "acme/www", "name": "www", "private": false, "visibility": "public", "owner": { "login": "acme" } },
+  "sender": { "login": "julian", "id": 1002, "type": "User" }
+}

@@ -1,0 +1,19 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "subtype": "bot_message",
+    "channel": "C0123ABC",
+    "channel_type": "channel",
+    "bot_id": "B0999XYZ",
+    "username": "Sentry",
+    "text": "checkout is down",
+    "ts": "1727000500.000100",
+    "event_ts": "1727000500.000100"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0129ABC",
+  "event_time": 1727000500
+}

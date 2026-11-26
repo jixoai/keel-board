@@ -13,9 +13,9 @@ two-way sync follow in later phases.
 
 - Upstream pin: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0`
 - License: Apache-2.0 (see `LICENSE` and `NOTICE`)
-- Status: phase 1 core implemented: channels, messages and replies, labels,
-  tasks with leases and fencing, needs, claim-ready, and the SSE feed. Grants,
-  sync, files, schedules and reactions are not part of phase 1.
+- Status: phase 1 core (channels, messages, tasks, claims, needs, labels, SSE)
+  and the phase 2 sync design + adapter skeletons
+- Sync design: [`docs/SYNC.md`](docs/SYNC.md)
 
 ## Layout
 
