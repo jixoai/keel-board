@@ -120,6 +120,9 @@ func TestResolveChannelAndTargetBoundaries(t *testing.T) {
 	if _, err := p.ResolveChannel(ctx, "github", "acme/www:branches"); !errors.Is(err, boardsync.ErrBadRequest) {
 		t.Fatalf("unknown channel suffix = %v", err)
 	}
+	if _, err := p.ResolveChannel(ctx, "github", "acme/www:pulls:issues"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("double channel suffix = %v", err)
+	}
 	if _, err := p.ResolveTarget(ctx, "github", "other/repo:1"); !errors.Is(err, boardsync.ErrNotFound) {
 		t.Fatalf("unknown repo target = %v", err)
 	}
@@ -147,12 +150,18 @@ func TestFetchRootIssue(t *testing.T) {
 }
 
 func TestIssueStateFallbackAndInvalidHead(t *testing.T) {
+	// Use a non-lifecycle action: opened/closed/reopened overwrite state
+	// explicitly, so only labeled/edited/unassigned exercise stateOfIssue.
 	weird := mutateFixture(t, "issue_opened.json", func(payload map[string]any) {
+		payload["action"] = "labeled"
 		payload["issue"].(map[string]any)["state"] = "mystery"
 	})
 	event := receive(t, newProvider(t, false), "issues", weird)[0].Event
+	if event.Type != "issue.labeled" {
+		t.Fatalf("type = %q", event.Type)
+	}
 	if event.Lifecycle.Labels["state"] != "open" {
-		t.Fatalf("issue state = %q", event.Lifecycle.Labels["state"])
+		t.Fatalf("issue state = %q, want open", event.Lifecycle.Labels["state"])
 	}
 	badSHA := mutateFixture(t, "pr_opened.json", func(payload map[string]any) {
 		payload["pull_request"].(map[string]any)["head"] = map[string]any{"sha": "not a sha"}
@@ -160,6 +169,13 @@ func TestIssueStateFallbackAndInvalidHead(t *testing.T) {
 	event = receive(t, newProvider(t, false), "pull_request", badSHA)[0].Event
 	if _, exists := event.Lifecycle.Labels["head"]; exists {
 		t.Fatalf("invalid SHA became a head label: %+v", event.Lifecycle.Labels)
+	}
+	syncBad := mutateFixture(t, "pr_synchronize.json", func(payload map[string]any) {
+		payload["pull_request"].(map[string]any)["head"] = map[string]any{"sha": "not a sha"}
+	})
+	event = receive(t, newProvider(t, false), "pull_request", syncBad)[0].Event
+	if _, exists := event.Lifecycle.Labels["head"]; exists {
+		t.Fatalf("invalid synchronize SHA kept a head label: %+v", event.Lifecycle.Labels)
 	}
 }
 

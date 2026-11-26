@@ -681,18 +681,15 @@ skipped even without `BotUserID` (a failed lookup is retried at most once a
 minute).
 
 Echo suppression fails closed. With `DisableMarker` set, an entry that has
-neither `BotUserID`/`BotLogin` nor a resolvable `Viewer` refuses `Post` and
-`Edit` instead of writing a comment it cannot recognise on the way back.
-Marker detection scans every marker in a comment, so a foreign marker placed
-before ours cannot hide ours.
+neither `BotUserID`/`BotLogin` nor a resolvable `Viewer` refuses `Post`,
+`Edit`, `Delete`, and `React` instead of writing a comment it cannot recognise
+on the way back. Marker detection scans every marker in a comment, so a foreign
+marker placed before ours cannot hide ours.
 
 Rate-limit errors expose `RateLimitError.RetryAfter` (from `Retry-After` or
 `X-RateLimit-Reset`). The in-memory outbox still uses its generic backoff; a
 deployment that runs its own retry loop should honour that field or treat
-`ErrRateLimited` as retryable. GitHub's comment POST has no idempotency key:
-if a post succeeds and the host's `Record` call fails, a retry can post a
-second copy carrying a new marker. `Host.Record` must be durable before the
-outbox job is acked, or the deployment must dedupe on that failure boundary.
+`ErrRateLimited` as retryable.
 
 Known limits:
 

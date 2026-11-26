@@ -150,6 +150,12 @@ func TestDisabledMarkerWithoutIdentityRefusesToSend(t *testing.T) {
 	if err := p.Edit(context.Background(), "github", thread, "9001", boardsync.OutboundMessage{Markdown: "x"}); !errors.Is(err, boardsync.ErrUnsupported) {
 		t.Fatalf("Edit without any echo guard = %v", err)
 	}
+	if err := p.Delete(context.Background(), "github", thread, "9001"); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("Delete without any echo guard = %v", err)
+	}
+	if err := p.React(context.Background(), "github", thread, "9001", "rocket", true); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("React without any echo guard = %v", err)
+	}
 }
 
 func TestDisabledMarkerRefusesWhenViewerCannotBeResolved(t *testing.T) {

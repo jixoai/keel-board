@@ -144,6 +144,9 @@ func (p *Provider) requireEchoGuard(ctx context.Context) error {
 	return nil
 }
 
+// channelPattern is one repo channel, never a repo with two suffixes.
+var channelPattern = regexp.MustCompile(`^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?::(pulls|issues))?$`)
+
 // ResolveChannel accepts "owner/repo", "owner/repo:pulls", or
 // "owner/repo:issues". A bare repo resolves to its pulls channel, which is
 // only useful for routing; GitHub can't start a thread there.
@@ -151,17 +154,18 @@ func (p *Provider) ResolveChannel(_ context.Context, key boardsync.Key, name str
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return "", fmt.Errorf("%w: entry %q isn't this github app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
 	}
-	repo := strings.TrimSuffix(strings.TrimSuffix(name, ":pulls"), ":issues")
-	if !validRepo(repo) {
+	match := channelPattern.FindStringSubmatch(name)
+	if match == nil || !validRepo(match[1]) {
 		return "", fmt.Errorf("%w: not a github repo channel: %s", boardsync.ErrBadRequest, name)
 	}
+	repo := match[1]
 	if !p.cfg.readAllowed(repo) {
 		return "", fmt.Errorf("%w: %s is not in the inbound repo allowlist", boardsync.ErrNotFound, repo)
 	}
-	if strings.HasSuffix(name, ":pulls") || strings.HasSuffix(name, ":issues") {
+	if match[2] != "" {
 		return name, nil
 	}
-	return name + ":pulls", nil
+	return repo + ":pulls", nil
 }
 
 // ResolveTarget reads "owner/repo" (a channel), "owner/repo:123" (a PR), or
@@ -323,6 +327,9 @@ func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsy
 	if err != nil {
 		return err
 	}
+	if err := p.requireEchoGuard(ctx); err != nil {
+		return err
+	}
 	if info.ReviewID != 0 {
 		err = p.client.DeleteReviewComment(ctx, info.Full, commentID)
 	} else {
@@ -342,6 +349,9 @@ func (p *Provider) React(ctx context.Context, key boardsync.Key, thread boardsyn
 	}
 	info, err := p.threadWhere(key, thread)
 	if err != nil {
+		return err
+	}
+	if err := p.requireEchoGuard(ctx); err != nil {
 		return err
 	}
 	content, ok := reactionContent(emoji)
