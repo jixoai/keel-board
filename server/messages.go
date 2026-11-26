@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -248,10 +249,6 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("a post needs `channel`; a reply needs `re`"))
 		return
 	}
-	if len(body.Attachments) > 0 {
-		writeError(w, protocol.Invalid("attachments: phase 1 keeps no files"))
-		return
-	}
 	if len(body.Sync) > 0 {
 		writeError(w, protocol.Invalid("sync: phase 1 syncs nothing"))
 		return
@@ -260,7 +257,19 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NewError(protocol.CodeInvalidAfter, "`after` is for replies: it names the newest message in `re`'s thread"))
 		return
 	}
-	if err := protocol.ValidateText(body.Text); err != nil {
+	if err := protocol.ValidateAttachmentIDs(body.Attachments); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := protocol.ValidateMessageText(body.Text, len(body.Attachments) > 0); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := protocol.ValidateBlocks(body.Text); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := protocol.ValidateMentions(body.Text); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -349,6 +358,11 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	attachments, perr := s.bindAttachments(req, body.Attachments)
+	if perr != nil {
+		writeError(w, perr)
+		return
+	}
 
 	reValue := ""
 	if body.Re != nil {
@@ -367,6 +381,9 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 			}
 			postID = replay.MessageIDs[0]
 			return nil
+		}
+		if perr := s.verifyAttachments(req, attachments); perr != nil {
+			return perr
 		}
 		thread := log.ThreadKey(rootID)
 		if body.Re != nil {
@@ -394,15 +411,16 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 			re = &rootID
 		}
 		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
-			ID:      postID,
-			Channel: channel,
-			Text:    body.Text,
-			Re:      re,
-			ReplyTo: replyTo,
-			Thread:  thread,
-			Labels:  nonNilLabels(body.Labels),
-			NoSync:  body.NoSync,
-			By:      req.actor.Actored(),
+			ID:          postID,
+			Channel:     channel,
+			Text:        body.Text,
+			Re:          re,
+			ReplyTo:     replyTo,
+			Thread:      thread,
+			Labels:      nonNilLabels(body.Labels),
+			NoSync:      body.NoSync,
+			By:          req.actor.Actored(),
+			Attachments: attachments,
 			// Where its author can't read the channel, the write still lands,
 			// but the board marks it: only its author changes such a post
 			// without reading it.
@@ -637,6 +655,22 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 					return protocol.NewError(protocol.CodeLabelConflict, fmt.Sprintf("%s isn't %s", key, *wanted))
 				}
 			}
+		}
+		// A write that leaves the labels as they are is the same board: a
+		// retried write lands nothing. The net effect matters: setting a key
+		// and unsetting it in one write changes nothing.
+		desired := make(map[string]string, len(message.Labels)+len(body.Set))
+		for key, value := range message.Labels {
+			desired[key] = value
+		}
+		for key, value := range body.Set {
+			desired[key] = value
+		}
+		for _, key := range body.Unset {
+			delete(desired, key)
+		}
+		if maps.Equal(desired, message.Labels) {
+			return nil
 		}
 		if needsActorSeen(tx.Read(), req.actor) {
 			tx.Emit(log.EventActorSeen, actorSeenPayload(req.actor))

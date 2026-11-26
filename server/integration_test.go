@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
@@ -43,6 +44,7 @@ type harness struct {
 	http  *httptest.Server
 	board *log.Board
 	clock *testClock
+	blobs blob.Store
 }
 
 func newHarness(t *testing.T, options ...server.Options) *harness {
@@ -58,11 +60,19 @@ func newHarness(t *testing.T, options ...server.Options) *harness {
 		if supplied.Authorize != nil {
 			opts.Authorize = supplied.Authorize
 		}
+		opts.Blobs = supplied.Blobs
+		opts.Now = supplied.Now
+		if supplied.Actor != nil {
+			opts.Actor = supplied.Actor
+		}
+		if supplied.Tenant != nil {
+			opts.Tenant = supplied.Tenant
+		}
 	}
 	api := server.New(opts)
 	httpServer := httptest.NewServer(api)
 	t.Cleanup(httpServer.Close)
-	return &harness{t: t, http: httpServer, board: board, clock: clock}
+	return &harness{t: t, http: httpServer, board: board, clock: clock, blobs: opts.Blobs}
 }
 
 // request makes a request with an actor and optional tenant.

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 )
@@ -36,6 +37,8 @@ type Server struct {
 	version   string
 	mux       *http.ServeMux
 	logger    *slog.Logger
+	blobs     blob.Store
+	now       func() time.Time
 }
 
 // Options configure a Server.
@@ -55,6 +58,11 @@ type Options struct {
 	Version string
 	// Logger receives unexpected failures. Default: slog.Default().
 	Logger *slog.Logger
+	// Blobs keeps attachment bytes. Nil keeps no files: every attachment route
+	// answers 501 no_files, as a board without a store does.
+	Blobs blob.Store
+	// Now is the server's clock for upload tickets. Default: time.Now.
+	Now func() time.Time
 }
 
 // New returns a server. It panics if no board is given: a server without a
@@ -78,6 +86,9 @@ func New(opts Options) *Server {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	server := &Server{
 		board:     opts.Board,
 		authorize: opts.Authorize,
@@ -86,6 +97,8 @@ func New(opts Options) *Server {
 		version:   opts.Version,
 		mux:       http.NewServeMux(),
 		logger:    opts.Logger,
+		blobs:     opts.Blobs,
+		now:       opts.Now,
 	}
 	server.routes()
 	return server
@@ -100,9 +113,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+base+"/messages", s.handleListMessages)
 	s.mux.HandleFunc("POST "+base+"/messages", s.handlePost)
 	s.mux.HandleFunc("GET "+base+"/messages/{id}", s.handleThread)
+	s.mux.HandleFunc("POST "+base+"/messages/{id}/edit", s.handleEdit)
+	s.mux.HandleFunc("POST "+base+"/messages/{id}/delete", s.handleDelete)
+	s.mux.HandleFunc("POST "+base+"/messages/{id}/reactions", s.handleReact)
+	s.mux.HandleFunc("GET "+base+"/messages/{id}/labels", s.handleListLabels)
 	s.mux.HandleFunc("POST "+base+"/messages/{id}/labels", s.handleLabels)
+	s.mux.HandleFunc("GET "+base+"/threads", s.handleThreads)
+	s.mux.HandleFunc("GET "+base+"/actors", s.handleActors)
 	s.mux.HandleFunc("GET "+base+"/tasks", s.handleListTasks)
 	s.mux.HandleFunc("POST "+base+"/tasks", s.handleCreateTask)
+	s.mux.HandleFunc("POST "+base+"/tasks/batch", s.handleBatchTasks)
+	s.mux.HandleFunc("GET "+base+"/tasks/batch/{id}", s.handleCreatedTasks)
 	s.mux.HandleFunc("POST "+base+"/tasks/claim", s.handleClaimReady)
 	s.mux.HandleFunc("POST "+base+"/tasks/{id}/claim", s.handleClaimTask)
 	s.mux.HandleFunc("POST "+base+"/tasks/{id}/renew", s.handleRenewTask)
@@ -115,6 +136,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+base+"/tasks/{id}/assign", s.handleAssignTask)
 	s.mux.HandleFunc("POST "+base+"/tasks/{id}/needs", s.handleSetTaskNeeds)
 	s.mux.HandleFunc("POST "+base+"/tasks/{id}/cancel", s.handleCancelTask)
+	s.mux.HandleFunc("POST "+base+"/attachments", s.handleUpload)
+	s.mux.HandleFunc("GET "+base+"/attachments/{id}", s.handleAttachment)
+	s.mux.HandleFunc("DELETE "+base+"/attachments/{id}", s.handleDeleteAttachment)
+	s.mux.HandleFunc("POST "+base+"/attachments/uploads", s.handleUploadStart)
+	s.mux.HandleFunc("POST "+base+"/attachments/uploads/{id}", s.handleUploadFinish)
 	s.mux.HandleFunc("GET "+base+"/events", s.handleEvents)
 	// Anything else answers the board's own error shape.
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -260,7 +286,7 @@ func decodeBody(r *http.Request, into any, strict, optional bool) *protocol.Erro
 		}
 		return protocol.Invalid("invalid request: a JSON body is required")
 	}
-	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
 	if strict {
 		decoder.DisallowUnknownFields()
 	}

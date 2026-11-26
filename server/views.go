@@ -52,7 +52,7 @@ func messageView(snapshot *log.Snapshot, message *log.Message, fallback *protoco
 		ReplyTo:     optionalRef(message.ReplyTo),
 		Thread:      message.Thread,
 		Labels:      labels,
-		Reactions:   map[string][]protocol.Ref{},
+		Reactions:   reactionViews(message.Reactions),
 		NoSync:      message.NoSync,
 		From:        message.From,
 		CreatedAt:   protocol.FormatTime(message.CreatedAt),
@@ -63,9 +63,9 @@ func messageView(snapshot *log.Snapshot, message *log.Message, fallback *protoco
 		Links:       []protocol.LinkView{},
 		Version:     message.Version,
 		Revision:    message.Revision,
-		Task:        taskView(message.Task),
+		Task:        taskView(message.Task, snapshot, fallback),
 		Blind:       message.Blind,
-		Blocks:      []protocol.BlockView{},
+		Blocks:      protocol.BlocksIn(message.Text),
 		By:          actorView(snapshot, message.By.Actor, fallback),
 	}
 	if len(message.Attachments) > 0 {
@@ -75,8 +75,22 @@ func messageView(snapshot *log.Snapshot, message *log.Message, fallback *protoco
 	return view
 }
 
+// reactionViews renders a message's reactions: each emoji and the actors who
+// chose it, in the order they did.
+func reactionViews(reactions map[string][]string) map[string][]protocol.Ref {
+	out := make(map[string][]protocol.Ref, len(reactions))
+	for emoji, actors := range reactions {
+		refs := make([]protocol.Ref, 0, len(actors))
+		for _, actor := range actors {
+			refs = append(refs, actor)
+		}
+		out[emoji] = refs
+	}
+	return out
+}
+
 // taskView renders a task, without its claim's token.
-func taskView(task *log.Task) *protocol.TaskView {
+func taskView(task *log.Task, snapshot *log.Snapshot, fallback *protocol.Actor) *protocol.TaskView {
 	if task == nil {
 		return nil
 	}
@@ -85,12 +99,13 @@ func taskView(task *log.Task) *protocol.TaskView {
 		needs = append(needs, protocol.FormatRef(id))
 	}
 	view := &protocol.TaskView{
-		State: task.State,
-		Owner: task.Owner,
-		By:    task.By,
-		For:   task.For,
-		Needs: needs,
-		Epoch: task.Epoch,
+		State:  task.State,
+		Owner:  task.Owner,
+		By:     task.By,
+		Author: actorView(snapshot, task.By, fallback),
+		For:    task.For,
+		Needs:  needs,
+		Epoch:  task.Epoch,
 	}
 	if task.Claim != nil {
 		view.Claim = &protocol.ClaimView{Actor: task.Claim.Actor, Until: protocol.FormatTime(task.Claim.Until)}
@@ -190,6 +205,8 @@ func payloadActor(payload any) string {
 	case *log.MessageEditedPayload:
 		return value.By.Actor
 	case *log.MessageDeletedPayload:
+		return value.By.Actor
+	case *log.ReactionPayload:
 		return value.By.Actor
 	case *log.LabelsChangedPayload:
 		return value.By.Actor

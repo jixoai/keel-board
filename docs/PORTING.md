@@ -22,12 +22,32 @@ Source: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0` (Apache-2.0).
 - TypeScript runtime → Go library + HTTP server.
 - SQLite-only local engine → PostgreSQL/SQLite/memory behind one interface.
 
-## Phase 1
+## Phase 1 and 3 (message surface)
 
 Implemented, end to end:
 
 - Channels (`GET`/`POST /channels`), messages (`GET`/`POST /messages`,
-  `GET /messages/{id}`) and label writes (`POST /messages/{id}/labels`).
+  `GET /messages/{id}`) and the full message surface (`POST edit`, `POST
+  delete`, `POST reactions`, `GET`/`POST labels`).
+- Threads (`GET /threads`) with latest-activity ordering, `after` and `older`
+  (`before`) paging, root/reply attribution, per-channel counts, and thread
+  summaries (`message`, live `replies`, `last`).
+- Actors (`GET /actors`) and actor snapshots on messages (`by`/`author`) and
+  tasks (`task.author`); edit, delete, reaction, label, and task writes record
+  their actor.
+- Attachments: `POST /attachments` (4 MB body), `GET`/`DELETE
+  /attachments/{id}`, `POST /attachments/uploads` and `POST
+  /attachments/uploads/{id}` for signed direct uploads, at most 10 files per
+  message, content-addressed IDs, and a `blob.Store` seam with memory and FS
+  implementations.
+- JSON blocks: `json#name@version` fences are parsed, checked against a
+  schema, and shown in `message.blocks`; mentions (`@[actor-id]` and `@handle`)
+  are parsed and exact IDs validated; `mentions`, `label`, `text`, `by`, `re`,
+  and `from` narrow `/threads`.
+- Batch tasks (`POST /tasks/batch`, `GET /tasks/batch/{id}`): several new
+  task threads in one channel, made in one append, with `key`-based needs,
+  external prerequisites, assignees, attachments, and an `id`/`request`
+  idempotency digest.
 - Tasks (`GET`/`POST /tasks`), `claim`/`claim-ready`, `renew`, `release`,
   `complete`, `fail`, `block`, `unblock`, `reopen`, `assign`, `needs`, `cancel`,
   with lease expiry, epoch/token fencing, owned-or-manage changes, and
@@ -45,6 +65,60 @@ admission and lockout checks, and a tenant-aware authorizer. Sync and its
 receipts, reactions, files and attachments, schedules, schemas and blocks, and
 watchers remain outside phase 1; their wire types are not served, and requests
 that name them are refused rather than half-accepted.
+
+### Message surface semantics
+
+- An edit or delete is its author's (`post` in the channel, and the principal
+  or the exact profile that wrote it). Someone else's answers 403 where the
+  caller can read it and 404 where it can't, unless it is the caller's own
+  blind post.
+- `revision` moves only on a post, edit, or delete; every change moves
+  `version`. An edit/delete may carry the `revision` the caller read: a moved
+  message answers 409 `revision_conflict` and nothing lands.
+- Deleting a message leaves a tombstone: its text, labels, reactions, files,
+  and blocks empty, its ID, channel, thread, author, and timestamps kept, and
+  its replies still in the thread. A retried delete is a no-op; an edit of a
+  tombstone answers `message_deleted` (or `revision_conflict` at a stale
+  revision).
+- Deleting a task's root cancels the task (`reason: deleted`) in the same
+  append. Editing a task's root by anyone but its owner holds the task for its
+  owner (`blocked.kind: edited`) and ends any claim.
+- Reactions are stored under Chat SDK names (`thumbs_up`), with common Slack
+  aliases normalized. A repeated add/remove is a no-op.
+- Label writes under `board.` are refused, and a write that leaves labels as
+  they are emits nothing.
+
+### Deliberate simplifications
+
+- **Blocks use built-in schemas only.** There is no writable schema registry
+  yet: `git-commit@1` and `vercel-deployment@1` are known, and any other
+  `json#name@version` fence is refused with `invalid_block`. The scanner reads
+  top-level fences, not upstream's full Markdown containers (quotes/list
+  items).
+- **Mentions are parsed, not settled.** `@[actor-id]` is validated as an actor
+  ID; `@handle` stays as typed and filters match it as written. Upstream also
+  rewrites a unique `@handle` to `@[actor-id]` and accepts email mentions from
+  sync.
+- **Emoji normalization is a small table.** Short names and common Slack
+  aliases (`+1`, `white_check_mark`, …) are canonicalized; Unicode emoji
+  characters aren't.
+- **Attachments gained an explicit delete.** Upstream has no delete route; here
+  the uploader may delete bytes no live message carries, messages hide their
+  files when deleted, and the uploader keeps read access (as upstream). Upload
+  itself isn't permission-checked because the `Authorizer` seam answers per
+  channel; binding a file to a message requires `post` there. Direct uploads
+  exist only for a `blob.Store` that also implements `blob.UploadSigner`; no
+  external object store is wired in.
+- **Thread filters are computed over the folded log.** There's no search
+  index; `from` matches only `board` (nothing records sync origins yet).
+- **Batch is the plan.** Upstream has no separate plan entry; a batch whose
+  tasks wait on each other by `key` is that plan. The batch `request` digest is
+  trusted as a fronting board's, as upstream does.
+- **No migration change.** Every new fact rides the existing `payload jsonb`
+  column; `store/migrations/0001_board_log.sql` is unchanged.
+
+Tests: `go test -count=1 ./...`, `go test -race ./...`, `go vet ./...`,
+`gofmt -l .`.
 
 ## Deliberate differences
 

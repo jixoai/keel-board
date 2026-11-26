@@ -340,8 +340,12 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("a task needs `channel` and `text` for a new thread, or `re` for a thread that's there"))
 		return
 	}
-	if len(body.Attachments) > 0 {
-		writeError(w, protocol.Invalid("attachments: phase 1 keeps no files"))
+	if len(body.Attachments) > 0 && body.Re != nil {
+		writeError(w, protocol.Invalid("`attachments` are a new thread's: `re` makes a task of a thread as it is"))
+		return
+	}
+	if err := protocol.ValidateAttachmentIDs(body.Attachments); err != nil {
+		writeError(w, err)
 		return
 	}
 	if body.Lease != nil && !body.Claim {
@@ -371,7 +375,7 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	var self *uint64
 	if body.Re != nil {
-		if body.Text != nil || body.Labels != nil || body.NoSync || body.ID != "" {
+		if body.Text != nil || body.Labels != nil || body.NoSync || body.ID != "" || len(body.Attachments) > 0 {
 			writeError(w, protocol.Invalid("`text`, `labels`, `noSync`, `attachments`, and `id` are a new thread's: `re` makes a task of a thread as it is"))
 			return
 		}
@@ -390,7 +394,15 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		if body.Text != nil {
 			text = *body.Text
 		}
-		if err := protocol.ValidateText(text); err != nil {
+		if err := protocol.ValidateMessageText(text, len(body.Attachments) > 0); err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := protocol.ValidateBlocks(text); err != nil {
+			writeError(w, err)
+			return
+		}
+		if err := protocol.ValidateMentions(text); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -468,6 +480,11 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	attachments, perr := s.bindAttachments(req, body.Attachments)
+	if perr != nil {
+		writeError(w, perr)
+		return
+	}
 
 	reValue := ""
 	if body.Re != nil {
@@ -490,6 +507,9 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 			preview = log.CloneMessage(tx.Message(replay.MessageIDs[0]))
 			claim = nil
 			return nil
+		}
+		if perr := s.verifyAttachments(req, attachments); perr != nil {
+			return perr
 		}
 		now := tx.Now()
 		if body.Re != nil {
@@ -541,14 +561,15 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 				text = *body.Text
 			}
 			tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
-				ID:      rootID,
-				Channel: channel,
-				Text:    text,
-				Thread:  thread,
-				Labels:  nonNilLabels(body.Labels),
-				NoSync:  body.NoSync,
-				By:      req.actor.Actored(),
-				Blind:   !req.can(s, channel, protocol.PermissionRead),
+				ID:          rootID,
+				Channel:     channel,
+				Text:        text,
+				Thread:      thread,
+				Labels:      nonNilLabels(body.Labels),
+				NoSync:      body.NoSync,
+				By:          req.actor.Actored(),
+				Attachments: attachments,
+				Blind:       !req.can(s, channel, protocol.PermissionRead),
 			})
 		}
 		tx.Emit(log.EventTaskCreated, &log.TaskCreatedPayload{

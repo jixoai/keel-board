@@ -18,6 +18,7 @@ type Message struct {
 	// Thread is the thread key: the root's ID in decimal, as a ref.
 	Thread    string
 	Labels    map[string]string
+	Reactions map[string][]string
 	By        Author
 	NoSync    bool
 	From      *string
@@ -33,8 +34,7 @@ type Message struct {
 	// Blind marks a message its author couldn't read the channel of.
 	Blind bool
 
-	// Attachments and Links are wire shape only in phase 1: the board stores
-	// no files and records no platform links.
+	// Attachments are the files the message carries. A tombstone keeps none.
 	Attachments []protocol.Attachment
 	Links       []any
 }
@@ -131,11 +131,14 @@ func (s *State) Apply(event Event) {
 			message.Deleted = true
 			message.Text = ""
 			message.Labels = map[string]string{}
+			message.Reactions = map[string][]string{}
 			message.Attachments = nil
 			message.Links = nil
 			message.Version = event.Seq
 			message.Revision = event.Seq
 		}
+	case *ReactionPayload:
+		s.applyReaction(payload, event.Seq, event.Type == EventReactionRemoved)
 	case *LabelsChangedPayload:
 		if message := s.Messages[payload.ID]; message != nil && !message.Deleted {
 			for key, value := range payload.Set {
@@ -338,20 +341,22 @@ func (s *State) applyPosted(event Event) {
 		labels[key] = value
 	}
 	message := &Message{
-		ID:        event.Seq,
-		Channel:   payload.Channel,
-		Text:      payload.Text,
-		Re:        copyUint64(payload.Re),
-		ReplyTo:   copyUint64(payload.ReplyTo),
-		Thread:    payload.Thread,
-		Labels:    labels,
-		By:        payload.By,
-		NoSync:    payload.NoSync,
-		From:      copyString(payload.From),
-		CreatedAt: event.At,
-		Version:   event.Seq,
-		Revision:  event.Seq,
-		Blind:     payload.Blind,
+		ID:          event.Seq,
+		Channel:     payload.Channel,
+		Text:        payload.Text,
+		Re:          copyUint64(payload.Re),
+		ReplyTo:     copyUint64(payload.ReplyTo),
+		Thread:      payload.Thread,
+		Labels:      labels,
+		Reactions:   map[string][]string{},
+		By:          payload.By,
+		NoSync:      payload.NoSync,
+		From:        copyString(payload.From),
+		CreatedAt:   event.At,
+		Version:     event.Seq,
+		Revision:    event.Seq,
+		Blind:       payload.Blind,
+		Attachments: append([]protocol.Attachment(nil), payload.Attachments...),
 	}
 	s.Messages[event.Seq] = message
 	if payload.Re != nil {
@@ -363,6 +368,37 @@ func (s *State) applyPosted(event Event) {
 	if payload.Re == nil {
 		channel.Threads++
 	}
+}
+
+// applyReaction adds or removes one actor's reaction. An add an actor already
+// made, or a remove of one it never made, changes nothing: a retried write is
+// the same board.
+func (s *State) applyReaction(payload *ReactionPayload, seq uint64, remove bool) {
+	message := s.Messages[payload.ID]
+	if message == nil || message.Deleted {
+		return
+	}
+	if message.Reactions == nil {
+		message.Reactions = map[string][]string{}
+	}
+	actors := message.Reactions[payload.Emoji]
+	if remove {
+		if !containsString(actors, payload.By.Actor) {
+			return
+		}
+		kept := withoutString(append([]string(nil), actors...), payload.By.Actor)
+		if len(kept) > 0 {
+			message.Reactions[payload.Emoji] = kept
+		} else {
+			delete(message.Reactions, payload.Emoji)
+		}
+	} else {
+		if containsString(actors, payload.By.Actor) {
+			return
+		}
+		message.Reactions[payload.Emoji] = append(actors, payload.By.Actor)
+	}
+	message.Version = seq
 }
 
 func (s *State) applyTaskCreated(payload *TaskCreatedPayload, seq uint64) {
@@ -443,6 +479,12 @@ func CloneMessage(message *Message) *Message {
 	for key, value := range message.Labels {
 		copy.Labels[key] = value
 	}
+	copy.Reactions = make(map[string][]string, len(message.Reactions))
+	for emoji, actors := range message.Reactions {
+		copy.Reactions[emoji] = append([]string(nil), actors...)
+	}
+	copy.Attachments = append([]protocol.Attachment(nil), message.Attachments...)
+	copy.Links = append([]any(nil), message.Links...)
 	if message.Task != nil {
 		task := *message.Task
 		task.For = copyString(message.Task.For)

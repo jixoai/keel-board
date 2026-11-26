@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -153,6 +154,9 @@ type TaskView struct {
 	Blocked *HoldView  `json:"blocked"`
 	Result  *string    `json:"result"`
 	Reason  *string    `json:"reason"`
+	// Author is who made the thread a task, as a snapshot: a task's actor
+	// record, kept beside its ID as a message's is.
+	Author *ActorView `json:"author,omitempty"`
 }
 
 // MessageView is a message as clients see it. IDs are refs, version grows
@@ -232,6 +236,32 @@ type MessagesPage struct {
 type TasksPage struct {
 	Tasks  []ThreadSummary `json:"tasks"`
 	Cursor Ref             `json:"cursor"`
+}
+
+// ThreadsPage is a page of threads by latest activity. Older is the `before`
+// of the page before it when there is one, else null.
+type ThreadsPage struct {
+	Threads []ThreadSummary `json:"threads"`
+	Cursor  Ref             `json:"cursor"`
+	Older   *string         `json:"older"`
+}
+
+// ActorWithID is an actor as the board's actor list shows it.
+type ActorWithID struct {
+	ID ActorID `json:"id"`
+	ActorView
+}
+
+// ActorsPage is the actors a board knows, and the cursor the read reflects.
+type ActorsPage struct {
+	Actors []ActorWithID `json:"actors"`
+	Cursor Ref           `json:"cursor"`
+}
+
+// LabelList is one message's labels and the cursor the read reflects.
+type LabelList struct {
+	Labels map[string]string `json:"labels"`
+	Cursor Ref               `json:"cursor"`
 }
 
 // TaskClaim is what a claim answers once: epoch and token go on every write
@@ -357,6 +387,72 @@ type (
 	CancelRequest struct {
 		Reason string `json:"reason"`
 	}
+
+	// EditRequest is POST /messages/:id/edit. A revision, when given, must be
+	// the message's revision as the caller read it.
+	EditRequest struct {
+		Text     string  `json:"text"`
+		Revision *uint64 `json:"revision"`
+	}
+
+	// DeleteRequest is POST /messages/:id/delete. The body may be absent.
+	DeleteRequest struct {
+		Revision *uint64 `json:"revision"`
+	}
+
+	// ReactRequest is POST /messages/:id/reactions.
+	ReactRequest struct {
+		Emoji  string `json:"emoji"`
+		Remove bool   `json:"remove"`
+	}
+
+	// BatchTask is one task of a batch: a new thread's root and task.
+	BatchTask struct {
+		Key         string            `json:"key"`
+		Text        string            `json:"text"`
+		Labels      map[string]string `json:"labels"`
+		NoSync      bool              `json:"noSync"`
+		Attachments []string          `json:"attachments"`
+		Needs       []BatchNeed       `json:"needs"`
+		For         NullableString    `json:"for"`
+	}
+
+	// CreateTasksRequest is POST /tasks/batch: several new threads in one
+	// channel, each a task, made in one write. ID names the batch for a retry;
+	// Request optionally carries a fronting board's digest of the request.
+	CreateTasksRequest struct {
+		Channel string      `json:"channel"`
+		Tasks   []BatchTask `json:"tasks"`
+		ID      string      `json:"id"`
+		Request string      `json:"request"`
+	}
+
+	// CreatedTasksPage is GET /tasks/batch/:id: the batch's roots as they are.
+	CreatedTasksPage struct {
+		Tasks []MessageView `json:"tasks"`
+	}
+
+	// UploadStartRequest is POST /attachments/uploads: a file's name, type,
+	// exact size, and optionally the base64 SHA-256 of its bytes.
+	UploadStartRequest struct {
+		Name   *string `json:"name"`
+		Type   *string `json:"type"`
+		Size   int64   `json:"size"`
+		SHA256 *string `json:"sha256"`
+	}
+
+	// UploadTicket is where a direct upload's bytes go.
+	UploadTicket struct {
+		ID        string            `json:"id"`
+		URL       string            `json:"url"`
+		Headers   map[string]string `json:"headers"`
+		ExpiresAt string            `json:"expiresAt"`
+	}
+
+	// AttachmentResponse is what an upload answers.
+	AttachmentResponse struct {
+		Attachment Attachment `json:"attachment"`
+	}
 )
 
 // NullableString is a JSON string that may be null, and remembers whether it
@@ -378,6 +474,41 @@ func (n *NullableString) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	n.Value = &value
+	return nil
+}
+
+// BatchNeed is one task a batch task waits for: another task of the batch by
+// its key, or a task that's already there by its ref.
+type BatchNeed struct {
+	// Ref names a task already on the board. Empty for a keyed need.
+	Ref string
+	// Key names a task of the same batch. Empty for a ref need.
+	Key string
+}
+
+// UnmarshalJSON implements json.Unmarshaler for a ref string or `{ "key": k }`.
+func (need *BatchNeed) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasPrefix(trimmed, `"`) {
+		var ref string
+		if err := json.Unmarshal(data, &ref); err != nil {
+			return err
+		}
+		*need = BatchNeed{Ref: ref}
+		return nil
+	}
+	var keyed struct {
+		Key *string `json:"key"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&keyed); err != nil {
+		return err
+	}
+	if keyed.Key == nil {
+		return fmt.Errorf("a need is a message ref or { \"key\": <task key> }")
+	}
+	*need = BatchNeed{Key: *keyed.Key}
 	return nil
 }
 

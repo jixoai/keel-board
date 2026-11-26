@@ -11,63 +11,85 @@ import (
 type Code string
 
 const (
-	CodeInvalidRequest  Code = "invalid_request"
-	CodeInvalidCursor   Code = "invalid_cursor"
-	CodeInvalidAfter    Code = "invalid_after"
-	CodeInvalidNeeds    Code = "invalid_needs"
-	CodeInvalidFrom     Code = "invalid_from"
-	CodeMessageDeleted  Code = "message_deleted"
-	CodeReservedLabel   Code = "reserved_label"
-	CodeTextTooLong     Code = "text_too_long"
-	CodeBatchTooLarge   Code = "batch_too_large"
-	CodeUnauthorized    Code = "unauthorized"
-	CodeForbidden       Code = "forbidden"
-	CodeTaskNotOwned    Code = "task_not_owned"
-	CodeNotFound        Code = "not_found"
-	CodeMessageNotFound Code = "message_not_found"
-	CodeNotATask        Code = "not_a_task"
-	CodeDuplicateID     Code = "duplicate_id"
-	CodeLabelConflict   Code = "label_conflict"
-	CodeNewerMessage    Code = "newer_message"
-	CodeAlreadyATask    Code = "already_a_task"
-	CodeTaskClaimed     Code = "task_claimed"
-	CodeTaskAssigned    Code = "task_assigned"
-	CodeTaskWaiting     Code = "task_waiting"
-	CodeTaskBlocked     Code = "task_blocked"
-	CodeTaskFinished    Code = "task_finished"
-	CodeClaimLost       Code = "claim_lost"
-	CodeUnavailable     Code = "unavailable"
-	CodeInternal        Code = "internal"
+	CodeInvalidRequest     Code = "invalid_request"
+	CodeInvalidCursor      Code = "invalid_cursor"
+	CodeInvalidAfter       Code = "invalid_after"
+	CodeInvalidNeeds       Code = "invalid_needs"
+	CodeInvalidFrom        Code = "invalid_from"
+	CodeMessageDeleted     Code = "message_deleted"
+	CodeRevisionConflict   Code = "revision_conflict"
+	CodeReservedLabel      Code = "reserved_label"
+	CodeTextTooLong        Code = "text_too_long"
+	CodeBatchTooLarge      Code = "batch_too_large"
+	CodeInvalidBlock       Code = "invalid_block"
+	CodeAttachmentNotFound Code = "attachment_not_found"
+	CodeAttachmentInUse    Code = "attachment_in_use"
+	CodeTooLarge           Code = "too_large"
+	CodeNoFiles            Code = "no_files"
+	CodeNoDirectUploads    Code = "no_direct_uploads"
+	CodeUploadNotFound     Code = "upload_not_found"
+	CodeNotUploaded        Code = "not_uploaded"
+	CodeSizeMismatch       Code = "size_mismatch"
+	CodeBatchNotFound      Code = "batch_not_found"
+	CodeUnauthorized       Code = "unauthorized"
+	CodeForbidden          Code = "forbidden"
+	CodeTaskNotOwned       Code = "task_not_owned"
+	CodeNotFound           Code = "not_found"
+	CodeMessageNotFound    Code = "message_not_found"
+	CodeNotATask           Code = "not_a_task"
+	CodeDuplicateID        Code = "duplicate_id"
+	CodeLabelConflict      Code = "label_conflict"
+	CodeNewerMessage       Code = "newer_message"
+	CodeAlreadyATask       Code = "already_a_task"
+	CodeTaskClaimed        Code = "task_claimed"
+	CodeTaskAssigned       Code = "task_assigned"
+	CodeTaskWaiting        Code = "task_waiting"
+	CodeTaskBlocked        Code = "task_blocked"
+	CodeTaskFinished       Code = "task_finished"
+	CodeClaimLost          Code = "claim_lost"
+	CodeUnavailable        Code = "unavailable"
+	CodeInternal           Code = "internal"
 )
 
 var statuses = map[Code]int{
-	CodeInvalidRequest:  http.StatusBadRequest,
-	CodeInvalidCursor:   http.StatusBadRequest,
-	CodeInvalidAfter:    http.StatusBadRequest,
-	CodeInvalidNeeds:    http.StatusBadRequest,
-	CodeInvalidFrom:     http.StatusBadRequest,
-	CodeMessageDeleted:  http.StatusBadRequest,
-	CodeReservedLabel:   http.StatusBadRequest,
-	CodeTextTooLong:     http.StatusBadRequest,
-	CodeBatchTooLarge:   http.StatusBadRequest,
-	CodeUnauthorized:    http.StatusUnauthorized,
-	CodeForbidden:       http.StatusForbidden,
-	CodeTaskNotOwned:    http.StatusForbidden,
-	CodeNotFound:        http.StatusNotFound,
-	CodeMessageNotFound: http.StatusNotFound,
-	CodeNotATask:        http.StatusNotFound,
-	CodeDuplicateID:     http.StatusConflict,
-	CodeLabelConflict:   http.StatusConflict,
-	CodeNewerMessage:    http.StatusConflict,
-	CodeAlreadyATask:    http.StatusConflict,
-	CodeTaskClaimed:     http.StatusConflict,
-	CodeTaskAssigned:    http.StatusConflict,
-	CodeTaskWaiting:     http.StatusConflict,
-	CodeTaskBlocked:     http.StatusConflict,
-	CodeTaskFinished:    http.StatusConflict,
-	CodeClaimLost:       http.StatusConflict,
-	CodeUnavailable:     http.StatusServiceUnavailable,
-	CodeInternal:        http.StatusInternalServerError,
+	CodeInvalidRequest:     http.StatusBadRequest,
+	CodeInvalidCursor:      http.StatusBadRequest,
+	CodeInvalidAfter:       http.StatusBadRequest,
+	CodeInvalidNeeds:       http.StatusBadRequest,
+	CodeInvalidFrom:        http.StatusBadRequest,
+	CodeMessageDeleted:     http.StatusBadRequest,
+	CodeRevisionConflict:   http.StatusConflict,
+	CodeReservedLabel:      http.StatusBadRequest,
+	CodeTextTooLong:        http.StatusBadRequest,
+	CodeBatchTooLarge:      http.StatusBadRequest,
+	CodeInvalidBlock:       http.StatusBadRequest,
+	CodeAttachmentNotFound: http.StatusNotFound,
+	CodeAttachmentInUse:    http.StatusConflict,
+	CodeTooLarge:           http.StatusRequestEntityTooLarge,
+	CodeNoFiles:            http.StatusNotImplemented,
+	CodeNoDirectUploads:    http.StatusNotImplemented,
+	CodeUploadNotFound:     http.StatusNotFound,
+	CodeNotUploaded:        http.StatusConflict,
+	CodeSizeMismatch:       http.StatusBadRequest,
+	CodeBatchNotFound:      http.StatusNotFound,
+	CodeUnauthorized:       http.StatusUnauthorized,
+	CodeForbidden:          http.StatusForbidden,
+	CodeTaskNotOwned:       http.StatusForbidden,
+	CodeNotFound:           http.StatusNotFound,
+	CodeMessageNotFound:    http.StatusNotFound,
+	CodeNotATask:           http.StatusNotFound,
+	CodeDuplicateID:        http.StatusConflict,
+	CodeLabelConflict:      http.StatusConflict,
+	CodeNewerMessage:       http.StatusConflict,
+	CodeAlreadyATask:       http.StatusConflict,
+	CodeTaskClaimed:        http.StatusConflict,
+	CodeTaskAssigned:       http.StatusConflict,
+	CodeTaskWaiting:        http.StatusConflict,
+	CodeTaskBlocked:        http.StatusConflict,
+	CodeTaskFinished:       http.StatusConflict,
+	CodeClaimLost:          http.StatusConflict,
+	CodeUnavailable:        http.StatusServiceUnavailable,
+	CodeInternal:           http.StatusInternalServerError,
 }
 
 // StatusOf returns the HTTP status a code answers with. An unknown code is a

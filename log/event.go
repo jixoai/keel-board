@@ -22,6 +22,8 @@ const (
 	EventChannelCreated  EventType = "channel.created"
 	EventMessageEdited   EventType = "message.edited"
 	EventMessageDeleted  EventType = "message.deleted"
+	EventReactionAdded   EventType = "reaction.added"
+	EventReactionRemoved EventType = "reaction.removed"
 	EventLabelsChanged   EventType = "labels.changed"
 	EventActorSeen       EventType = "actor.seen"
 	EventTaskCreated     EventType = "task.created"
@@ -66,6 +68,8 @@ func ConcernedMessageID(event Event) uint64 {
 		return payload.ID
 	case *MessageDeletedPayload:
 		return payload.ID
+	case *ReactionPayload:
+		return payload.ID
 	case *LabelsChangedPayload:
 		return payload.ID
 	case interface{ messageID() uint64 }:
@@ -109,6 +113,9 @@ type MessagePostedPayload struct {
 	By      Author            `json:"by"`
 	From    *string           `json:"from"`
 	Blind   bool              `json:"blind,omitempty"`
+	// Attachments are the files the message carries, as the board stored
+	// them when it bound them. Empty for a message with none.
+	Attachments []protocol.Attachment `json:"attachments,omitempty"`
 	// Along is how many events right after this post, in its append, are
 	// about it: what made a new thread a task.
 	Along int `json:"along,omitempty"`
@@ -147,6 +154,18 @@ type MessageDeletedPayload struct {
 }
 
 func (p *MessageDeletedPayload) messageID() uint64 { return p.ID }
+
+// ReactionPayload adds or removes one actor's reaction to a message. Emoji is
+// already canonical when the board appends it.
+type ReactionPayload struct {
+	ID     uint64  `json:"id"`
+	Thread string  `json:"thread"`
+	Emoji  string  `json:"emoji"`
+	By     Author  `json:"by"`
+	From   *string `json:"from"`
+}
+
+func (p *ReactionPayload) messageID() uint64 { return p.ID }
 
 // LabelsChangedPayload sets and unsets labels on a message.
 type LabelsChangedPayload struct {

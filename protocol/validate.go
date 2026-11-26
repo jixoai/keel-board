@@ -3,6 +3,7 @@ package protocol
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -21,12 +22,33 @@ const (
 	ClientIDMax        = 200
 	TaskNeedsMax       = 20
 	TaskNoteMax        = 1000
+	TaskKeyMax         = 64
+	TaskBatchMax       = 100
 	HoldKindMax        = 64
 	LeaseDefaultSecs   = 900
 	LeaseMinSecs       = 30
 	LeaseMaxSecs       = 3600
 	ClaimTokenChars    = 43
 	MaxLabelConditions = 16
+
+	// AttachmentBytesMax is the most a request may upload in one body. It
+	// sits under a typical 4.5 MB function body limit.
+	AttachmentBytesMax = 4 * 1024 * 1024
+	// DirectUploadBytesMax is the most a signed direct upload may carry.
+	DirectUploadBytesMax = 100 * 1024 * 1024
+	// AttachmentsPerMessageMax is how many files one message carries.
+	AttachmentsPerMessageMax = 10
+	// AttachmentNameMax is how long a stored file name may be.
+	AttachmentNameMax = 255
+	// EmojiMax is how long a reaction's name may be.
+	EmojiMax = 64
+	// ThreadsLimitDefault and ThreadsLimitMax bound a thread page.
+	ThreadsLimitDefault = 50
+	ThreadsLimitMax     = 500
+	// ActorsByIdMax is how many actors one read may name.
+	ActorsByIdMax = 100
+	// BatchRequestMax is how long a batch's request digest may be.
+	BatchRequestMax = 64
 )
 
 const (
@@ -79,9 +101,16 @@ func ValidateChannelOrSubtree(value string) *Error {
 
 // ValidateText validates a message's text as a request sends it: it must say
 // something, be at most MessageTextMax characters, and be storable. An empty
-// text is only allowed with attachments, which phase 1 doesn't serve.
+// text is only allowed with attachments.
 func ValidateText(text string) *Error {
-	if strings.TrimSpace(text) == "" {
+	return ValidateMessageText(text, false)
+}
+
+// ValidateMessageText validates a message's text, allowing it to be empty when
+// the message carries attachments. Upstream lets a file-only message say
+// nothing; every other write still needs text.
+func ValidateMessageText(text string, hasAttachments bool) *Error {
+	if strings.TrimSpace(text) == "" && !hasAttachments {
 		return Invalid("text: message text is empty")
 	}
 	if utf8.RuneCountInString(text) > MessageTextMax {
@@ -294,3 +323,197 @@ func ValidTaskState(state string) bool {
 
 // OpenTaskStates are the states a task can still leave by being worked.
 var OpenTaskStates = []string{"waiting", "ready", "claimed", "blocked"}
+
+var (
+	attachmentIDExpr   = regexp.MustCompile(`^(?:[A-Za-z0-9_-]{22}|att_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`)
+	emojiExpr          = regexp.MustCompile(`^[a-z0-9_+-]+$`)
+	mediaTypeExpr      = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$`)
+	threadPositionExpr = regexp.MustCompile(`^([1-9][0-9]{0,15})\.([1-9][0-9]{0,15})$`)
+)
+
+// reservedEmoji are names a JavaScript object already has. A board that keys
+// reactions by name refuses them, as upstream does.
+var reservedEmoji = map[string]bool{
+	"constructor": true,
+	"prototype":   true,
+	"__proto__":   true,
+	"tostring":    true,
+	"valueof":     true,
+}
+
+// ValidateRevision validates a message's `revision` precondition: the positive
+// revision the caller read.
+func ValidateRevision(revision *uint64) *Error {
+	if revision == nil {
+		return nil
+	}
+	if *revision == 0 {
+		return Invalid("revision: a message's revision is a positive number")
+	}
+	return nil
+}
+
+// ValidateEmoji validates a reaction's name: a short name such as thumbs_up,
+// 1 to EmojiMax lowercase letters, numbers, _ and -, and not a reserved name.
+func ValidateEmoji(name string) *Error {
+	if len(name) == 0 || len(name) > EmojiMax || !emojiExpr.MatchString(name) {
+		return Invalidf("emoji: %q isn't an emoji name: one is 1 to %d lowercase letters, numbers, _ and -", name, EmojiMax)
+	}
+	if reservedEmoji[name] {
+		return Invalidf("emoji: %s is a reserved name", name)
+	}
+	return nil
+}
+
+// emojiAliases maps the platform names the board used to accept to the Chat
+// SDK names it stores, as upstream's table does for the common ones. A name
+// it doesn't know is its own.
+var emojiAliases = map[string]string{
+	"+1":                     "thumbs_up",
+	"thumbsup":               "thumbs_up",
+	"-1":                     "thumbs_down",
+	"thumbsdown":             "thumbs_down",
+	"white_check_mark":       "check",
+	"heavy_check_mark":       "check",
+	"ballot_box_with_check":  "check",
+	"x":                      "x",
+	"heavy_multiplication_x": "x",
+	"red_circle":             "red_circle",
+	"large_blue_circle":      "large_blue_circle",
+	"rotating_light":         "rotating_light",
+	"ship":                   "ship",
+	"tada":                   "tada",
+	"fire":                   "fire",
+	"rocket":                 "rocket",
+	"heart":                  "heart",
+	"joy":                    "joy",
+	"eyes":                   "eyes",
+	"clap":                   "clap",
+	"pray":                   "pray",
+	"warning":                "warning",
+}
+
+// CanonicalEmoji returns an emoji's stored name: the Chat SDK name for a
+// platform alias, and the name itself otherwise.
+func CanonicalEmoji(name string) string {
+	if canonical, ok := emojiAliases[name]; ok {
+		return canonical
+	}
+	return name
+}
+
+// NormalizeEmoji validates a reaction's emoji as a request sends it (with or
+// without colons) and returns its canonical stored name.
+func NormalizeEmoji(value string) (string, *Error) {
+	trimmed := strings.TrimSpace(value)
+	trimmed = strings.TrimSuffix(strings.TrimPrefix(trimmed, ":"), ":")
+	name := strings.ToLower(trimmed)
+	if err := ValidateEmoji(name); err != nil {
+		return "", err
+	}
+	return CanonicalEmoji(name), nil
+}
+
+// ValidateAttachmentID reports whether id is shaped like one this board issues:
+// 22 base64url characters (128 random bits), or an att_ UUID.
+func ValidateAttachmentID(id string) *Error {
+	if len(id) == 0 || len(id) > 128 || !attachmentIDExpr.MatchString(id) {
+		return Invalidf("%q isn't an attachment ID", id)
+	}
+	return nil
+}
+
+// ValidateAttachmentIDs validates the files a write binds: at most
+// AttachmentsPerMessageMax, each shaped like an ID. Duplicates are allowed and
+// bound once.
+func ValidateAttachmentIDs(ids []string) *Error {
+	if len(ids) > AttachmentsPerMessageMax {
+		return Invalidf("attachments: a message carries at most %d", AttachmentsPerMessageMax)
+	}
+	for _, id := range ids {
+		if err := ValidateAttachmentID(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SanitizeFileName turns a request's file name into one the board stores: the
+// last path segment, without control or invisible formatting characters, no
+// leading dot, at most AttachmentNameMax characters. An empty result is
+// "file".
+func SanitizeFileName(name string) string {
+	if index := strings.LastIndexAny(name, `/\`); index >= 0 {
+		name = name[index+1:]
+	}
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			return -1
+		}
+		return r
+	}, name)
+	clean = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(clean), "."))
+	if runes := []rune(clean); len(runes) > AttachmentNameMax {
+		clean = string(runes[:AttachmentNameMax])
+	}
+	if clean == "" {
+		return "file"
+	}
+	return clean
+}
+
+// MediaType returns a request's content type as the board stores it, falling
+// back to application/octet-stream for anything that isn't one.
+func MediaType(value string) string {
+	value = strings.ToLower(strings.TrimSpace(strings.SplitN(value, ";", 2)[0]))
+	if len(value) > 255 || !mediaTypeExpr.MatchString(value) {
+		return "application/octet-stream"
+	}
+	return value
+}
+
+// ValidateTaskKey validates a key a batch's tasks name each other by.
+func ValidateTaskKey(key string) *Error {
+	if len(key) == 0 || len(key) > TaskKeyMax {
+		return Invalidf("key: a task's key is 1 to %d characters", TaskKeyMax)
+	}
+	if !Storable(key) {
+		return Invalid("key: it has a NUL character or an invalid sequence")
+	}
+	return nil
+}
+
+// ValidateBatchRequest validates a batch's `request`: the digest of what it
+// asked for, as a board in front of this one gave it.
+func ValidateBatchRequest(request string) *Error {
+	if len(request) == 0 || len(request) > BatchRequestMax {
+		return Invalidf("request: a batch's request is 1 to %d characters", BatchRequestMax)
+	}
+	if !Storable(request) {
+		return Invalid("request: it has a NUL character or an invalid sequence")
+	}
+	return nil
+}
+
+// FormatThreadPosition returns a thread page's `older` cursor: the position of
+// the oldest thread shown, as "<activity>.<root>".
+func FormatThreadPosition(activity, root uint64) string {
+	return fmt.Sprintf("%d.%d", activity, root)
+}
+
+// ParseThreadPosition parses a thread page's `older` cursor.
+func ParseThreadPosition(value string) (activity, root uint64, ok bool) {
+	found := threadPositionExpr.FindStringSubmatch(value)
+	if found == nil {
+		return 0, 0, false
+	}
+	activity, err := strconv.ParseUint(found[1], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	root, err = strconv.ParseUint(found[2], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	return activity, root, true
+}

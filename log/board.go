@@ -509,6 +509,8 @@ type AppendResult struct {
 	LastSeq  uint64
 	// Replayed is true when the idempotency key had already landed.
 	Replayed bool
+	// Digest is what the keyed write asked for, as its key recorded it.
+	Digest string
 	// MessageIDs are the posts the write made (or made the first time).
 	MessageIDs []uint64
 }
@@ -601,6 +603,29 @@ func (b *Board) Head(tenantName string) (uint64, error) {
 		return 0, err
 	}
 	return current.state.Head, nil
+}
+
+// ReplayKey answers what an idempotent write under key landed, for a read that
+// tells a retry from a new write without writing. It reports false when no
+// write used the key.
+func (b *Board) ReplayKey(tenantName, key string) (AppendResult, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current, err := b.ensure(tenantName)
+	if err != nil {
+		return AppendResult{}, false, err
+	}
+	entry, ok := current.idem[key]
+	if !ok {
+		return AppendResult{}, false, nil
+	}
+	return AppendResult{
+		FirstSeq:   entry.first,
+		LastSeq:    entry.last,
+		Replayed:   true,
+		Digest:     entry.digest,
+		MessageIDs: append([]uint64(nil), entry.messageIDs...),
+	}, true, nil
 }
 
 // History returns events with FirstSeq <= Seq <= LastSeq, in order.
@@ -845,6 +870,16 @@ func (s *Snapshot) MessagesInChannel(channel string) []*Message {
 	return out
 }
 
+// AllMessages returns every message, roots and replies, oldest first.
+func (s *Snapshot) AllMessages() []*Message {
+	out := make([]*Message, 0, len(s.state.Messages))
+	for _, message := range s.state.Messages {
+		out = append(out, message)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 // Channel returns a channel by path.
 func (s *Snapshot) Channel(path string) *Channel { return s.state.Channels[path] }
 
@@ -947,6 +982,9 @@ func (tx *Tx) Result() AppendResult {
 	if tx.replay != nil {
 		return *tx.replay
 	}
+	if tx.idem != nil {
+		result.Digest = tx.idem.Digest
+	}
 	if len(tx.events) > 0 {
 		result.FirstSeq = tx.events[0].Seq
 		result.LastSeq = tx.events[len(tx.events)-1].Seq
@@ -1012,6 +1050,8 @@ func decodeEvent(record store.Record) (Event, error) {
 		payload = &MessageEditedPayload{}
 	case EventMessageDeleted:
 		payload = &MessageDeletedPayload{}
+	case EventReactionAdded, EventReactionRemoved:
+		payload = &ReactionPayload{}
 	case EventLabelsChanged:
 		payload = &LabelsChangedPayload{}
 	case EventTaskCreated:
