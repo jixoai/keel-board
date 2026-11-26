@@ -1,7 +1,14 @@
 // Package store keeps a board's raw log. It knows nothing about messages or
-// tasks: an event's type and payload are opaque bytes here, and the log package
-// above folds them. (Channel is a derived index column the log fills; the store
-// never interprets it.)
+// tasks: an event's type is opaque and its payload is a JSON value, and the log
+// package above folds them. (Channel is a derived index column the log fills;
+// the store never interprets it.)
+//
+// Payload contract: a record's Payload must be valid JSON. Stores may normalize
+// its representation (PostgreSQL's jsonb reorders keys and spacing), so callers
+// compare payloads by JSON value, never by bytes. An empty payload means JSON
+// null; a payload containing a NUL (a raw zero byte or a \u0000 escape) is
+// refused, as jsonb cannot hold one. A zero At means the store's clock at
+// append, and timestamps are kept at microsecond precision.
 //
 // EventStore is the seam a PostgreSQL implementation plugs into. Any store must
 // make an append all-or-nothing and must reject one whose expected head has
@@ -12,9 +19,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -26,6 +35,10 @@ var ErrHeadMoved = errors.New("store: the log moved on")
 // ErrDuplicateRequest is returned by an append whose request key already
 // landed with another digest: 409 duplicate_id to the caller.
 var ErrDuplicateRequest = errors.New("store: the request key was used for another write")
+
+// ErrInvalidPayload is returned by an append whose payload isn't a JSON value
+// the stores can hold, or contains a NUL.
+var ErrInvalidPayload = errors.New("store: invalid event payload")
 
 // HistoryDefaultLimit is what History reads when its limit is zero or less.
 const HistoryDefaultLimit = 1000
@@ -39,9 +52,11 @@ type Record struct {
 	// Channel is the channel the event concerns, when it concerns one. It is a
 	// derived index column: the store never interprets it.
 	Channel string
-	// Payload is the event's JSON payload, as the log wrote it.
+	// Payload is the event's JSON payload. Stores keep it as a JSON value, so
+	// its bytes may be normalized; empty means JSON null.
 	Payload []byte
-	// At is when the board recorded it.
+	// At is when the board recorded it. Zero means the store's clock at append;
+	// stores keep microseconds.
 	At time.Time
 	// RequestKey, Digest, RequestLast, and RequestResult describe the
 	// idempotent batch this record starts: its key, the digest of what it
@@ -101,6 +116,13 @@ type HistoryStore interface {
 	History(ctx context.Context, tenant string, after uint64, limit int) ([]Record, error)
 }
 
+// HeadStore is an EventStore that reports a tenant's head without reading its
+// log. It lets a process sharing a store bound how stale its cached view may
+// be: one indexed lookup per tenant per freshness window.
+type HeadStore interface {
+	Head(ctx context.Context, tenant string) (uint64, error)
+}
+
 // Waiter is a store whose writes can arrive from another process: Wait blocks
 // until the tenant's head passes after, or ctx ends. It never holds a database
 // lock while it waits.
@@ -150,6 +172,11 @@ func (m *Memory) Append(_ context.Context, tenant string, records []Record, expe
 	if len(records) == 0 {
 		return AppendResult{}, nil
 	}
+	normalized, err := normalizeRecords(records)
+	if err != nil {
+		return AppendResult{}, err
+	}
+	records = normalized
 	key, digest := requestOf(records)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -170,11 +197,7 @@ func (m *Memory) Append(_ context.Context, tenant string, records []Record, expe
 			return AppendResult{}, ErrHeadMoved
 		}
 	}
-	for _, record := range records {
-		record.Payload = append([]byte(nil), record.Payload...)
-		record.RequestResult = append([]byte(nil), record.RequestResult...)
-		current = append(current, record)
-	}
+	current = append(current, records...)
 	m.byTenant[tenant] = current
 	result := batchResultOf(records)
 	if key != "" {
@@ -304,4 +327,57 @@ func checkBatch(records []Record, expectedHead uint64) error {
 		}
 	}
 	return nil
+}
+
+// payloadHasNUL reports a raw NUL byte or a \u0000 escape in valid JSON. A
+// backslash escaped by another (\\u0000) is literal text, not a NUL.
+func payloadHasNUL(payload []byte) bool {
+	if bytes.IndexByte(payload, 0) >= 0 {
+		return true
+	}
+	for index := 0; index < len(payload); index++ {
+		if payload[index] != '\\' {
+			continue
+		}
+		run := 0
+		for index+run < len(payload) && payload[index+run] == '\\' {
+			run++
+		}
+		at := index + run
+		if run%2 == 1 && at+5 <= len(payload) &&
+			payload[at] == 'u' && string(payload[at+1:at+5]) == "0000" {
+			return true
+		}
+		index = at - 1
+	}
+	return false
+}
+
+// normalizeRecords returns copies of records in the store's canonical payload
+// and timestamp form. It never mutates the caller's records or payloads:
+// a failed append leaves them exactly as they came in. An empty payload becomes
+// JSON null, a malformed one or one with a NUL is ErrInvalidPayload, a zero At
+// becomes now, and a time keeps microsecond precision (jsonb's).
+func normalizeRecords(records []Record) ([]Record, error) {
+	out := make([]Record, len(records))
+	copy(out, records)
+	for index := range out {
+		payload := out[index].Payload
+		if len(payload) == 0 {
+			payload = []byte("null")
+		}
+		if !json.Valid(payload) {
+			return nil, fmt.Errorf("%w: record #%d isn't valid JSON", ErrInvalidPayload, out[index].Seq)
+		}
+		if payloadHasNUL(payload) {
+			return nil, fmt.Errorf("%w: record #%d contains a NUL", ErrInvalidPayload, out[index].Seq)
+		}
+		out[index].Payload = append([]byte(nil), payload...)
+		out[index].RequestResult = append([]byte(nil), out[index].RequestResult...)
+		if out[index].At.IsZero() {
+			out[index].At = time.Now().UTC()
+		}
+		out[index].At = out[index].At.Truncate(time.Microsecond)
+	}
+	return out, nil
 }

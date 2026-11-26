@@ -132,11 +132,14 @@ func (p *Postgres) migrate(ctx context.Context) error {
 	return nil
 }
 
-// recordColumns is the projection every read shares. request_last comes from
-// the batch's request row, so board_events stays one row per event.
+// recordColumns is the projection every read shares. request_last and
+// request_result come from the batch's request row, so board_events stays one
+// row per event and a rebuilt log answers a keyed retry without the post events
+// (an adopted thread's batch has none).
 const recordColumns = `e.seq, e.kind, COALESCE(e.channel, ''), e.payload, e.created_at,
 	COALESCE(e.request_key, ''), COALESCE(e.digest, ''),
-	COALESCE((r.result->>'lastSeq')::bigint, 0)`
+	COALESCE((r.result->>'lastSeq')::bigint, 0),
+	COALESCE(r.result, 'null'::jsonb)`
 
 const recordFrom = ` FROM board_events e
 	LEFT JOIN board_requests r
@@ -190,8 +193,13 @@ func (p *Postgres) readRecords(ctx context.Context, tenant string, after uint64,
 			&record.RequestKey,
 			&record.Digest,
 			&record.RequestLast,
+			&record.RequestResult,
 		); err != nil {
 			return nil, err
+		}
+		if record.RequestKey == "" {
+			// A non-keyed row's join is empty: don't carry a JSON null note.
+			record.RequestResult = nil
 		}
 		records = append(records, record)
 	}
@@ -209,6 +217,11 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 	if len(records) == 0 {
 		return AppendResult{}, nil
 	}
+	normalized, err := normalizeRecords(records)
+	if err != nil {
+		return AppendResult{}, err
+	}
+	records = normalized
 	key, digest := requestOf(records)
 	result := batchResultOf(records)
 
@@ -335,20 +348,12 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 	}
 
 	for _, record := range records {
-		at := record.At
-		if at.IsZero() {
-			at = time.Now().UTC()
-		}
-		payload := record.Payload
-		if len(payload) == 0 {
-			payload = []byte("null")
-		}
 		_, err := tx.Exec(ctx, `
 			INSERT INTO board_events
 				(tenant_id, seq, channel, kind, payload, request_key, digest, created_at)
 			VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6, ''), NULLIF($7, ''), $8)`,
-			tenant, record.Seq, record.Channel, record.Type, payload,
-			record.RequestKey, record.Digest, at)
+			tenant, record.Seq, record.Channel, record.Type, record.Payload,
+			record.RequestKey, record.Digest, record.At)
 		if err != nil {
 			return AppendResult{}, err
 		}
@@ -402,17 +407,27 @@ func requestInTx(ctx context.Context, q queryer, tenant, key string) (storedRequ
 	return stored, true, nil
 }
 
+// Head implements HeadStore with one indexed lookup on the tenant's head row.
+func (p *Postgres) Head(ctx context.Context, tenant string) (uint64, error) {
+	var head uint64
+	err := p.pool.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1`, tenant).Scan(&head)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return head, nil
+}
+
 // Wait implements Waiter by polling the tenant's head. It holds no lock, so
 // writers never wait on a reader.
 func (p *Postgres) Wait(ctx context.Context, tenant string, after uint64) error {
 	ticker := time.NewTicker(WaitPoll)
 	defer ticker.Stop()
 	for {
-		var head uint64
-		err := p.pool.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1`, tenant).Scan(&head)
-		if errors.Is(err, pgx.ErrNoRows) {
-			head = 0
-		} else if err != nil {
+		head, err := p.Head(ctx, tenant)
+		if err != nil {
 			return err
 		}
 		if head > after {
@@ -429,6 +444,7 @@ func (p *Postgres) Wait(ctx context.Context, tenant string, after uint64) error 
 var (
 	_ EventStore   = (*Postgres)(nil)
 	_ HistoryStore = (*Postgres)(nil)
+	_ HeadStore    = (*Postgres)(nil)
 	_ Waiter       = (*Postgres)(nil)
 	_ RequestStore = (*Postgres)(nil)
 )

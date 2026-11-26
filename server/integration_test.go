@@ -1338,6 +1338,18 @@ func TestEventsLastAndQueryValidation(t *testing.T) {
 	if code := errorCode(t, data); code != protocol.CodeInvalidCursor {
 		t.Fatalf("expected invalid_cursor, got %s", code)
 	}
+	// A cursor ahead of the log isn't clamped down to the head: it names
+	// nothing this board has, so it's refused.
+	status, data = h.request(http.MethodGet, "/events?after=999", nil, alice, "", nil)
+	h.expect(status, data, http.StatusBadRequest)
+	if code := errorCode(t, data); code != protocol.CodeInvalidCursor {
+		t.Fatalf("expected invalid_cursor for a future after, got %s", code)
+	}
+	status, data = h.request(http.MethodGet, "/events", nil, alice, "", map[string]string{"Last-Event-ID": "999"})
+	h.expect(status, data, http.StatusBadRequest)
+	if code := errorCode(t, data); code != protocol.CodeInvalidCursor {
+		t.Fatalf("expected invalid_cursor for a future Last-Event-ID, got %s", code)
+	}
 }
 
 func TestEventPayloadWireShape(t *testing.T) {

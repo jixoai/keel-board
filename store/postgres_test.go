@@ -1,9 +1,15 @@
 package store_test
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"strings"
@@ -15,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
+	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
 )
 
@@ -209,8 +216,9 @@ func TestPostgresHeadVersion(t *testing.T) {
 	}
 }
 
-// TestPostgresAppendRollsBack writes a batch whose second event is invalid:
-// the head, the request row, and the first event must all be gone.
+// TestPostgresAppendRollsBack writes a batch whose second event PostgreSQL
+// refuses (a NUL in its channel text): the head, the request row, and the first
+// event must all be gone.
 func TestPostgresAppendRollsBack(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
@@ -222,9 +230,12 @@ func TestPostgresAppendRollsBack(t *testing.T) {
 	first.RequestKey = "key"
 	first.Digest = "digest"
 	first.RequestResult = resultJSON(t, 1, 2, nil)
-	broken := store.Record{Seq: 2, Type: "event", Payload: []byte(`not json`), At: time.Now().UTC()}
+	broken := store.Record{
+		Seq: 2, Type: "event", Channel: "bad\x00channel",
+		Payload: []byte(`{"n":2}`), At: time.Now().UTC(),
+	}
 	if _, err := events.Append(ctx, "t", []store.Record{first, broken}, 0); err == nil {
-		t.Fatal("an invalid jsonb payload should fail the batch")
+		t.Fatal("a NUL in a text column should fail the batch")
 	}
 	loaded, err := events.Load(ctx, "t")
 	if err != nil || len(loaded) != 0 {
@@ -245,7 +256,11 @@ func TestPostgresAppendRollsBack(t *testing.T) {
 		t.Fatalf("a failed batch wrote a request row (%d)", requests)
 	}
 	// The same key is free after the rollback.
-	mustAppend(t, events, "t", 0, seqRecord(1, "event", `{"n":1}`))
+	retry := seqRecord(1, "event", `{"n":1}`)
+	retry.RequestKey = "key"
+	retry.Digest = "digest"
+	retry.RequestResult = resultJSON(t, 1, 1, nil)
+	mustAppend(t, events, "t", 0, retry)
 }
 
 // TestPostgresConcurrentSameKey races one idempotent request: exactly one
@@ -463,29 +478,23 @@ func TestPostgresBoardWaitSeesAnotherStore(t *testing.T) {
 		t.Fatalf("cross-process replay: %+v vs %+v", retry, written)
 	}
 
-	// An unkeyed write on the stale reader is refused once, catches the cache
-	// up, and the retry lands after the writer's event.
+	// An unkeyed write on the stale reader hits the writer's newer head; the
+	// board catches up and retries the write once, so it lands after it.
 	if _, err := writer.Append(ctx, log.AppendRequest{
 		Tenant: "t",
 		Events: []log.Event{postedEvent("work", "writer again")},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reader.Append(ctx, log.AppendRequest{
-		Tenant: "t",
-		Events: []log.Event{postedEvent("work", "reader at last")},
-	}); !errors.Is(err, log.ErrHeadMoved) {
-		t.Fatalf("stale reader should be refused, got %v", err)
-	}
 	landed, err := reader.Append(ctx, log.AppendRequest{
 		Tenant: "t",
 		Events: []log.Event{postedEvent("work", "reader at last")},
 	})
 	if err != nil {
-		t.Fatalf("retry after catch-up: %v", err)
+		t.Fatalf("stale write after catch-up: %v", err)
 	}
 	if landed.FirstSeq != 4 || landed.LastSeq != 4 {
-		t.Fatalf("retry after catch-up: %+v", landed)
+		t.Fatalf("stale write after catch-up: %+v", landed)
 	}
 }
 
@@ -496,4 +505,574 @@ func postedEvent(channel, text string) log.Event {
 		Labels:  map[string]string{},
 		By:      protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"},
 	}}
+}
+
+// adopt appends a keyed task.created for an existing root and no
+// message.posted, the shape a task adopted from a thread has.
+func adopt(ctx context.Context, board *log.Board, tenant string, opts log.UpdateOptions, rootID uint64) (log.AppendResult, error) {
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+	var result log.AppendResult
+	err := board.Update(ctx, tenant, opts, func(tx *log.Tx) error {
+		if replay, ok := tx.Replay(); ok {
+			result = replay
+			return nil
+		}
+		root := tx.Message(rootID)
+		if root == nil {
+			return fmt.Errorf("root #%d isn't there", rootID)
+		}
+		tx.Emit(log.EventTaskCreated, &log.TaskCreatedPayload{
+			ID: rootID, Thread: root.Thread, By: author,
+		})
+		tx.RecordResult(rootID)
+		result = tx.Result()
+		return nil
+	})
+	return result, err
+}
+
+// TestPostgresRestartReplaysAdoptedTask writes a keyed adopt batch (no
+// message.posted) and proves a rebuilt board answers the retry with the task's
+// ID, not duplicate_id.
+func TestPostgresRestartReplaysAdoptedTask(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+
+	first := openTestPostgres(t, dsn, schema)
+	before := log.New(log.Options{Store: first})
+	root, err := before.Append(ctx, log.AppendRequest{
+		Tenant: "t",
+		Events: []log.Event{postedEvent("work", "root")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID := root.MessageIDs[0]
+	opts := log.UpdateOptions{Idempotency: &log.Idempotency{
+		Key: "task:local:user:alice:adopt-1", Digest: "channel=work;re=1",
+	}}
+	written, err := adopt(ctx, before, "t", opts, rootID)
+	if err != nil {
+		t.Fatalf("adopt: %v", err)
+	}
+	if written.Replayed || !reflect.DeepEqual(written.MessageIDs, []uint64{rootID}) {
+		t.Fatalf("adopt result: %+v", written)
+	}
+	first.Close()
+
+	second := openTestPostgres(t, dsn, schema)
+	rebuilt := log.New(log.Options{Store: second})
+	replay, err := adopt(ctx, rebuilt, "t", opts, rootID)
+	if err != nil {
+		t.Fatalf("restart replay: %v", err)
+	}
+	if !replay.Replayed || !reflect.DeepEqual(replay.MessageIDs, []uint64{rootID}) {
+		t.Fatalf("restart replay: %+v", replay)
+	}
+	if err := rebuilt.Read("t", func(snapshot *log.Snapshot) error {
+		message := snapshot.Message(rootID)
+		if message == nil || message.Task == nil || message.Task.State != "ready" {
+			t.Fatalf("rebuilt task: %+v", message)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresConcurrentAdoptAcrossBoards races one keyed adopt through two
+// boards and two pools: every caller gets the task's ID, one batch lands.
+func TestPostgresConcurrentAdoptAcrossBoards(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	aStore := openTestPostgres(t, dsn, schema)
+	bStore := openTestPostgres(t, dsn, schema)
+	a := log.New(log.Options{Store: aStore})
+	b := log.New(log.Options{Store: bStore})
+
+	root, err := a.Append(ctx, log.AppendRequest{
+		Tenant: "t",
+		Events: []log.Event{postedEvent("work", "root")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID := root.MessageIDs[0]
+	if err := b.Read("t", func(*log.Snapshot) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	opts := log.UpdateOptions{Idempotency: &log.Idempotency{
+		Key: "task:local:user:alice:adopt-race", Digest: "channel=work;re=1",
+	}}
+
+	const racers = 8
+	type outcome struct {
+		result log.AppendResult
+		err    error
+	}
+	results := make(chan outcome, racers)
+	for index := 0; index < racers; index++ {
+		board := a
+		if index%2 == 1 {
+			board = b
+		}
+		go func() {
+			result, err := adopt(ctx, board, "t", opts, rootID)
+			results <- outcome{result: result, err: err}
+		}()
+	}
+	fresh, replayed := 0, 0
+	for index := 0; index < racers; index++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("adopt %d: %v", index, got.err)
+		}
+		if !reflect.DeepEqual(got.result.MessageIDs, []uint64{rootID}) {
+			t.Fatalf("adopt %d answered %+v", index, got.result)
+		}
+		if got.result.Replayed {
+			replayed++
+		} else {
+			fresh++
+		}
+	}
+	if fresh != 1 || replayed != racers-1 {
+		t.Fatalf("adopt race: fresh=%d replayed=%d", fresh, replayed)
+	}
+	loaded, err := aStore.Load(ctx, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded) != 2 {
+		t.Fatalf("adopt race wrote %d records, want 2", len(loaded))
+	}
+}
+
+// TestPostgresBoundedFreshness proves a second board catches up within its
+// freshness window and that Read, Head, and History all trigger the catch-up.
+func TestPostgresBoundedFreshness(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	writer := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	reader := log.New(log.Options{
+		Store:     openTestPostgres(t, dsn, schema),
+		Freshness: 10 * time.Millisecond,
+	})
+	if err := reader.Read("t", func(snapshot *log.Snapshot) error {
+		if snapshot.Head() != 0 {
+			t.Fatalf("reader primes at head %d", snapshot.Head())
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: "t", Events: []log.Event{postedEvent("work", "one")}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if err := reader.Read("t", func(snapshot *log.Snapshot) error {
+		if snapshot.Head() != 1 || snapshot.Message(1) == nil || snapshot.Message(1).Text != "one" {
+			t.Fatalf("reader after its window: head %d, %+v", snapshot.Head(), snapshot.Message(1))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: "t", Events: []log.Event{postedEvent("work", "two")}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	head, err := reader.Head("t")
+	if err != nil || head != 2 {
+		t.Fatalf("reader head: %d, %v", head, err)
+	}
+
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: "t", Events: []log.Event{postedEvent("work", "three")}}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	events, err := reader.History("t", 1, 3)
+	if err != nil || len(events) != 3 || events[2].Seq != 3 {
+		t.Fatalf("reader history: %d events, %v", len(events), err)
+	}
+}
+
+// TestPostgresHeadMovedRetriesBusinessFn has a stale board emit from an old
+// read; the store refuses, the board catches up, and the retried fn sees the
+// new state and answers the correct conflict instead of appending.
+func TestPostgresHeadMovedRetriesBusinessFn(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	a := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	// b never refreshes on its own: the store's head-moved refusal is the only
+	// catch-up path this test exercises.
+	b := log.New(log.Options{Store: openTestPostgres(t, dsn, schema), Freshness: -1})
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+
+	posted := postedEvent("work", "root")
+	posted.Payload.(*log.MessagePostedPayload).Labels = map[string]string{"status": "old"}
+	if _, err := a.Append(ctx, log.AppendRequest{Tenant: "t", Events: []log.Event{posted}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Read("t", func(*log.Snapshot) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Update(ctx, "t", log.UpdateOptions{}, func(tx *log.Tx) error {
+		root := tx.Message(1)
+		if root == nil {
+			return errors.New("root disappeared")
+		}
+		tx.Emit(log.EventLabelsChanged, &log.LabelsChangedPayload{
+			ID: 1, Thread: root.Thread, Set: map[string]string{"status": "new"}, By: author,
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	attempts := 0
+	conflict := protocol.NewError(protocol.CodeLabelConflict, "status moved on")
+	err := b.Update(ctx, "t", log.UpdateOptions{}, func(tx *log.Tx) error {
+		attempts++
+		root := tx.Message(1)
+		if root == nil {
+			return errors.New("root disappeared")
+		}
+		if root.Labels["status"] != "old" {
+			return conflict
+		}
+		tx.Emit(log.EventLabelsChanged, &log.LabelsChangedPayload{
+			ID: 1, Thread: root.Thread, Set: map[string]string{"status": "from-b"}, By: author,
+		})
+		return nil
+	})
+	var apiErr *protocol.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != protocol.CodeLabelConflict {
+		t.Fatalf("stale write: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("business fn ran %d times, want 2", attempts)
+	}
+	if err := b.Read("t", func(snapshot *log.Snapshot) error {
+		root := snapshot.Message(1)
+		if root == nil || root.Labels["status"] != "new" {
+			t.Fatalf("labels after retry: %+v", root)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresConcurrentClaimAcrossStores races claims through two boards and
+// two pools: one lands, every loser answers task_claimed (not a 503).
+func TestPostgresConcurrentClaimAcrossStores(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	a := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	b := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+
+	if err := a.Update(ctx, "t", log.UpdateOptions{}, func(tx *log.Tx) error {
+		id := tx.NextID(0)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: "work", Text: "fix", Thread: log.ThreadKey(id),
+			Labels: map[string]string{}, By: author,
+		})
+		tx.Emit(log.EventTaskCreated, &log.TaskCreatedPayload{ID: id, Thread: log.ThreadKey(id), By: author})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Read("t", func(*log.Snapshot) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	until := protocol.FormatTime(time.Now().Add(time.Hour))
+	const claimers = 8
+	var claimed, failed atomic.Int32
+	var wait sync.WaitGroup
+	for index := 0; index < claimers; index++ {
+		board := a
+		if index%2 == 1 {
+			board = b
+		}
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			err := board.Update(ctx, "t", log.UpdateOptions{}, func(tx *log.Tx) error {
+				root := tx.Message(1)
+				if root == nil || root.Task == nil {
+					return errors.New("task disappeared")
+				}
+				if root.Task.State != "ready" {
+					return protocol.NewError(protocol.CodeTaskClaimed, "already claimed")
+				}
+				tx.Emit(log.EventTaskClaimed, &log.TaskClaimedPayload{
+					ID: 1, Thread: root.Thread, Epoch: root.Task.Epoch + 1,
+					Until: until, Token: "hash", By: author,
+				})
+				return nil
+			})
+			if err != nil {
+				var apiErr *protocol.Error
+				if !errors.As(err, &apiErr) || apiErr.Code != protocol.CodeTaskClaimed {
+					t.Errorf("claim: %v", err)
+				}
+				failed.Add(1)
+				return
+			}
+			claimed.Add(1)
+		}()
+	}
+	wait.Wait()
+	if claimed.Load() != 1 || failed.Load() != claimers-1 {
+		t.Fatalf("claims landed=%d failed=%d", claimed.Load(), failed.Load())
+	}
+	if err := b.Read("t", func(snapshot *log.Snapshot) error {
+		root := snapshot.Message(1)
+		if root == nil || root.Task == nil || root.Task.State != "claimed" || root.Task.Epoch != 1 {
+			t.Fatalf("claimed task: %+v", root)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPostgresConcurrentSameKeyAcrossStores races one keyed post through two
+// boards and pools: every caller answers the same message, one lands.
+func TestPostgresConcurrentSameKeyAcrossStores(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	aStore := openTestPostgres(t, dsn, schema)
+	a := log.New(log.Options{Store: aStore})
+	b := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+	opts := log.UpdateOptions{Idempotency: &log.Idempotency{Key: "post:alice:cross", Digest: "channel=work"}}
+
+	const racers = 8
+	type outcome struct {
+		result log.AppendResult
+		err    error
+	}
+	results := make(chan outcome, racers)
+	for index := 0; index < racers; index++ {
+		board := a
+		if index%2 == 1 {
+			board = b
+		}
+		go func() {
+			var result log.AppendResult
+			err := board.Update(ctx, "t", opts, func(tx *log.Tx) error {
+				if replay, ok := tx.Replay(); ok {
+					result = replay
+					return nil
+				}
+				id := tx.NextID(0)
+				tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+					ID: id, Channel: "work", Text: "once", Thread: log.ThreadKey(id),
+					Labels: map[string]string{}, By: author,
+				})
+				tx.RecordResult(id)
+				result = tx.Result()
+				return nil
+			})
+			results <- outcome{result: result, err: err}
+		}()
+	}
+	fresh, replayed := 0, 0
+	for index := 0; index < racers; index++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatalf("same-key %d: %v", index, got.err)
+		}
+		if !reflect.DeepEqual(got.result.MessageIDs, []uint64{1}) {
+			t.Fatalf("same-key %d answered %+v", index, got.result)
+		}
+		if got.result.Replayed {
+			replayed++
+		} else {
+			fresh++
+		}
+	}
+	if fresh != 1 || replayed != racers-1 {
+		t.Fatalf("same-key race: fresh=%d replayed=%d", fresh, replayed)
+	}
+	loaded, err := aStore.Load(ctx, "t")
+	if err != nil || len(loaded) != 1 {
+		t.Fatalf("same-key race wrote %d records: %v", len(loaded), err)
+	}
+}
+
+// newTestServer serves a board over httptest for the feed tests.
+func newTestServer(t *testing.T, board *log.Board) *httptest.Server {
+	t.Helper()
+	api := server.New(server.Options{
+		Board:  board,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	httpServer := httptest.NewServer(api)
+	t.Cleanup(httpServer.Close)
+	return httpServer
+}
+
+// openSSE opens the event feed and consumes its connected comment.
+func openSSE(t *testing.T, httpServer *httptest.Server, query string, headers map[string]string) (*http.Response, *bufio.Reader) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodGet, httpServer.URL+server.APIPrefix+"/events"+query, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	response, err := httpServer.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		t.Fatalf("events: status %d: %s", response.StatusCode, body)
+	}
+	reader := bufio.NewReader(response.Body)
+	line, err := reader.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, ": connected") {
+		response.Body.Close()
+		t.Fatalf("events: expected a connected comment, got %q (%v)", line, err)
+	}
+	if blank, err := reader.ReadString('\n'); err != nil || strings.TrimSpace(blank) != "" {
+		response.Body.Close()
+		t.Fatalf("events: expected a blank line, got %q (%v)", blank, err)
+	}
+	return response, reader
+}
+
+// readSSEEvent reads one event or fails after five seconds.
+func readSSEEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
+	t.Helper()
+	type result struct {
+		view protocol.EventView
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		for {
+			var id, data string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				line = strings.TrimRight(line, "\r\n")
+				if line == "" {
+					break
+				}
+				switch {
+				case strings.HasPrefix(line, "id: "):
+					id = strings.TrimPrefix(line, "id: ")
+				case strings.HasPrefix(line, "data: "):
+					data = strings.TrimPrefix(line, "data: ")
+				}
+			}
+			if data == "" {
+				continue
+			}
+			var view protocol.EventView
+			if err := json.Unmarshal([]byte(data), &view); err != nil {
+				done <- result{err: err}
+				return
+			}
+			if id != "" && string(view.Cursor) != id {
+				done <- result{err: fmt.Errorf("event id %q doesn't match cursor %q", id, view.Cursor)}
+				return
+			}
+			done <- result{view: view}
+			return
+		}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("reading an event: %v", got.err)
+		}
+		return got.view
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out reading an SSE event")
+		return protocol.EventView{}
+	}
+}
+
+// TestPostgresFeedRefreshesBeforeCursorAndLast proves the feed catches up
+// before replaying `last` and never clamps a client cursor below the store.
+func TestPostgresFeedRefreshesBeforeCursorAndLast(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	ctx := t.Context()
+	tenant := "default"
+	writer := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	reader := log.New(log.Options{
+		Store:     openTestPostgres(t, dsn, schema),
+		Freshness: 10 * time.Millisecond,
+	})
+	httpServer := newTestServer(t, reader)
+
+	// The reader's cache is empty and its window has not been asked yet. A
+	// `last` feed must refresh first and answer the newest event.
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: tenant, Events: []log.Event{postedEvent("work", "one")}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: tenant, Events: []log.Event{postedEvent("work", "two")}}); err != nil {
+		t.Fatal(err)
+	}
+	response, stream := openSSE(t, httpServer, "?last=1", nil)
+	event := readSSEEvent(t, stream)
+	if event.Message == nil || event.Message.Text != "two" || event.Cursor != "2" {
+		t.Fatalf("last=1: %+v", event)
+	}
+	response.Body.Close()
+
+	// A fresh cache and a client cursor at the store's head: no replay, and the
+	// next event is delivered without clamping the cursor down.
+	reader2 := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
+	httpServer2 := newTestServer(t, reader2)
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: tenant, Events: []log.Event{postedEvent("work", "three")}}); err != nil {
+		t.Fatal(err)
+	}
+	response2, stream2 := openSSE(t, httpServer2, "", map[string]string{"Last-Event-ID": "3"})
+	if _, err := writer.Append(ctx, log.AppendRequest{Tenant: tenant, Events: []log.Event{postedEvent("work", "four")}}); err != nil {
+		t.Fatal(err)
+	}
+	next := readSSEEvent(t, stream2)
+	if next.Message == nil || next.Message.Text != "four" || next.Cursor != "4" {
+		t.Fatalf("cursor after head: %+v", next)
+	}
+	response2.Body.Close()
+
+	// A cursor ahead of the log is refused, not silently clamped.
+	future, err := http.Get(httpServer2.URL + server.APIPrefix + "/events?after=99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer future.Body.Close()
+	if future.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(future.Body)
+		t.Fatalf("future cursor: status %d: %s", future.StatusCode, body)
+	}
+	var body protocol.ErrorBody
+	if err := json.NewDecoder(future.Body).Decode(&body); err != nil {
+		t.Fatalf("decoding the future-cursor error: %v", err)
+	}
+	if body.Error.Code != protocol.CodeInvalidCursor {
+		t.Fatalf("future cursor code %s", body.Error.Code)
+	}
 }

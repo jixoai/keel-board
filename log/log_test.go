@@ -2,7 +2,9 @@ package log_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -309,5 +311,70 @@ func TestTenantLogsAreSeparate(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestRefusedAppendDoesNotMutatePayload forces a store-level head move after
+// the payload is emitted: the caller's payload keeps ID 0, and the same request
+// lands on a retry.
+func TestRefusedAppendDoesNotMutatePayload(t *testing.T) {
+	memory := store.NewMemory()
+	board := log.New(log.Options{Store: memory})
+	ctx := context.Background()
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+
+	// Cache the tenant at head 0, then move the store behind the board's back.
+	if err := board.Read("t", func(*log.Snapshot) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	other := &log.MessagePostedPayload{
+		ID: 1, Channel: "work", Text: "other", Thread: "1",
+		Labels: map[string]string{}, By: author,
+	}
+	payload, err := json.Marshal(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := memory.Append(ctx, "t", []store.Record{{
+		Seq: 1, Type: string(log.EventMessagePosted), Channel: "work", Payload: payload, At: time.Now().UTC(),
+	}}, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	posted := &log.MessagePostedPayload{
+		Channel: "work", Text: "once", Labels: map[string]string{}, By: author,
+	}
+	request := log.AppendRequest{
+		Tenant:     "t",
+		Events:     []log.Event{{Type: log.EventMessagePosted, Payload: posted}},
+		ExpectHead: new(uint64), // the board's stale head, 0
+	}
+	if _, err := board.Append(ctx, request); !errors.Is(err, log.ErrHeadMoved) {
+		t.Fatalf("expected head moved, got %v", err)
+	}
+	if posted.ID != 0 {
+		t.Fatalf("a refused append mutated the payload's ID to %d", posted.ID)
+	}
+
+	// The retry lands at the next seq; the caller's payload is still untouched.
+	one := uint64(1)
+	request.ExpectHead = &one
+	result, err := board.Append(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FirstSeq != 2 || result.LastSeq != 2 || !reflect.DeepEqual(result.MessageIDs, []uint64{2}) {
+		t.Fatalf("retry result: %+v", result)
+	}
+	if posted.ID != 0 {
+		t.Fatalf("a successful append mutated the caller's payload")
+	}
+	history, err := board.History("t", 2, 2)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("history: %+v, %v", history, err)
+	}
+	stored, ok := history[0].Payload.(*log.MessagePostedPayload)
+	if !ok || stored.ID != 2 {
+		t.Fatalf("the persisted post should carry its seq: %+v", history[0].Payload)
 	}
 }

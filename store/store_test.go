@@ -52,6 +52,9 @@ func storeContract(t *testing.T, open func(t *testing.T) store.EventStore) {
 		if !sameJSON(t, loaded[0].Payload, `{"id":1,"channel":"work","text":"one"}`) {
 			t.Fatalf("payload: %s", loaded[0].Payload)
 		}
+		if loaded[0].RequestResult != nil || loaded[1].RequestResult != nil {
+			t.Fatalf("a non-keyed record should carry no request result: %q / %q", loaded[0].RequestResult, loaded[1].RequestResult)
+		}
 		// Load copies: a caller can't rewrite the log.
 		loaded[0].Payload[0] = 'X'
 		again, err := events.Load(ctx, "t")
@@ -77,6 +80,61 @@ func storeContract(t *testing.T, open func(t *testing.T) store.EventStore) {
 		if err != nil || len(loaded) != 0 {
 			t.Fatalf("empty append wrote: %+v, %v", loaded, err)
 		}
+	})
+
+	t.Run("payload contract", func(t *testing.T) {
+		events := open(t)
+		ctx := context.Background()
+		// Empty payload is JSON null and a zero time is filled in; the caller's
+		// record is never changed.
+		empty := seqRecord(1, "event", "")
+		empty.Payload = nil
+		empty.At = time.Time{}
+		if _, err := events.Append(ctx, "t", []store.Record{empty}, 0); err != nil {
+			t.Fatal(err)
+		}
+		if empty.Payload != nil || !empty.At.IsZero() {
+			t.Fatalf("append mutated the caller's record: %+v", empty)
+		}
+		loaded, err := events.Load(ctx, "t")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(loaded) != 1 || !sameJSON(t, loaded[0].Payload, `null`) {
+			t.Fatalf("empty payload: %+v", loaded)
+		}
+		if loaded[0].At.IsZero() {
+			t.Fatalf("a zero At should be filled at append")
+		}
+		if loaded[0].At.Nanosecond()%1000 != 0 {
+			t.Fatalf("timestamps should keep microseconds, got %v", loaded[0].At)
+		}
+
+		// Nanoseconds are truncated to the store's microsecond precision.
+		nanos := time.Date(2026, 2, 3, 4, 5, 6, 123456789, time.UTC)
+		precise := seqRecord(2, "event", `{"n":2}`)
+		precise.At = nanos
+		mustAppend(t, events, "t", 1, precise)
+		loaded, _ = events.Load(ctx, "t")
+		if !loaded[1].At.Equal(nanos.Truncate(time.Microsecond)) {
+			t.Fatalf("nanosecond timestamp: %v, want %v", loaded[1].At, nanos.Truncate(time.Microsecond))
+		}
+
+		// Malformed JSON and a NUL are refused, and nothing is written.
+		for _, payload := range []string{`{not json`, `{"text":"a\u0000b"}`} {
+			bad := seqRecord(3, "event", payload)
+			if _, err := events.Append(ctx, "t", []store.Record{bad}, 2); !errors.Is(err, store.ErrInvalidPayload) {
+				t.Fatalf("payload %q: %v", payload, err)
+			}
+			if string(bad.Payload) != payload {
+				t.Fatalf("a refused append mutated the caller's payload: %q", bad.Payload)
+			}
+		}
+		loaded, _ = events.Load(ctx, "t")
+		if len(loaded) != 2 {
+			t.Fatalf("a refused payload wrote: %+v", loaded)
+		}
+		mustAppend(t, events, "t", 2, seqRecord(3, "event", `{"n":3}`))
 	})
 
 	t.Run("conditional append", func(t *testing.T) {
@@ -179,6 +237,16 @@ func storeContract(t *testing.T, open func(t *testing.T) store.EventStore) {
 		}
 		if loaded[0].RequestKey != "post:alice:abc" || loaded[0].RequestLast != 1 || loaded[0].Digest != "channel=work" {
 			t.Fatalf("request metadata: %+v", loaded[0])
+		}
+		if len(loaded[0].RequestResult) == 0 {
+			t.Fatalf("Load dropped the request result")
+		}
+		var storedResult store.BatchResult
+		if err := json.Unmarshal(loaded[0].RequestResult, &storedResult); err != nil {
+			t.Fatalf("decoding the request result: %v", err)
+		}
+		if storedResult.FirstSeq != 1 || storedResult.LastSeq != 1 || !reflect.DeepEqual(storedResult.MessageIDs, []uint64{1}) {
+			t.Fatalf("loaded request result: %+v", storedResult)
 		}
 
 		looker, ok := events.(store.RequestStore)

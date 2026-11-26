@@ -21,20 +21,38 @@ var ErrHeadMoved = store.ErrHeadMoved
 // leases.
 type Clock func() time.Time
 
+// defaultFreshness bounds how long a shared store's cached head is trusted
+// before a read asks the store. It is the staleness a multi-process board
+// accepts for non-streaming reads; one indexed head lookup per tenant per
+// window, not one per request.
+const defaultFreshness = time.Second
+
+// storeTimeout bounds one store read (a tenant's first load, a catch-up page,
+// a head check). Writes use the caller's context.
+const storeTimeout = 5 * time.Second
+
 // Options configure a board.
 type Options struct {
 	// Store persists the raw log. Default: an in-memory store.
 	Store store.EventStore
 	// Now is the board's clock. Default: time.Now.
 	Now Clock
+	// Freshness bounds how stale a cached view of a store that implements
+	// store.HeadStore may be. Default: time.Second. A negative value disables
+	// the check (a board that owns its tenant's writes).
+	Freshness time.Duration
 }
 
-// Board is one process's view of many tenants' logs.
+// Board is one process's view of many tenants' logs. Reads are served from the
+// cache; a store that reports a head (store.HeadStore, as PostgreSQL does) is
+// asked at most once per Freshness window, so several processes sharing a log
+// see each other's writes within that bound.
 type Board struct {
-	mu      sync.Mutex
-	store   store.EventStore
-	now     Clock
-	tenants map[string]*tenant
+	mu        sync.Mutex
+	store     store.EventStore
+	now       Clock
+	freshness time.Duration
+	tenants   map[string]*tenant
 }
 
 type tenant struct {
@@ -42,8 +60,11 @@ type tenant struct {
 	events []Event
 	idem   map[string]idemEntry
 	// active is the keyed batch whose records are still being folded: a page
-	// boundary can split one, so it carries across apply calls.
+	// boundary can split one, so it carries across apply calls. A stored
+	// RequestResult answers the batch, so it doesn't start an active scan.
 	active string
+	// checked is when the cache last compared itself with the store's head.
+	checked time.Time
 	// notify is closed and replaced after each append, waking waiters.
 	notify chan struct{}
 }
@@ -63,7 +84,15 @@ func New(opts Options) *Board {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	return &Board{store: opts.Store, now: opts.Now, tenants: make(map[string]*tenant)}
+	if opts.Freshness == 0 {
+		opts.Freshness = defaultFreshness
+	}
+	return &Board{
+		store:     opts.Store,
+		now:       opts.Now,
+		freshness: opts.Freshness,
+		tenants:   make(map[string]*tenant),
+	}
 }
 
 // SetNow replaces the board's clock. It is for tests and the board's own
@@ -77,20 +106,35 @@ func (b *Board) SetNow(now Clock) {
 	b.now = now
 }
 
-// ensure returns a tenant, loading and folding its log the first time.
-// The caller holds b.mu.
-func (b *Board) ensure(tenantName string) (*tenant, error) {
+// ensure returns a tenant, loading and folding its log the first time. A cold
+// load runs outside b.mu, so one tenant's first read doesn't block another
+// tenant's reads. The caller does not hold b.mu.
+func (b *Board) ensure(ctx context.Context, tenantName string) (*tenant, error) {
 	name := normalizeTenant(tenantName)
+	b.mu.Lock()
 	if existing, ok := b.tenants[name]; ok {
+		b.mu.Unlock()
 		return existing, nil
 	}
-	records, err := b.store.Load(context.Background(), name)
+	b.mu.Unlock()
+
+	loadCtx, cancel := context.WithTimeout(ctx, storeTimeout)
+	records, err := b.store.Load(loadCtx, name)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
 	created := newTenant()
 	if err := created.apply(records); err != nil {
 		return nil, err
+	}
+	created.checked = time.Now()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if existing, ok := b.tenants[name]; ok {
+		// Another goroutine loaded this tenant first; its cache is as good.
+		return existing, nil
 	}
 	b.tenants[name] = created
 	return created, nil
@@ -129,14 +173,41 @@ func (t *tenant) apply(records []store.Record) error {
 			if last < record.Seq {
 				last = record.Seq
 			}
-			t.idem[record.RequestKey] = idemEntry{digest: record.Digest, first: record.Seq, last: last}
-			t.active = record.RequestKey
+			entry := idemEntry{digest: record.Digest, first: record.Seq, last: last}
+			// A store may keep the batch's answer with the key. It names every
+			// post the batch made, including a task adopted from an existing
+			// thread, whose batch has no message.posted event to scan.
+			answered := false
+			if raw := record.RequestResult; len(raw) > 0 {
+				var batch store.BatchResult
+				if err := json.Unmarshal(raw, &batch); err != nil {
+					return fmt.Errorf("log: replaying request %q: %w", record.RequestKey, err)
+				}
+				if batch.FirstSeq != 0 || batch.LastSeq != 0 || len(batch.MessageIDs) > 0 {
+					answered = true
+					if batch.FirstSeq != 0 {
+						entry.first = batch.FirstSeq
+					}
+					if batch.LastSeq != 0 {
+						entry.last = batch.LastSeq
+					}
+					entry.messageIDs = append([]uint64(nil), batch.MessageIDs...)
+				}
+			}
+			t.idem[record.RequestKey] = entry
+			if answered {
+				t.active = ""
+			} else {
+				t.active = record.RequestKey
+			}
 		}
 		if t.active != "" {
 			entry := t.idem[t.active]
 			if posted, ok := event.Payload.(*MessagePostedPayload); ok && posted.ID == event.Seq {
-				entry.messageIDs = append(entry.messageIDs, event.Seq)
-				t.idem[t.active] = entry
+				if !containsMessageID(entry.messageIDs, event.Seq) {
+					entry.messageIDs = append(entry.messageIDs, event.Seq)
+					t.idem[t.active] = entry
+				}
 			}
 			if event.Seq >= entry.last {
 				t.active = ""
@@ -161,37 +232,59 @@ func (t *tenant) wake() {
 // update must run once more, now seeing the key and replaying it.
 var errRequestReplayed = errors.New("log: the store replayed the request")
 
+// errStoreHeadMoved reports an append the store refused because another
+// process moved the head: the cache was refreshed and fn must decide again.
+var errStoreHeadMoved = errors.New("log: the store's head moved")
+
 // Update runs fn against a transaction and commits what it emits, atomically:
 // either every emitted event lands or none does. The board is locked for the
-// whole read-decide-append, so two writers can't both decide from the same
-// state.
+// whole read-decide-append, so two writers in this process can't both decide
+// from the same state.
 //
 // With opts.Idempotency set, a key already seen with the same digest answers
 // the first result and fn should return early after calling tx.Replay; a key
 // seen with another digest is 409 duplicate_id before fn runs.
 //
-// If the store knows a key this process's cache didn't (another process wrote
-// it), the cache is refreshed and fn runs once more; its replay path answers.
+// A write can be decided again once when another process got there first: the
+// cache is caught up and fn runs again against the fresh board (a keyed retry
+// then takes its replay path). fn therefore must decide only from tx and must
+// not have side effects outside it.
 func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOptions, fn func(*Tx) error) error {
-	for attempt := 0; attempt < 2; attempt++ {
-		b.mu.Lock()
-		err := b.update(ctx, tenantName, opts, fn)
-		b.mu.Unlock()
-		if errors.Is(err, errRequestReplayed) && attempt == 0 {
-			continue
-		}
-		return err
-	}
-	return fmt.Errorf("log: the store replayed a request the refreshed log doesn't know")
-}
-
-// update is one read-decide-append. The caller holds b.mu.
-func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOptions, fn func(*Tx) error) error {
-	current, err := b.ensure(tenantName)
+	current, err := b.ensure(ctx, tenantName)
 	if err != nil {
 		return err
 	}
+	replayed, moved := false, false
+	for attempt := 0; attempt < 3; attempt++ {
+		b.mu.Lock()
+		err := b.update(ctx, tenantName, current, opts, fn)
+		b.mu.Unlock()
+		switch {
+		case errors.Is(err, errRequestReplayed):
+			if replayed {
+				return fmt.Errorf("log: the store replayed a request the refreshed log doesn't know")
+			}
+			replayed = true
+		case errors.Is(err, errStoreHeadMoved):
+			if moved {
+				return ErrHeadMoved
+			}
+			moved = true
+		default:
+			return err
+		}
+	}
+	return fmt.Errorf("log: the store kept changing under the write")
+}
+
+// update is one read-decide-append. The caller holds b.mu and passes the
+// tenant ensure returned. Update may call it again after a store-level race,
+// so fn can run more than once.
+func (b *Board) update(ctx context.Context, tenantName string, current *tenant, opts UpdateOptions, fn func(*Tx) error) error {
 	tenant := normalizeTenant(tenantName)
+	if err := b.refreshStaleLocked(ctx, tenant, current); err != nil {
+		return err
+	}
 	tx := &Tx{
 		board:  b,
 		tenant: tenant,
@@ -203,6 +296,23 @@ func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOption
 		if entry, ok := current.idem[opts.Idempotency.Key]; ok {
 			if entry.digest != opts.Idempotency.Digest {
 				return duplicateIDError()
+			}
+			// A cache entry from before request results were stored may lack
+			// the message IDs; ask the store before answering a retry.
+			if len(entry.messageIDs) == 0 {
+				if looker, ok := b.store.(store.RequestStore); ok {
+					stored, found, err := looker.Request(ctx, tenant, opts.Idempotency.Key)
+					if err != nil {
+						return err
+					}
+					if found {
+						if stored.Digest != opts.Idempotency.Digest {
+							return duplicateIDError()
+						}
+						mergeBatch(&entry, stored.Result)
+						current.idem[opts.Idempotency.Key] = entry
+					}
+				}
 			}
 			tx.replay = replayOf(entry)
 		} else if looker, ok := b.store.(store.RequestStore); ok {
@@ -220,21 +330,10 @@ func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOption
 				}
 				entry, ok := current.idem[opts.Idempotency.Key]
 				if !ok {
-					// The log should carry the keyed batch; trust the store's
-					// answer if it somehow doesn't.
-					entry = idemEntry{
-						digest:     stored.Digest,
-						messageIDs: append([]uint64(nil), stored.Result.MessageIDs...),
-						first:      stored.Result.FirstSeq,
-						last:       stored.Result.LastSeq,
-					}
-					current.idem[opts.Idempotency.Key] = entry
-				} else if len(entry.messageIDs) == 0 && len(stored.Result.MessageIDs) > 0 {
-					// A fold that can't identify a post by its seq (a write
-					// with a pre-set ID) still gets the store's answer.
-					entry.messageIDs = append([]uint64(nil), stored.Result.MessageIDs...)
-					current.idem[opts.Idempotency.Key] = entry
+					entry = idemEntry{digest: stored.Digest}
 				}
+				mergeBatch(&entry, stored.Result)
+				current.idem[opts.Idempotency.Key] = entry
 				tx.replay = replayOf(entry)
 			}
 		}
@@ -283,20 +382,28 @@ func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOption
 	case errors.Is(err, store.ErrDuplicateRequest):
 		return duplicateIDError()
 	case errors.Is(err, store.ErrHeadMoved):
-		// Another process moved the head. Catch this cache up so the caller's
-		// next attempt decides from the log as it is now.
+		// Another process moved the head while this write decided. Catch the
+		// cache up and let Update run fn once more against the fresh board.
 		if refreshErr := b.refreshLocked(ctx, tenant, current); refreshErr != nil {
 			return refreshErr
 		}
-		return ErrHeadMoved
+		return errStoreHeadMoved
 	default:
 		return err
 	}
 	if outcome.Replayed {
 		// Another process landed the key between the lookup and the append.
-		// Fold what the store has, then let the retry see the replay.
+		// Fold what the store has, keep its answer, and retry so fn replays.
 		if err := b.refreshLocked(ctx, tenant, current); err != nil {
 			return err
+		}
+		if tx.idem != nil {
+			entry, ok := current.idem[tx.idem.Key]
+			if !ok {
+				entry = idemEntry{digest: tx.idem.Digest}
+			}
+			mergeBatch(&entry, outcome.BatchResult)
+			current.idem[tx.idem.Key] = entry
 		}
 		return errRequestReplayed
 	}
@@ -312,8 +419,32 @@ func (b *Board) update(ctx context.Context, tenantName string, opts UpdateOption
 			last:       result.LastSeq,
 		}
 	}
+	current.checked = time.Now()
 	current.wake()
 	return nil
+}
+
+// mergeBatch fills a cache entry's missing answer from a batch result.
+func mergeBatch(entry *idemEntry, batch store.BatchResult) {
+	if len(entry.messageIDs) == 0 && len(batch.MessageIDs) > 0 {
+		entry.messageIDs = append([]uint64(nil), batch.MessageIDs...)
+	}
+	if entry.first == 0 {
+		entry.first = batch.FirstSeq
+	}
+	if entry.last == 0 {
+		entry.last = batch.LastSeq
+	}
+}
+
+// containsMessageID reports whether ids already names want.
+func containsMessageID(ids []uint64, want uint64) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // duplicateIDError is the 409 an idempotency key reused for another write
@@ -433,12 +564,24 @@ func idempotencyOf(req AppendRequest) *Idempotency {
 }
 
 // Read runs fn against the folded board as it is now. No write can land while
-// fn runs.
+// fn runs. Store reads are bounded by storeTimeout.
 func (b *Board) Read(tenantName string, fn func(*Snapshot) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	return b.ReadContext(ctx, tenantName, fn)
+}
+
+// ReadContext is Read with a caller's context. A shared store's head is checked
+// at most once per Freshness window, so a read sees another process's writes
+// within that bound.
+func (b *Board) ReadContext(ctx context.Context, tenantName string, fn func(*Snapshot) error) error {
+	current, err := b.ensure(ctx, tenantName)
+	if err != nil {
+		return err
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	current, err := b.ensure(tenantName)
-	if err != nil {
+	if err := b.refreshStaleLocked(ctx, normalizeTenant(tenantName), current); err != nil {
 		return err
 	}
 	return fn(&Snapshot{state: current.state, now: b.now()})
@@ -446,23 +589,34 @@ func (b *Board) Read(tenantName string, fn func(*Snapshot) error) error {
 
 // Head returns a tenant's head: the seq of its latest event, 0 when empty.
 func (b *Board) Head(tenantName string) (uint64, error) {
-	var head uint64
-	err := b.Read(tenantName, func(snapshot *Snapshot) error {
-		head = snapshot.Head()
-		return nil
-	})
-	return head, err
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	current, err := b.ensure(ctx, tenantName)
+	if err != nil {
+		return 0, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.refreshStaleLocked(ctx, normalizeTenant(tenantName), current); err != nil {
+		return 0, err
+	}
+	return current.state.Head, nil
 }
 
 // History returns events with FirstSeq <= Seq <= LastSeq, in order.
 func (b *Board) History(tenantName string, first, last uint64) ([]Event, error) {
-	var out []Event
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	current, err := b.ensure(tenantName)
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	current, err := b.ensure(ctx, tenantName)
 	if err != nil {
 		return nil, err
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.refreshStaleLocked(ctx, normalizeTenant(tenantName), current); err != nil {
+		return nil, err
+	}
+	var out []Event
 	for _, event := range current.events {
 		if event.Seq < first {
 			continue
@@ -484,13 +638,12 @@ func (b *Board) History(tenantName string, first, last uint64) ([]Event, error) 
 // wait never holds a write lock.
 func (b *Board) Wait(ctx context.Context, tenantName string, after uint64) error {
 	tenant := normalizeTenant(tenantName)
+	current, err := b.ensure(ctx, tenantName)
+	if err != nil {
+		return err
+	}
 	for {
 		b.mu.Lock()
-		current, err := b.ensure(tenantName)
-		if err != nil {
-			b.mu.Unlock()
-			return err
-		}
 		if current.state.Head > after {
 			b.mu.Unlock()
 			return nil
@@ -520,21 +673,77 @@ func (b *Board) Wait(ctx context.Context, tenantName string, after uint64) error
 	}
 }
 
+// Refresh makes the cache compare with the store now, ignoring the freshness
+// window. A feed calls it before reading its cursor: a client's Last-Event-ID
+// must not be clamped below events the store already holds just because this
+// process's cache is a little behind.
+func (b *Board) Refresh(ctx context.Context, tenantName string) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, storeTimeout)
+		defer cancel()
+	}
+	current, err := b.ensure(ctx, tenantName)
+	if err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.refreshNowLocked(ctx, normalizeTenant(tenantName), current)
+}
+
+// refreshStaleLocked refreshes a tenant when its cache is older than the
+// freshness window. A store without a head check is left alone: its writes are
+// this process's own.
+func (b *Board) refreshStaleLocked(ctx context.Context, tenant string, current *tenant) error {
+	if b.freshness < 0 {
+		return nil
+	}
+	if _, ok := b.store.(store.HeadStore); !ok {
+		return nil
+	}
+	if time.Since(current.checked) < b.freshness {
+		return nil
+	}
+	return b.refreshNowLocked(ctx, tenant, current)
+}
+
+// refreshNowLocked checks the store's head and folds anything past the cache.
+// The caller holds b.mu.
+func (b *Board) refreshNowLocked(ctx context.Context, tenant string, current *tenant) error {
+	if header, ok := b.store.(store.HeadStore); ok {
+		head, err := header.Head(ctx, tenant)
+		if err != nil {
+			return err
+		}
+		if head <= current.state.Head {
+			current.checked = time.Now()
+			return nil
+		}
+	}
+	return b.refreshLocked(ctx, tenant, current)
+}
+
 // refreshLocked folds records the store has gained since the tenant's head: a
 // write by another process, or a key this process hadn't loaded. The caller
 // holds b.mu.
-func (b *Board) refreshLocked(ctx context.Context, tenant string, current *tenant) error {
+func (b *Board) refreshLocked(ctx context.Context, tenant string, current *tenant) (err error) {
+	defer func() {
+		if err == nil {
+			current.checked = time.Now()
+		}
+	}()
 	const page = 1000
 	for {
-		records, err := b.recordsAfter(ctx, tenant, current.state.Head, page)
-		if err != nil {
-			return err
+		records, readErr := b.recordsAfter(ctx, tenant, current.state.Head, page)
+		if readErr != nil {
+			return readErr
 		}
 		if len(records) == 0 {
 			return nil
 		}
-		if err := current.apply(records); err != nil {
-			return err
+		if applyErr := current.apply(records); applyErr != nil {
+			return applyErr
 		}
 		if len(records) < page {
 			return nil
@@ -695,7 +904,8 @@ func (tx *Tx) Now() time.Time { return tx.snap.now }
 func (tx *Tx) NextID(offset int) uint64 { return tx.head + uint64(offset) + 1 }
 
 // Emit buffers an event and returns the seq it will land at. A message.posted
-// payload's ID is filled in with that seq when it's zero.
+// payload with no ID is copied with the event's seq filled in; the caller's
+// payload is never mutated, so a refused append leaves its request as it was.
 func (tx *Tx) Emit(eventType EventType, payload any) uint64 {
 	return tx.EmitRaw(eventType, payload)
 }
@@ -704,9 +914,15 @@ func (tx *Tx) Emit(eventType EventType, payload any) uint64 {
 func (tx *Tx) EmitRaw(eventType EventType, payload any) uint64 {
 	seq := tx.head + uint64(len(tx.events)) + 1
 	if posted, ok := payload.(*MessagePostedPayload); ok && posted.ID == 0 {
-		posted.ID = seq
+		copy := *posted
+		copy.ID = seq
+		payload = &copy
 	}
-	tx.events = append(tx.events, Event{Seq: seq, Type: eventType, Payload: payload, At: tx.snap.now})
+	tx.events = append(tx.events, Event{
+		Seq: seq, Type: eventType, Payload: payload,
+		// The stores keep microseconds; a live fold and a replay agree.
+		At: tx.snap.now.Truncate(time.Microsecond),
+	})
 	return seq
 }
 

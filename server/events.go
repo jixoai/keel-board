@@ -242,6 +242,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Catch the cache up before reading the start. A stream cursor may name
+	// events another process wrote; never clamp it below what the store already
+	// holds just because this process's cache is behind.
+	if err := s.board.Refresh(req.ctx, req.tenant); err != nil {
+		writeError(w, protocol.NewError(protocol.CodeInternal, "could not read the board"))
+		return
+	}
 	// Read the start before announcing the stream: a write that lands after
 	// this head is delivered, never skipped because it raced the opening.
 	head := uint64(0)
@@ -257,7 +264,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		cursor = *after
 	}
 	if cursor > head {
-		cursor = head
+		// The cursor is ahead of the log even after a forced catch-up: it
+		// isn't this board's, so refuse it rather than silently replay.
+		writeError(w, protocol.NewError(protocol.CodeInvalidCursor,
+			fmt.Sprintf("%s is ahead of this board's log", protocol.FormatRef(cursor))))
+		return
 	}
 
 	w.Header().Set("content-type", "text/event-stream; charset=utf-8")

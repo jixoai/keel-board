@@ -5,7 +5,10 @@
 //	board serve --dsn 'postgres://user:pass@host/db?sslmode=disable'
 //
 // Without --dsn the log lives in memory and is lost when the process exits.
-// With --dsn it lives in PostgreSQL, and a restart replays it.
+// With --dsn it lives in PostgreSQL, and a restart replays it. Processes
+// sharing a DSN see each other's writes within --freshness (one second by
+// default): a board rechecks the store's head at that interval, not per
+// request, and a write that loses a race catches up and decides again once.
 //
 // The development server trusts its caller headers (see server.DevActor) and
 // allows every permission. It is for curl smoke tests and local work, never
@@ -57,7 +60,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `board: the Keel board server (phase 1)
 
 Usage:
-  board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--verbose]
+  board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--freshness 1s] [--verbose]
   board version
 `)
 }
@@ -80,6 +83,7 @@ func serve(args []string) error {
 	flags := flag.NewFlagSet("board serve", flag.ExitOnError)
 	addr := flags.String("addr", "127.0.0.1:8790", "the address to listen on")
 	dsn := flags.String("dsn", "", "PostgreSQL DSN for the board's log; empty keeps it in memory")
+	freshness := flags.Duration("freshness", time.Second, "how stale a shared PostgreSQL cache may be; negative disables the check")
 	verbose := flags.Bool("verbose", false, "log every request")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -100,7 +104,7 @@ func serve(args []string) error {
 	}
 	defer closeStore()
 
-	board := log.New(log.Options{Store: events})
+	board := log.New(log.Options{Store: events, Freshness: *freshness})
 	api := server.New(server.Options{Board: board, Logger: logger})
 	handler := http.Handler(api)
 	if *verbose {

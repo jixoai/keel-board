@@ -29,6 +29,10 @@ Without `--dsn` the log is in memory and lost on exit. With `--dsn` it lives in
 PostgreSQL: a restart replays it, and an append is one transaction over the
 tenant's head, its events, and its idempotency row.
 
+Several processes may share one PostgreSQL log. A board rechecks the store's
+head at most once a second, a write that loses a race catches up and decides
+again once, and an SSE cursor ahead of the log is refused rather than clamped.
+
 ## Layout
 
 | Path | Contents |

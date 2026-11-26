@@ -73,3 +73,35 @@ Slack, GitHub, Linear, and a generic Chat SDK bridge. The complete design is in
 - The Chat SDK bridge is a Go `Adapter` interface, not a JavaScript runtime.
 - Providers emit platform-native author IDs; a host re-keys them under the
   entry key with `sync.KeyedID`, as upstream's engine does automatically.
+
+## Storage and multi-process behavior
+
+- PostgreSQL is the durable log; the in-memory store is process-local.
+- One append is one transaction: the tenant's `board_heads` row is locked and
+  its `seq` checked against the expected head, then the batch's events and its
+  `board_requests` idempotency row are written. A keyed retry with the same
+  digest answers the first result without writing.
+- Payloads are JSON values (`jsonb`). Supply valid JSON; empty means `null`, a
+  NUL is refused, and timestamps keep microseconds. The representation may be
+  normalized, so compare payloads by value, not bytes.
+- A board caches each tenant's folded log. Against a store that reports a head
+  (PostgreSQL), it rechecks at most once per `Freshness` window (default 1s), so
+  a read sees another process's writes within that bound. A write that collides
+  with another process's append catches up and runs its decision once more.
+- An SSE feed forces a catch-up when it opens, so `last` replay and a client's
+  `Last-Event-ID` see the store's events. A cursor ahead of the log is refused
+  (`invalid_cursor`), never silently clamped downward.
+
+Known deviations and deferred work:
+
+- The idempotency digest in `server/messages.go` and `server/tasks.go` is coarse
+  (`channel`/`re`); it is not content-addressed yet. port/messages owns this.
+- The HTTP task-adopt route (`POST /tasks` with `re`) refuses `id` in this
+  snapshot, so a keyed adopt is exercised through `Board.Update`; the replay
+  path and store contract are ready if the handler allows the key later.
+- There is no migration version table: migration files are idempotent and run
+  under a session advisory lock. No `CREATE INDEX CONCURRENTLY`.
+- There is no LISTEN/NOTIFY: `Wait` polls the tenant head every 50ms per waiter.
+  No log compaction and no `board_requests` retention.
+- There is no statement timeout: read-side store work (first load, catch-up,
+  head check) is bounded at 5s; writes use the caller's request context.
