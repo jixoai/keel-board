@@ -261,7 +261,7 @@ func TestGitHubContractMatrix(t *testing.T) {
 func TestEndToEndExistingThreadAndEchoSuppression(t *testing.T) {
 	f := newFakeGitHub(t)
 	p := contractProvider(t, f.server.URL)
-	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Mirror("prs")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: p, Sync: boardsync.Mirror("prs")}
 	registry := boardsync.NewRegistry()
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
@@ -271,7 +271,7 @@ func TestEndToEndExistingThreadAndEchoSuppression(t *testing.T) {
 	gate := fake.NewGate(nil, []string{"github:acme/www:123"})
 	inbox := boardsync.NewMemoryInbox(boardsync.InboundRetry, 0)
 	ctx := context.Background()
-	response, err := registry.HandleWebhook(ctx, "github", request(t, "issue_comment", "in-1", fixture(t, "pr_comment.json")), gate, inbox)
+	response, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "issue_comment", "in-1", fixture(t, "pr_comment.json")), gate, inbox)
 	if err != nil || response.Status != 200 {
 		t.Fatalf("HandleWebhook = %+v, %v", response, err)
 	}
@@ -315,7 +315,7 @@ func TestEndToEndExistingThreadAndEchoSuppression(t *testing.T) {
 	// The platform echoes the comment back. The marker drops it even though the
 	// author isn't the app's bot account.
 	echo := commentWebhook(t, 9300, posted, 1001, "ada", true, "echo-1")
-	if response, err := registry.HandleWebhook(ctx, "github", echo, gate, inbox); err != nil || response.Status != 200 {
+	if response, err := registry.HandleWebhook(ctx, "t1", "github", echo, gate, inbox); err != nil || response.Status != 200 {
 		t.Fatalf("echo = %+v, %v", response, err)
 	}
 	if pending := inbox.Pending("github"); pending != 0 {
@@ -324,7 +324,7 @@ func TestEndToEndExistingThreadAndEchoSuppression(t *testing.T) {
 
 	// A bot comment with no marker is dropped by the bot identity.
 	botEcho := commentWebhook(t, 9400, "no marker here", 4242, "keel-board[bot]", true, "echo-2")
-	if response, err := registry.HandleWebhook(ctx, "github", botEcho, gate, inbox); err != nil || response.Status != 200 {
+	if response, err := registry.HandleWebhook(ctx, "t1", "github", botEcho, gate, inbox); err != nil || response.Status != 200 {
 		t.Fatalf("bot echo = %+v, %v", response, err)
 	}
 	if pending := inbox.Pending("github"); pending != 0 {
@@ -339,7 +339,7 @@ func TestEndToEndExistingThreadAndEchoSuppression(t *testing.T) {
 func TestEndToEndIssueReviewAndCI(t *testing.T) {
 	f := newFakeGitHub(t)
 	p := contractProvider(t, f.server.URL)
-	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Mirror("board")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: p, Sync: boardsync.Mirror("board")}
 	registry := boardsync.NewRegistry()
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
@@ -349,16 +349,16 @@ func TestEndToEndIssueReviewAndCI(t *testing.T) {
 	ctx := context.Background()
 
 	// An issue comment imports on the existing issue thread.
-	response, err := registry.HandleWebhook(ctx, "github", request(t, "issue_comment", "issue-1", fixture(t, "issue_comment.json")), gate, inbox)
+	response, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "issue_comment", "issue-1", fixture(t, "issue_comment.json")), gate, inbox)
 	if err != nil || response.Status != 200 {
 		t.Fatalf("issue comment = %+v, %v", response, err)
 	}
 	// A review reply imports under the PR's review sub-thread.
-	if response, err := registry.HandleWebhook(ctx, "github", request(t, "pull_request_review_comment", "review-1", fixture(t, "review_comment.json")), gate, inbox); err != nil || response.Status != 200 {
+	if response, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "pull_request_review_comment", "review-1", fixture(t, "review_comment.json")), gate, inbox); err != nil || response.Status != 200 {
 		t.Fatalf("review comment = %+v, %v", response, err)
 	}
 	// CI failure imports as a lifecycle record on the PR thread.
-	if response, err := registry.HandleWebhook(ctx, "github", request(t, "workflow_run", "ci-1", fixture(t, "workflow_run.json")), gate, inbox); err != nil || response.Status != 200 {
+	if response, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "workflow_run", "ci-1", fixture(t, "workflow_run.json")), gate, inbox); err != nil || response.Status != 200 {
 		t.Fatalf("ci = %+v, %v", response, err)
 	}
 	if pending := inbox.Pending("github"); pending != 3 {
@@ -437,7 +437,7 @@ func TestBoardRootDoesNotCreateGitHubIssue(t *testing.T) {
 	if p.Capabilities().StartThreads {
 		t.Fatal("github must not claim startThreads")
 	}
-	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Mirror("prs")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: p, Sync: boardsync.Mirror("prs")}
 	runner := boardsync.NewRunner(fake.NewHost())
 	message := boardsync.Message{ID: 7, Thread: 7, Channel: "prs", Text: "new root", Actor: "local:user:ada"}
 	err := runner.OfferRoot(context.Background(), entry, boardsync.BoardEvent{Type: boardsync.BoardMessagePosted, Thread: 7}, message, "acme/www:pulls")

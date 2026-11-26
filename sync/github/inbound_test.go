@@ -95,7 +95,7 @@ func TestReceiveRequiresUsableDeliveryID(t *testing.T) {
 
 func TestDuplicateDeliveryImportsOnce(t *testing.T) {
 	p := newProvider(t, false)
-	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Into("prs")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: p, Sync: boardsync.Into("prs")}
 	registry := boardsync.NewRegistry()
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
@@ -106,7 +106,7 @@ func TestDuplicateDeliveryImportsOnce(t *testing.T) {
 	ctx := context.Background()
 
 	for attempt := 0; attempt < 2; attempt++ {
-		response, err := registry.HandleWebhook(ctx, "github", request(t, "issue_comment", "same-delivery", body), gate, inbox)
+		response, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "issue_comment", "same-delivery", body), gate, inbox)
 		if err != nil || response.Status != 200 {
 			t.Fatalf("attempt %d = %+v, %v", attempt, response, err)
 		}
@@ -133,7 +133,7 @@ func TestDuplicateDeliveryImportsOnce(t *testing.T) {
 
 func TestDuplicateLifecycleDeliveryImportsOnce(t *testing.T) {
 	p := newProvider(t, false)
-	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Mirror("prs")}
+	entry := boardsync.Entry{Tenant: "t1", Key: "github", Platform: "github", Provider: p, Sync: boardsync.Mirror("prs")}
 	registry := boardsync.NewRegistry()
 	if err := registry.Add(entry); err != nil {
 		t.Fatal(err)
@@ -143,7 +143,7 @@ func TestDuplicateLifecycleDeliveryImportsOnce(t *testing.T) {
 	body := fixture(t, "pr_closed.json")
 	ctx := context.Background()
 	for attempt := 0; attempt < 2; attempt++ {
-		if _, err := registry.HandleWebhook(ctx, "github", request(t, "pull_request", "closed-delivery", body), gate, inbox); err != nil {
+		if _, err := registry.HandleWebhook(ctx, "t1", "github", request(t, "pull_request", "closed-delivery", body), gate, inbox); err != nil {
 			t.Fatal(err)
 		}
 	}
