@@ -86,8 +86,10 @@ Replaced or simplified:
   can have manage before a grant gives it.
 - The server's `Authorize` seam now passes the tenant the server resolved, so a
   multi-tenant board can't authorize against another tenant's grants. A
-  `Tenant` hook may normalize the name but the explicit tenant is what reaches
-  the store.
+  `Tenant` hook may confirm the name but not replace it: returning a different
+  tenant is an error, since only the server decides which board a request is
+  on. `BoardTeam`/`TeamFunc` must be set before the service serves writes;
+  changing them concurrently isn't supported.
 - `GrantService.Create`/`Update` force project `TeamID` from `BoardTeam` or
   `TeamFunc`; a team-scoped grant no longer matches a caller whose token names
   no team. A project moving teams keeps none of its old team's grants.
@@ -96,8 +98,16 @@ Replaced or simplified:
 - Grant listings and explanations are gated: `List` and explaining another
   caller require manage at `*`. A caller that can't list sees its own
   permissions for a channel a grant admits it to, but no pattern, level, or
-  grants; an unknown or unreachable target is a uniform 403. This closes the
-  404/403 enumeration oracle.
+  grants; an unknown or unreachable target is a uniform 403. `Update` and
+  `Revoke` do reach on the grant as it is before reading a change, and a caller
+  that can't list gets the same 403 for a missing grant, an unreachable one, a
+  removal that names nothing, or the last principal; only a lister sees a 404
+  or `not_in_grant`/`grant_empty`. This closes the 404/403 enumeration oracle.
+- A bad `x-board-can`, a canceled request, or a store failure that a filtering
+  handler would otherwise turn into an empty 200 is caught before the handler
+  runs: an Authorizer may implement `server.RequestValidator`, and `access`
+  does, so GET /channels and GET /tasks answer 400, 499, 503, or 500 rather than an
+  empty 200.
 - A sandboxed owner (owner with a token scope or cap) still passes reach and
   admission; only the lockout is waived for an owner.
 - `Removes` compares a GitHub principal by identity: a grant carrying a
@@ -122,11 +132,13 @@ Known deviations, deliberately not implemented now:
   404 by default. `RevealUnreadable` opts into 403 for hosts that know the
   channel was named.
 - No `O(channels × grants)` indexing or grant cache; `Authorize` reloads the
-  tenant's grants per check.
+  tenant's grants per check, and `RequestValidator`'s preflight adds one more
+  read per request.
 - A bad `x-board-can` is 400 `invalid_scope` when the host uses `ScopeText`; a
-  programmatic `Scope` is trusted host code. A programmatic scope over 64
-  patterns is applied pattern by pattern instead of being rejected, while a
-  parsed header over the limit is 400.
+  programmatic `Scope` is trusted host code. When both are configured they
+  compose by intersection, and neither can widen the other. A programmatic
+  scope over 64 patterns is applied pattern by pattern instead of being
+  rejected, while a parsed header over the limit is 400.
 
 
 ## Sync

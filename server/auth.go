@@ -28,6 +28,14 @@ func (f AuthorizerFunc) Authorize(ctx context.Context, tenant string, actor prot
 	return f(ctx, tenant, actor, channel, permission)
 }
 
+// RequestValidator is an optional Authorizer capability. When an Authorizer
+// implements it, the server validates the caller before a handler runs, so a
+// handler that filters with can() can't turn an invalid scope or a store
+// failure into an empty 200.
+type RequestValidator interface {
+	ValidateRequest(ctx context.Context, tenant string, actor protocol.Actor) error
+}
+
 // AllowAll allows every caller every permission. It is for development and
 // tests, never for a shared deployment.
 type AllowAll struct{}

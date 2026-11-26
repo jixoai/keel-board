@@ -527,8 +527,7 @@ func TestGrantServiceReachChecksOwnLimitsUnderThePattern(t *testing.T) {
 }
 
 func errorCode(err error) protocol.Code {
-	var boardErr *protocol.Error
-	if errors.As(err, &boardErr) {
+	if boardErr := AsProtocolError(err); boardErr != nil {
 		return boardErr.Code
 	}
 	return ""

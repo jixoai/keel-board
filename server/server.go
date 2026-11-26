@@ -174,7 +174,14 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) (*request, bool
 	if actor.Kind == "" {
 		actor.Kind = protocol.ActorPerson
 	}
-	return &request{tenant: tenant, actor: actor, http: r, ctx: r.Context()}, true
+	req := &request{tenant: tenant, actor: actor, http: r, ctx: r.Context()}
+	if validator, ok := s.authorize.(RequestValidator); ok {
+		if err := validator.ValidateRequest(req.ctx, req.tenant, req.actor); err != nil {
+			writeError(w, asProtocol(err))
+			return nil, false
+		}
+	}
+	return req, true
 }
 
 // can asks the authorizer whether the request may do permission in channel.

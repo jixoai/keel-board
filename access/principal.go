@@ -167,13 +167,11 @@ func NormalizePrincipal(principal Principal) (Principal, error) {
 			if out.Email == "" {
 				return Principal{}, invalidGrantf("a user principal names a userId (or an email)")
 			}
-			out.UserID = strings.ToLower(out.Email)
+			out.UserID = out.Email
 		}
 		// An email-shaped userId is a login: users are known by it in
 		// lowercase, as what verified them gives it.
-		if strings.Contains(out.UserID, "@") {
-			out.UserID = strings.ToLower(out.UserID)
-		}
+		out.UserID = normalizeUserID(out.UserID)
 		if len(out.UserID) > 200 || !protocol.Storable(out.UserID) || strings.ContainsAny(out.UserID, " \t\r\n") {
 			return Principal{}, invalidGrantf("a user principal's ID is 1 to 200 characters without spaces, got %q", out.UserID)
 		}
@@ -230,6 +228,16 @@ func NormalizePrincipal(principal Principal) (Principal, error) {
 		// Nothing to fill.
 	}
 	return out, nil
+}
+
+// normalizeUserID lowercases an email-shaped login, which is how both a grant
+// and a verified caller are known. A non-email ID is case-sensitive.
+func normalizeUserID(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "@") {
+		return strings.ToLower(value)
+	}
+	return value
 }
 
 // principalKey is a principal's identity as one string. Two principals with

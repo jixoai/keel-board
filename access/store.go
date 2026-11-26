@@ -190,7 +190,9 @@ type GrantService struct {
 	mu    sync.Mutex
 	// BoardTeam is the team every project principal a write names is kept on.
 	// It is the service's source of truth, so a client-written TeamID can't
-	// outlive a project moving teams.
+	// outlive a project moving teams. Set it (and TeamFunc) before the service
+	// serves writes: they are read under the write lock but are not themselves
+	// synchronized, so changing them concurrently isn't supported.
 	BoardTeam string
 	// TeamFunc resolves the board's team for a tenant. When set it wins over
 	// BoardTeam. Configure it before writes: the service reads it while
@@ -265,6 +267,9 @@ func (s *GrantService) Create(ctx context.Context, tenant string, caller Caller,
 
 // Update changes a grant: adding and removing principals, or replacing its
 // can. It is judged like Create, on the grant's patterns before and after.
+// A caller that can't list grants gets the same 403 whether the grant is
+// missing, unreachable, a removal names nothing, or the last principal would
+// go; only a lister sees a 404 or the specific reason.
 func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Caller, update GrantUpdate, lockMeOut bool) (Grant, error) {
 	tenant = tenantName(tenant)
 	s.mu.Lock()
@@ -273,13 +278,26 @@ func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Cal
 	if err != nil {
 		return Grant{}, err
 	}
+	canList := lists(caller, tenant, before)
 	old, ok := findGrant(before, id)
 	if !ok {
+		if !canList {
+			return Grant{}, forbiddenListing()
+		}
 		return Grant{}, ErrGrantNotFound
+	}
+	// Reach on the grant as it is, before looking at any change detail. An
+	// empty update still needs manage at its patterns, and may not rewrite its
+	// TeamID or capped flag.
+	if refusal := reachOnRevoked(tenant, caller, before, old); refusal != nil {
+		return Grant{}, restrictedError(canList, refusal)
+	}
+	if update.Can == nil && len(update.Add) == 0 && len(update.Remove) == 0 {
+		return old.Clone(), nil
 	}
 	next, err := ApplyUpdate(old, update)
 	if err != nil {
-		return Grant{}, err
+		return Grant{}, restrictedError(canList, err)
 	}
 	next.ID = old.ID
 	next.Tenant = tenant
@@ -291,13 +309,11 @@ func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Cal
 	next.Capped = cappedFor(next, caller)
 	after := replaceGrant(before, id, next)
 	// A removal lets no one in, so it is judged by reach alone; adding or
-	// widening is judged by admission too.
-	var changed, revoked *Grant
+	// widening is judged by admission too. The grant as it was is always the
+	// one reach is judged on.
+	var changed *Grant
 	if update.Can != nil || len(update.Add) > 0 {
 		changed = &next
-	}
-	if update.Can != nil || len(update.Remove) > 0 {
-		revoked = &old
 	}
 	refusal := CheckGrantChange(GrantChange{
 		Tenant:    tenant,
@@ -305,18 +321,19 @@ func (s *GrantService) Update(ctx context.Context, tenant, id string, caller Cal
 		Before:    before,
 		After:     after,
 		Changed:   changed,
-		Revoked:   revoked,
+		Revoked:   &old,
 		LockMeOut: lockMeOut,
 	})
 	if refusal != nil {
-		return Grant{}, refusal
+		return Grant{}, restrictedError(canList, refusal)
 	}
 	return s.store.Update(ctx, tenant, id, next)
 }
 
 // Revoke removes a grant. Lifting what it held back widens whoever it named,
 // so it takes manage at its patterns, and a grant that keeps caller in is a
-// lockout.
+// lockout. A caller that can't list grants can't tell a missing grant from an
+// unreachable one.
 func (s *GrantService) Revoke(ctx context.Context, tenant, id string, caller Caller, lockMeOut bool) error {
 	tenant = tenantName(tenant)
 	s.mu.Lock()
@@ -325,9 +342,16 @@ func (s *GrantService) Revoke(ctx context.Context, tenant, id string, caller Cal
 	if err != nil {
 		return err
 	}
+	canList := lists(caller, tenant, before)
 	old, ok := findGrant(before, id)
 	if !ok {
+		if !canList {
+			return forbiddenListing()
+		}
 		return ErrGrantNotFound
+	}
+	if refusal := reachOnRevoked(tenant, caller, before, old); refusal != nil {
+		return restrictedError(canList, refusal)
 	}
 	after := make([]Grant, 0, len(before)-1)
 	for _, grant := range before {
@@ -344,9 +368,36 @@ func (s *GrantService) Revoke(ctx context.Context, tenant, id string, caller Cal
 		LockMeOut: lockMeOut,
 	})
 	if refusal != nil {
-		return refusal
+		return restrictedError(canList, refusal)
 	}
 	return s.store.Revoke(ctx, tenant, id)
+}
+
+// reachOnRevoked judges reach on a grant as it is, before a change's details
+// are known. Lockout is left to the full check.
+func reachOnRevoked(tenant string, caller Caller, before []Grant, old Grant) *Refusal {
+	return CheckGrantChange(GrantChange{
+		Tenant:    tenant,
+		Caller:    caller,
+		Before:    before,
+		After:     before,
+		Revoked:   &old,
+		LockMeOut: true,
+	})
+}
+
+// restrictedError hides a grant's details from a caller that can't list
+// grants. A lockout is left alone: reach already proved the caller manages the
+// pattern, so it reveals nothing it doesn't know.
+func restrictedError(canList bool, err error) error {
+	if err == nil || canList {
+		return err
+	}
+	var refusal *Refusal
+	if errors.As(err, &refusal) && refusal.Reason == RefusalLockout {
+		return err
+	}
+	return forbiddenListing()
 }
 
 // Explain returns what decides caller's access in channel, from the tenant's
@@ -405,7 +456,7 @@ func lists(caller Caller, tenant string, grants []Grant) bool {
 }
 
 func forbiddenListing() *protocol.Error {
-	return protocol.Forbidden("listing grants takes manage everywhere")
+	return protocol.Forbidden("not permitted")
 }
 
 func redactExplanation(explanation Explanation) Explanation {

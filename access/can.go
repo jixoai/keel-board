@@ -219,6 +219,29 @@ func groupsFromCan(can Can) map[string]*patternGroup {
 	return groups
 }
 
+// intersectCan returns the can that allows only what both cans allow, channel
+// by channel. It is how an x-board-can header and a host's own scope compose:
+// neither can widen the other.
+func intersectCan(left, right Can) Can {
+	leftGroups := groupsFromCan(left)
+	rightGroups := groupsFromCan(right)
+	leftView := &accessView{groups: leftGroups}
+	rightView := &accessView{groups: rightGroups}
+	patterns := map[string]ChannelPattern{"*": {Kind: PatternAll}}
+	for _, group := range leftGroups {
+		patterns[group.pattern.String()] = group.pattern
+	}
+	for _, group := range rightGroups {
+		patterns[group.pattern.String()] = group.pattern
+	}
+	out := make(Can, len(patterns))
+	for key, pattern := range patterns {
+		set := leftView.atPattern(pattern).Intersect(rightView.atPattern(pattern))
+		out[key] = Only(set.List()...)
+	}
+	return out
+}
+
 // parseCanText parses a can as a header writes it, `dev/=read,post;ci/=read`,
 // `*=all`, or `*=` for none. It is the shape a proxy's x-board-can narrows a
 // caller with.

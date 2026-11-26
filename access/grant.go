@@ -39,8 +39,9 @@ func (g Grant) Clone() Grant {
 // NormalizeGrant checks a grant and fills what its principals and can imply:
 // a user's email becomes its ID, a project's environments default to
 // production, a workflow becomes its path, and can patterns and permissions
-// are checked and de-duplicated. It accepts a grant with no principals, which
-// an update that removes the last one leaves; a create refuses one.
+// are checked and de-duplicated. It accepts a grant with no principals, for a
+// store validating a full replacement; a create refuses one, and an update
+// that would remove the last principal is grant_empty.
 func NormalizeGrant(grant Grant) (Grant, error) {
 	out := grant.Clone()
 	out.ID = strings.TrimSpace(grant.ID)
@@ -183,7 +184,7 @@ func Removes(removal, principal Principal) bool {
 	}
 	switch removal.Kind {
 	case PrincipalUser:
-		return removal.UserID != "" && removal.UserID == principal.UserID
+		return removal.UserID != "" && normalizeUserID(removal.UserID) == normalizeUserID(principal.UserID)
 	case PrincipalProject:
 		return removal.ProjectID != "" && removal.ProjectID == principal.ProjectID
 	case PrincipalGitHub:

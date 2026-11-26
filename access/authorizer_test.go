@@ -134,20 +134,18 @@ func TestAuthorizerTenantIsExplicit(t *testing.T) {
 	}
 	expectAccessError(t, authorizer.Authorize(ctx, "tenant-a", bob, "work", PermissionRead), protocol.CodeNotFound, 404)
 
-	// A Tenant hook may normalize the server's tenant, but the explicit tenant
-	// still reaches the store.
-	normalized := &Authorizer{Store: store, Tenant: func(_ context.Context, tenant string, _ protocol.Actor) string {
-		return tenant + "-normalized"
+	// A Tenant hook may confirm the server's tenant but may not replace it.
+	confirming := &Authorizer{Store: store, Tenant: func(_ context.Context, tenant string, _ protocol.Actor) string {
+		return tenant
 	}}
-	third := "tenant-c"
-	mustCreateGrant(t, store, third+"-normalized", Grant{
-		Principals: []Principal{UserPrincipal("local:user:alice")},
-		Can:        Can{"work": All()},
-	})
-	if err := normalized.Authorize(ctx, third, alice, "work", PermissionRead); err != nil {
-		t.Fatalf("normalized tenant: %v", err)
+	if err := confirming.Authorize(ctx, "tenant-a", alice, "work", PermissionRead); err != nil {
+		t.Fatalf("confirming tenant hook: %v", err)
 	}
-	expectAccessError(t, authorizer.Authorize(ctx, third, alice, "work", PermissionRead), protocol.CodeNotFound, 404)
+	different := &Authorizer{Store: store, Tenant: func(_ context.Context, _ string, _ protocol.Actor) string {
+		return "tenant-b"
+	}}
+	expectAccessError(t, different.Authorize(ctx, "tenant-a", alice, "work", PermissionRead), protocol.CodeInternal, 500)
+	expectAccessError(t, different.ValidateRequest(ctx, "tenant-a", alice), protocol.CodeInternal, 500)
 }
 
 func TestActorPrincipal(t *testing.T) {

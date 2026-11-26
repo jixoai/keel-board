@@ -240,7 +240,8 @@ func matchPrincipal(principal Principal, facts Facts) (Level, bool) {
 		if grantID == "" {
 			grantID = principal.Email
 		}
-		if caller.Kind == PrincipalUser && callerID != "" && grantID != "" && callerID == grantID {
+		if caller.Kind == PrincipalUser && callerID != "" && grantID != "" &&
+			normalizeUserID(callerID) == normalizeUserID(grantID) {
 			return LevelPrincipal, true
 		}
 	case PrincipalAllProjects:

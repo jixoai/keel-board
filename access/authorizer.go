@@ -22,8 +22,9 @@ import (
 type Authorizer struct {
 	// Store is the tenant's grants. Required.
 	Store GrantStore
-	// Tenant normalizes the tenant the server resolved. It may return another
-	// name, but never an empty one; the server's tenant is used otherwise.
+	// Tenant validates the tenant the server resolved. It must return the same
+	// tenant, or an empty string to leave it alone; a different name is an
+	// error, since only the server decides which board a request is on.
 	Tenant func(ctx context.Context, tenant string, actor protocol.Actor) string
 	// Principal resolves who a verified actor is in tenant. Default:
 	// ActorPrincipal.
@@ -45,8 +46,9 @@ type Authorizer struct {
 	Cap func(ctx context.Context, tenant string, principal Principal) []Permission
 	// Scope is a token's narrowing, resolved by the host. Nil doesn't narrow.
 	Scope func(ctx context.Context, tenant string, actor protocol.Actor) *Can
-	// ScopeText is a token's narrowing as x-board-can writes it. When set it
-	// wins over Scope; text that doesn't parse is a 400 invalid_scope.
+	// ScopeText is a token's narrowing as x-board-can writes it. When both
+	// ScopeText and Scope are set they compose by intersection: neither can
+	// widen the other. Text that doesn't parse is a 400 invalid_scope.
 	ScopeText func(ctx context.Context, tenant string, actor protocol.Actor) (string, bool)
 	// RevealUnreadable answers 403 where the default answers 404 for a channel
 	// the caller can't read. Keep it false to hide what the caller can't read.
@@ -54,6 +56,7 @@ type Authorizer struct {
 }
 
 var _ server.Authorizer = (*Authorizer)(nil)
+var _ server.RequestValidator = (*Authorizer)(nil)
 
 // ActorPrincipal is the default mapping from a verified actor to the
 // principal grants name: a person (or agent) is a user by its principal ID, a
@@ -98,15 +101,45 @@ func (a *Authorizer) Can(ctx context.Context, tenant string, actor protocol.Acto
 	return err == nil && explanation.Allows(permission)
 }
 
+// ValidateRequest checks the caller before a handler that filters with can()
+// begins: the tenant, the actor, and any token scope. The server calls it when
+// the authorizer implements server.RequestValidator, so a bad x-board-can is a
+// 400 on GET /channels or GET /tasks rather than a silently empty 200.
+func (a *Authorizer) ValidateRequest(ctx context.Context, tenant string, actor protocol.Actor) error {
+	if a == nil || a.Store == nil {
+		return protocol.NewError(protocol.CodeInternal, "access: no grant store")
+	}
+	tenant, err := a.tenant(ctx, tenant, actor)
+	if err != nil {
+		return err
+	}
+	if a.Principal != nil {
+		if _, err := a.Principal(ctx, tenant, actor); err != nil {
+			return protocol.NewError(protocol.CodeUnauthorized, err.Error())
+		}
+	} else if _, err := ActorPrincipal(actor); err != nil {
+		return protocol.NewError(protocol.CodeUnauthorized, err.Error())
+	}
+	if _, err := a.scopes(ctx, tenant, actor); err != nil {
+		return err
+	}
+	if _, err := a.Store.List(ctx, tenant); err != nil {
+		return storeAccessError(err)
+	}
+	return nil
+}
+
 // Explain returns what decides the actor's access in channel on tenant.
 func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.Actor, channel string) (Explanation, error) {
 	if a == nil || a.Store == nil {
 		return Explanation{}, protocol.NewError(protocol.CodeInternal, "access: no grant store")
 	}
-	tenant = a.tenant(ctx, tenant, actor)
+	tenant, err := a.tenant(ctx, tenant, actor)
+	if err != nil {
+		return Explanation{}, err
+	}
 	resolve := a.Principal
 	var principal Principal
-	var err error
 	if resolve != nil {
 		principal, err = resolve(ctx, tenant, actor)
 	} else {
@@ -115,11 +148,15 @@ func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.
 	if err != nil {
 		return Explanation{}, protocol.NewError(protocol.CodeUnauthorized, err.Error())
 	}
+	scope, err := a.scopes(ctx, tenant, actor)
+	if err != nil {
+		return Explanation{}, err
+	}
 	grants, err := a.Store.List(ctx, tenant)
 	if err != nil {
-		return Explanation{}, protocol.NewError(protocol.CodeInternal, "the board couldn't read its grants")
+		return Explanation{}, storeAccessError(err)
 	}
-	caller := Caller{Principal: principal}
+	caller := Caller{Principal: principal, Scope: scope}
 	if a.Team != nil {
 		if team := strings.TrimSpace(a.Team(ctx, tenant, principal)); team != "" {
 			caller.Principal.TeamID = team
@@ -137,33 +174,69 @@ func (a *Authorizer) Explain(ctx context.Context, tenant string, actor protocol.
 	if a.Cap != nil {
 		caller.Cap = a.Cap(ctx, tenant, principal)
 	}
+	return Evaluate(caller.facts(tenant, grants), channel), nil
+}
+
+// tenant resolves the tenant the server named. A Tenant hook may confirm it
+// but not replace it: a different name is a host bug, not a new board.
+func (a *Authorizer) tenant(ctx context.Context, tenant string, actor protocol.Actor) (string, error) {
+	tenant = strings.TrimSpace(tenant)
+	if tenant == "" {
+		if fromContext, ok := TenantFromContext(ctx); ok {
+			tenant = fromContext
+		}
+	}
+	if tenant == "" {
+		tenant = "default"
+	}
+	if a.Tenant != nil {
+		normalized := strings.TrimSpace(a.Tenant(ctx, tenant, actor))
+		if normalized != "" && normalized != tenant {
+			return "", protocol.NewError(protocol.CodeInternal, "access: the tenant hook changed the request's tenant")
+		}
+	}
+	return tenant, nil
+}
+
+// scopes returns the intersection of every configured scope. A ScopeText
+// returning false leaves the host's Scope in force, and a text scope can never
+// widen a programmatic one.
+func (a *Authorizer) scopes(ctx context.Context, tenant string, actor protocol.Actor) (*Can, error) {
+	scopes := make([]Can, 0, 2)
 	if a.ScopeText != nil {
 		if text, ok := a.ScopeText(ctx, tenant, actor); ok {
 			scope, err := ParseCan(text)
 			if err != nil {
-				return Explanation{}, invalidScopeError(err)
+				return nil, invalidScopeError(err)
 			}
-			caller.Scope = &scope
+			scopes = append(scopes, scope)
 		}
-	} else if a.Scope != nil {
-		caller.Scope = a.Scope(ctx, tenant, actor)
 	}
-	return Evaluate(caller.facts(tenant, grants), channel), nil
+	if a.Scope != nil {
+		if scope := a.Scope(ctx, tenant, actor); scope != nil {
+			scopes = append(scopes, *scope)
+		}
+	}
+	if len(scopes) == 0 {
+		return nil, nil
+	}
+	combined := scopes[0]
+	for _, scope := range scopes[1:] {
+		combined = intersectCan(combined, scope)
+	}
+	return &combined, nil
 }
 
-func (a *Authorizer) tenant(ctx context.Context, tenant string, actor protocol.Actor) string {
-	if a.Tenant != nil {
-		if normalized := strings.TrimSpace(a.Tenant(ctx, tenant, actor)); normalized != "" {
-			return normalized
-		}
+// storeAccessError keeps a canceled or timed-out request's error, so the
+// server answers 499 or 503 instead of a generic 500.
+func storeAccessError(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
 	}
-	if tenant = strings.TrimSpace(tenant); tenant != "" {
-		return tenant
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
 	}
-	if fromContext, ok := TenantFromContext(ctx); ok {
-		return fromContext
-	}
-	return "default"
+	return protocol.NewError(protocol.CodeInternal, "the board couldn't read its grants")
 }
 
 func (a *Authorizer) refuse(channel string, permission protocol.Permission, explanation Explanation) error {
