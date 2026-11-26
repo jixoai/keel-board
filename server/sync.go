@@ -155,8 +155,29 @@ func (s *Server) RunSync(ctx context.Context) error {
 	return s.sync.run(ctx)
 }
 
+// PrepareSync fixes each owned connection's starting cursor before the server
+// accepts writes. Without it, an event posted between process start and the
+// subscription's first read would be skipped as history.
+func (s *Server) PrepareSync(ctx context.Context) error {
+	if s.sync == nil {
+		return nil
+	}
+	return s.sync.prepare(ctx)
+}
+
 // boardEventsSource is the syncstore cursor name for the board subscription.
 const boardEventsSource = "board-events"
+
+// prepare records each owned connection's cursor at the current head, unless
+// one is already durable. It is safe to call more than once.
+func (s *syncService) prepare(ctx context.Context) error {
+	for _, owned := range s.owned {
+		if _, err := s.loadCursor(ctx, owned.Tenant, owned.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // run follows every owned connection's log. One connection's failure doesn't
 // stop another; the first error is returned after all stop.

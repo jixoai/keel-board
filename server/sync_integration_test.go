@@ -124,6 +124,9 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 	if h.cancel != nil {
 		return
 	}
+	if err := h.server.PrepareSync(t.Context()); err != nil {
+		t.Fatalf("prepare sync: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
 	runner, ok := h.server.SyncRunnerFor()
@@ -579,6 +582,23 @@ func TestSyncDeliveryFailureBecomesUndelivered(t *testing.T) {
 	}
 	depth, _ := h.store.OutboxDepth(t.Context(), "t1")
 	t.Fatalf("delivery never dead-lettered into undelivered: depth=%+v posts=%d", depth, h.posts.Load())
+}
+
+func TestSyncNoSyncNeverMirrors(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{startWorkers: true})
+	h.postMessage(map[string]any{"channel": "support", "text": "private", "noSync": true})
+	time.Sleep(250 * time.Millisecond)
+	if got := h.posts.Load(); got != 0 {
+		t.Fatalf("a noSync root was mirrored: %d", got)
+	}
+	// A root that syncs, then a noSync reply: only the root reaches Slack.
+	root := h.postMessage(map[string]any{"channel": "support", "text": "public"})
+	h.waitPosts(1)
+	h.postMessage(map[string]any{"re": root.ID, "text": "private reply", "noSync": true})
+	time.Sleep(250 * time.Millisecond)
+	if got := h.posts.Load(); got != 1 {
+		t.Fatalf("a noSync reply was mirrored: %d", got)
+	}
 }
 
 func TestSyncRestartRecoversPendingDelivery(t *testing.T) {

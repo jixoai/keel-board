@@ -304,6 +304,10 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 	if runtime == nil {
 		return func() {}, nil
 	}
+	if err := srv.PrepareSync(ctx); err != nil {
+		runtime.closeStore()
+		return nil, err
+	}
 	runner, ok := srv.SyncRunnerFor()
 	if !ok {
 		runtime.closeStore()

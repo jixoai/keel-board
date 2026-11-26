@@ -913,7 +913,13 @@ func (h *SyncHost) recordThreadSynced(ctx context.Context, event boardsync.Board
 	if kind != boardsync.TargetChannel {
 		return nil
 	}
-	return h.enqueueRoot(ctx, event.Tenant, boardsync.Key(target.Key), result.FirstSeq, root, target)
+	eventID := result.FirstSeq
+	if eventID == 0 {
+		// A cache that predates request results can replay without a first
+		// sequence; the root's own ID names the same fact stably.
+		eventID = root.ID
+	}
+	return h.enqueueRoot(ctx, event.Tenant, boardsync.Key(target.Key), eventID, root, target)
 }
 
 // enqueueRoot queues the root post that starts a channel target's thread.
