@@ -131,6 +131,9 @@ func (p *Provider) ResolveTarget(ctx context.Context, key boardsync.Key, target 
 		if issue.ID == "" {
 			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue %s has no ID", boardsync.ErrNotFound, target)
 		}
+		if issueTeam := strings.ToUpper(issue.Team.Key); issueTeam != "" && issueTeam != teamKey {
+			return boardsync.ResolvedTarget{}, fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, target, issueTeam, teamKey)
+		}
 		resolved := boardsync.ResolvedTarget{
 			Key: key, Platform: "linear", Channel: teamKey,
 			Thread: issueThread(teamKey, issue.ID), Kind: boardsync.TargetThread,
@@ -290,6 +293,13 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 	issue, err := p.client.IssueByID(ctx, issueID)
 	if err != nil {
 		return nil, err
+	}
+	issueTeam := strings.ToUpper(issue.Team.Key)
+	if issueTeam == "" {
+		issueTeam = teamOfIdentifier(issue.Identifier)
+	}
+	if issueTeam != "" && !p.cfg.teamAllowed(issueTeam) {
+		return nil, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, issueTeam)
 	}
 	return &boardsync.RootDraft{
 		Text:   issueRootText(&issue),

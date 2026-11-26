@@ -239,6 +239,9 @@ func (p *Provider) Permalink(ctx context.Context, key boardsync.Key, event board
 	if err != nil {
 		return "", err
 	}
+	if issueTeam := p.issueTeam(&issue); issueTeam != "" && !p.cfg.teamAllowed(issueTeam) {
+		return "", fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, issueTeam)
+	}
 	if issue.URL == "" {
 		return "", fmt.Errorf("%w: linear issue %s has no link", boardsync.ErrNotFound, issueID)
 	}
