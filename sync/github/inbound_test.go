@@ -129,6 +129,31 @@ func TestDuplicateDeliveryImportsOnce(t *testing.T) {
 	}
 }
 
+func TestDuplicateLifecycleDeliveryImportsOnce(t *testing.T) {
+	p := newProvider(t, false)
+	entry := boardsync.Entry{Key: "github", Provider: p, Sync: boardsync.Mirror("prs")}
+	registry := boardsync.NewRegistry()
+	if err := registry.Add(entry); err != nil {
+		t.Fatal(err)
+	}
+	inbox := boardsync.NewMemoryInbox(boardsync.InboundRetry, 0)
+	gate := fake.NewGate([]string{"acme/www:pulls"}, nil)
+	body := fixture(t, "pr_closed.json")
+	ctx := context.Background()
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := registry.HandleWebhook(ctx, "github", request(t, "pull_request", "closed-delivery", body), gate, inbox); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending := inbox.Pending("github"); pending != 1 {
+		t.Fatalf("pending = %d, want one deduped lifecycle event", pending)
+	}
+	items, err := inbox.Lease(ctx, "github", 10)
+	if err != nil || len(items) != 1 || items[0].Event.Type != "pr.closed" {
+		t.Fatalf("lease = %+v, %v", items, err)
+	}
+}
+
 func TestUnknownRepoAndInstallationFailClosed(t *testing.T) {
 	p := providerWith(t, func(c *github.Config) { c.InstallationID = 777 })
 	base := fixture(t, "issue_comment.json")
