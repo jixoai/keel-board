@@ -1,0 +1,34 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "subtype": "message_changed",
+    "channel": "C0123ABC",
+    "message": {
+      "type": "message",
+      "user": "U0456ABC",
+      "text": "look at <https://acme.slack.com/archives/C0123ABC/p1727000000123456|this>",
+      "ts": "1727000700.000100",
+      "attachments": [
+        {
+          "is_msg_unfurl": true,
+          "from_url": "https://acme.slack.com/archives/C0123ABC/p1727000000123456?thread_ts=1727000000.123456",
+          "author_name": "Ada",
+          "text": "ship it",
+          "ts": "1727000000.123456"
+        }
+      ]
+    },
+    "previous_message": {
+      "type": "message",
+      "user": "U0456ABC",
+      "text": "look at <https://acme.slack.com/archives/C0123ABC/p1727000000123456|this>",
+      "ts": "1727000700.000100"
+    }
+  },
+  "type": "event_callback",
+  "event_id": "Ev0203ABC",
+  "event_time": 1727000701
+}

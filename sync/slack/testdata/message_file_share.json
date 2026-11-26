@@ -1,0 +1,38 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "subtype": "file_share",
+    "channel": "C0123ABC",
+    "channel_type": "channel",
+    "user": "U0456ABC",
+    "text": "see attached",
+    "ts": "1727000600.000100",
+    "event_ts": "1727000600.000100",
+    "files": [
+      {
+        "id": "F0123ABC",
+        "name": "run.log",
+        "title": "Run log",
+        "mimetype": "text/plain",
+        "filetype": "text",
+        "size": 2048,
+        "url_private_download": "https://files.slack.com/files-pri/T0123ABC-F0123ABC/run.log",
+        "permalink": "https://acme.slack.com/files/U0456ABC/F0123ABC/run.log"
+      },
+      {
+        "id": "F0999ZZZ",
+        "name": "unsafe.bin",
+        "mimetype": "application/octet-stream",
+        "size": 4096,
+        "url_private_download": "https://169.254.169.254/latest/meta-data/",
+        "permalink": "https://evil.example/files/F0999ZZZ"
+      }
+    ]
+  },
+  "type": "event_callback",
+  "event_id": "Ev0201ABC",
+  "event_time": 1727000600
+}

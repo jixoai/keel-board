@@ -38,6 +38,20 @@ type Config struct {
 	Tolerance time.Duration
 	// MaxBodyBytes bounds a webhook body. The default is 1 MiB.
 	MaxBodyBytes int64
+	// MaxFiles and MaxFileBytes bound attachments in either direction. The
+	// defaults are 10 files and 25 MiB each; an inbound file over the byte
+	// limit stays in the event but FetchFile refuses it.
+	MaxFiles     int
+	MaxFileBytes int64
+	// FileSharePolls bounds how many times an upload looks for the message
+	// Slack made. The default is 10, with Slack's short backoff.
+	FileSharePolls int
+	// Sleep is the wait between file-share polls. Tests replace it.
+	Sleep func(ctx context.Context, d time.Duration) error
+	// JoinChannels opts in to conversations.join for source reads. It is off
+	// by default: joining announces the app in a channel and Slack starts
+	// sending its events.
+	JoinChannels bool
 }
 
 // Validate checks the configuration without revealing a secret.
@@ -52,9 +66,16 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: slack bot user ID %q isn't a user ID", boardsync.ErrBadRequest, c.BotUserID)
 	}
 	if c.APIBaseURL != "" {
-		if _, err := url.Parse(c.APIBaseURL); err != nil {
+		parsed, err := url.Parse(c.APIBaseURL)
+		if err != nil {
 			return fmt.Errorf("%w: slack API base URL: %v", boardsync.ErrBadRequest, err)
 		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return fmt.Errorf("%w: slack API base URL must be http or https", boardsync.ErrBadRequest)
+		}
+	}
+	if c.MaxFiles < 0 || c.MaxFileBytes < 0 || c.FileSharePolls < 0 {
+		return fmt.Errorf("%w: slack file limits can't be negative", boardsync.ErrBadRequest)
 	}
 	return nil
 }
@@ -91,6 +112,44 @@ func (c Config) maxBody() int64 {
 	return 1 << 20
 }
 
+func (c Config) maxFiles() int {
+	if c.MaxFiles > 0 {
+		return c.MaxFiles
+	}
+	return 10
+}
+
+func (c Config) maxFileBytes() int64 {
+	if c.MaxFileBytes > 0 {
+		return c.MaxFileBytes
+	}
+	return 25 << 20
+}
+
+func (c Config) fileSharePolls() int {
+	if c.FileSharePolls > 0 {
+		return c.FileSharePolls
+	}
+	return 10
+}
+
+func (c Config) sleep(ctx context.Context, d time.Duration) error {
+	if c.Sleep != nil {
+		return c.Sleep(ctx, d)
+	}
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 func (c Config) httpClient() *http.Client {
 	if c.HTTPClient != nil {
 		return c.HTTPClient
@@ -125,9 +184,46 @@ type apiEnvelope struct {
 	Provided string `json:"provided,omitempty"`
 }
 
-// call posts a form to one Slack method and decodes the response. A Slack
-// error becomes a classified Go error: auth failures, missing channels, rate
-// limits, and permanent refusals stay distinguishable for the retry policy.
+// ErrFileRefused means Slack will not accept files from this app at all, or
+// not this one. It is permanent; the text still goes out with a note.
+var ErrFileRefused = errors.New("slack: file upload refused")
+
+// APIError is a Slack Web API answer with ok=false. Code is Slack's error
+// string, kept so callers can classify one refusal without matching text.
+type APIError struct {
+	Method string
+	Code   string
+	Err    error
+}
+
+func (e *APIError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("slack %s: %s (%v)", e.Method, e.Code, e.Err)
+	}
+	return fmt.Sprintf("slack %s: %s", e.Method, e.Code)
+}
+
+func (e *APIError) Unwrap() error { return e.Err }
+
+// fileRefusals are Slack's answers that mean "no files from this app", not
+// "try again". They differ from a transport failure, where the app may have
+// shared the file already.
+var fileRefusals = map[string]bool{
+	"missing_scope":                       true,
+	"not_allowed_token_type":              true,
+	"no_permission":                       true,
+	"restricted_action":                   true,
+	"file_uploads_disabled":               true,
+	"file_uploads_except_images_disabled": true,
+	"file_upload_size_restricted":         true,
+}
+
+// isFileRefusal reports whether err is Slack refusing files.
+func isFileRefusal(err error) bool {
+	return errors.Is(err, ErrFileRefused)
+}
+
+// request posts a form to one Slack method and decodes the response.
 func (c *Client) call(ctx context.Context, method string, form url.Values, out any) error {
 	if c.token.Empty() {
 		return fmt.Errorf("%w: slack bot token is unset", boardsync.ErrUnauthorized)
@@ -138,20 +234,17 @@ func (c *Client) call(ctx context.Context, method string, form url.Values, out a
 	}
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	request.Header.Set("Authorization", "Bearer "+c.token.Reveal())
-	response, err := c.http.Do(request)
+	response, err := c.apiClient().Do(request)
 	if err != nil {
 		return boardsync.RedactError(err, c.token)
 	}
 	defer response.Body.Close()
-	if response.StatusCode == http.StatusTooManyRequests {
-		return fmt.Errorf("%w: slack %s rate-limited (retry after %ds)", boardsync.ErrRateLimited, method, boardsync.RetryAfter(response.Header))
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("slack %s answered HTTP %d", method, response.StatusCode)
+	if err := httpStatusError(method, response); err != nil {
+		return err
 	}
 	body, err := readLimited(response.Body, 4<<20)
 	if err != nil {
-		return err
+		return fmt.Errorf("slack %s answered an unreadable body: %w", method, err)
 	}
 	var envelope apiEnvelope
 	if err := jsonUnmarshal(body, &envelope); err != nil {
@@ -168,32 +261,85 @@ func (c *Client) call(ctx context.Context, method string, form url.Values, out a
 	return nil
 }
 
+// apiClient refuses a redirect: a Web API call carries the token, and Slack
+// does not redirect one. Keeping the token on Slack's host is worth more than
+// following a surprise Location.
+func (c *Client) apiClient() *http.Client {
+	client := *c.http
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("slack: API redirect refused")
+	}
+	return &client
+}
+
+// httpStatusError classifies a non-2xx answer before any JSON is read. 5xx and
+// transport failures are retryable; a refusing 4xx is permanent.
+func httpStatusError(method string, response *http.Response) error {
+	switch {
+	case response.StatusCode == http.StatusTooManyRequests:
+		if after := boardsync.RetryAfter(response.Header); after > 0 {
+			return fmt.Errorf("%w: slack %s rate-limited (retry after %ds)", boardsync.ErrRateLimited, method, after)
+		}
+		return fmt.Errorf("%w: slack %s rate-limited", boardsync.ErrRateLimited, method)
+	case response.StatusCode == http.StatusUnauthorized:
+		return fmt.Errorf("%w: slack %s answered HTTP 401", boardsync.ErrUnauthorized, method)
+	case response.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%w: slack %s answered HTTP 403", boardsync.ErrUnauthorized, method)
+	case response.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("%w: slack %s answered HTTP 404", boardsync.ErrNotFound, method)
+	case response.StatusCode >= 400 && response.StatusCode < 500:
+		return fmt.Errorf("%w: slack %s answered HTTP %d", boardsync.Permanent(errors.New("slack refused the request")), method, response.StatusCode)
+	case response.StatusCode >= 500:
+		return fmt.Errorf("slack %s answered HTTP %d", method, response.StatusCode)
+	default:
+		return nil
+	}
+}
+
 func slackAPIError(method, code string) error {
 	if code == "" {
-		return fmt.Errorf("slack %s failed", method)
+		return &APIError{Method: method, Code: "unknown", Err: boardsync.Permanent(errors.New("slack answered no error code"))}
 	}
-	switch code {
-	case "invalid_auth", "not_authed", "token_revoked", "account_inactive", "missing_scope":
-		return fmt.Errorf("%w: slack %s: %s", boardsync.ErrUnauthorized, method, code)
-	case "channel_not_found", "message_not_found", "thread_not_found", "user_not_found":
-		return fmt.Errorf("%w: slack %s: %s", boardsync.ErrNotFound, method, code)
-	case "ratelimited":
-		return fmt.Errorf("%w: slack %s: %s", boardsync.ErrRateLimited, method, code)
-	case "not_in_channel", "is_archived", "restricted_action", "cannot_reply_to_message":
-		return fmt.Errorf("%w: slack %s: %s", boardsync.Permanent(errors.New(code)), method, code)
+	apiErr := &APIError{Method: method, Code: code}
+	switch {
+	case code == "invalid_auth" || code == "not_authed" || code == "token_revoked" || code == "account_inactive" || code == "org_login_required":
+		apiErr.Err = boardsync.ErrUnauthorized
+	case code == "missing_scope":
+		// A missing scope is an authorization failure. On a file call it also
+		// means the app may not take files, which the text can survive.
+		apiErr.Err = boardsync.ErrUnauthorized
+		if strings.HasPrefix(method, "files.") {
+			apiErr.Err = fmt.Errorf("%w: %w", boardsync.ErrUnauthorized, ErrFileRefused)
+		}
+	case code == "channel_not_found" || code == "message_not_found" || code == "thread_not_found" || code == "user_not_found" || code == "file_not_found":
+		apiErr.Err = boardsync.ErrNotFound
+	case code == "ratelimited":
+		apiErr.Err = boardsync.ErrRateLimited
+	case fileRefusals[code] && strings.HasPrefix(method, "files."):
+		apiErr.Err = fmt.Errorf("%w: %w", boardsync.ErrUnsupported, ErrFileRefused)
+	case code == "not_in_channel" || code == "is_archived" || code == "restricted_action" || code == "cannot_reply_to_message" ||
+		code == "cant_update_message" || code == "cant_delete_message" || code == "edit_window_closed" || code == "too_many_reactions":
+		apiErr.Err = boardsync.Permanent(errors.New(code))
+	case code == "not_allowed" || code == "not_supported" || code == "unknown_method" || code == "feature_not_enabled":
+		apiErr.Err = boardsync.ErrUnsupported
 	default:
-		return fmt.Errorf("slack %s: %s", method, code)
+		// Slack's remaining codes are request-shaped but not enumerated;
+		// treat them as permanent rather than retrying the same refusal.
+		apiErr.Err = boardsync.Permanent(errors.New(code))
 	}
+	return apiErr
 }
 
 // Channel is one Slack channel, as conversations.list describes it.
 type Channel struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	IsMember bool   `json:"is_member"`
-	Private  bool   `json:"is_private"`
-	IM       bool   `json:"is_im"`
-	MPIM     bool   `json:"is_mpim"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	IsMember    bool   `json:"is_member"`
+	Private     bool   `json:"is_private"`
+	IM          bool   `json:"is_im"`
+	MPIM        bool   `json:"is_mpim"`
+	IsExtShared bool   `json:"is_ext_shared"`
+	IsArchived  bool   `json:"is_archived"`
 }
 
 type listResponse struct {
@@ -205,11 +351,24 @@ type listResponse struct {
 }
 
 // ListChannels lists public and private channels, following Slack's cursor.
+// Without groups:read Slack refuses the private listing; names then resolve
+// for public channels only, and a private channel must be mapped by ID.
 func (c *Client) ListChannels(ctx context.Context) ([]Channel, error) {
+	channels, err := c.listChannels(ctx, "public_channel,private_channel")
+	if err == nil {
+		return channels, nil
+	}
+	if !isMissingScope(err) {
+		return nil, err
+	}
+	return c.listChannels(ctx, "public_channel")
+}
+
+func (c *Client) listChannels(ctx context.Context, types string) ([]Channel, error) {
 	var channels []Channel
 	cursor := ""
 	for {
-		form := url.Values{"types": {"public_channel,private_channel"}, "exclude_archived": {"true"}, "limit": {"1000"}}
+		form := url.Values{"types": {types}, "exclude_archived": {"true"}, "limit": {"1000"}}
 		if cursor != "" {
 			form.Set("cursor", cursor)
 		}
@@ -225,7 +384,13 @@ func (c *Client) ListChannels(ctx context.Context) ([]Channel, error) {
 	}
 }
 
-// PostMessageRequest is the subset of chat.postMessage this skeleton sends.
+// isMissingScope reports whether Slack refused for a missing scope.
+func isMissingScope(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == "missing_scope"
+}
+
+// PostMessageRequest is the subset of chat.postMessage this adapter sends.
 type PostMessageRequest struct {
 	Channel      string
 	ThreadTS     string
@@ -336,18 +501,22 @@ func (c *Client) AuthTest(ctx context.Context) (userID string, scopes []string, 
 	return response.UserID, response.Metadata.Scopes, nil
 }
 
+var errResponseTooLarge = errors.New("slack: response is too large")
+
 func readLimited(reader io.Reader, max int64) ([]byte, error) {
 	body, err := io.ReadAll(io.LimitReader(reader, max+1))
 	if err != nil {
 		return nil, err
 	}
 	if int64(len(body)) > max {
-		return nil, errors.New("slack: response is too large")
+		return nil, errResponseTooLarge
 	}
 	return body, nil
 }
 
-var channelIDPattern = regexp.MustCompile(`^[A-Z][A-Z0-9]{2,}$`)
+// channelIDPattern is a channel ID, public or private. A DM or group DM is
+// not a sync target.
+var channelIDPattern = regexp.MustCompile(`^[CG][A-Z0-9]{2,}$`)
 
 var permalinkPattern = regexp.MustCompile(`^https://[a-z0-9-]+(?:\.enterprise)?\.slack\.com/archives/([A-Z0-9]+)/p(\d{10})(\d{6})(?:\?.*)?$`)
 
@@ -358,14 +527,8 @@ func parseTarget(ctx context.Context, client *Client, name string) (boardsync.Re
 	if target == "" {
 		return boardsync.ResolvedTarget{}, fmt.Errorf("%w: empty slack target", boardsync.ErrBadRequest)
 	}
-	if match := permalinkPattern.FindStringSubmatch(target); match != nil {
-		ts := match[2] + "." + match[3]
-		if parsed, err := url.Parse(target); err == nil {
-			if parent := parsed.Query().Get("thread_ts"); parent != "" {
-				ts = parent
-			}
-		}
-		return boardsync.ResolvedTarget{Channel: match[1], Thread: match[1] + ":" + ts, Kind: boardsync.TargetThread}, nil
+	if found, ok := parsePermalink(target); ok {
+		return boardsync.ResolvedTarget{Channel: found.Channel, Thread: found.Channel + ":" + found.Thread, Kind: boardsync.TargetThread}, nil
 	}
 	if strings.HasPrefix(target, "#") {
 		channel, err := resolveName(ctx, client, target)

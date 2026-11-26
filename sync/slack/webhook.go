@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -16,6 +17,7 @@ type webhookEnvelope struct {
 	Type      string          `json:"type"`
 	Challenge string          `json:"challenge"`
 	TeamID    string          `json:"team_id"`
+	APIAppID  string          `json:"api_app_id"`
 	EventID   string          `json:"event_id"`
 	EventTime int64           `json:"event_time"`
 	Event     json.RawMessage `json:"event"`
@@ -23,41 +25,53 @@ type webhookEnvelope struct {
 
 // slackEvent is the subset of a Slack event this adapter reads.
 type slackEvent struct {
-	Type            string        `json:"type"`
-	Subtype         string        `json:"subtype"`
-	Channel         string        `json:"channel"`
-	ChannelType     string        `json:"channel_type"`
-	User            string        `json:"user"`
-	BotID           string        `json:"bot_id"`
-	Text            string        `json:"text"`
-	TS              string        `json:"ts"`
-	ThreadTS        string        `json:"thread_ts"`
-	EventTS         string        `json:"event_ts"`
-	DeletedTS       string        `json:"deleted_ts"`
-	Reaction        string        `json:"reaction"`
-	Message         *slackMessage `json:"message,omitempty"`
-	PreviousMessage *slackMessage `json:"previous_message,omitempty"`
-	Item            struct {
-		Type    string `json:"type"`
-		Channel string `json:"channel"`
-		TS      string `json:"ts"`
-	} `json:"item"`
-	ItemUser string       `json:"item_user"`
-	Files    []slackFile  `json:"files"`
-	Edited   *slackEdited `json:"edited"`
+	Type            string            `json:"type"`
+	Subtype         string            `json:"subtype"`
+	Channel         string            `json:"channel"`
+	ChannelType     string            `json:"channel_type"`
+	User            string            `json:"user"`
+	BotID           string            `json:"bot_id"`
+	Username        string            `json:"username"`
+	Text            string            `json:"text"`
+	TS              string            `json:"ts"`
+	ThreadTS        string            `json:"thread_ts"`
+	EventTS         string            `json:"event_ts"`
+	DeletedTS       string            `json:"deleted_ts"`
+	Reaction        string            `json:"reaction"`
+	Message         *slackMessage     `json:"message,omitempty"`
+	PreviousMessage *slackMessage     `json:"previous_message,omitempty"`
+	Item            slackItem         `json:"item"`
+	ItemUser        string            `json:"item_user"`
+	Files           []slackFile       `json:"files"`
+	Attachments     []slackAttachment `json:"attachments"`
+	Edited          *slackEdited      `json:"edited"`
+}
+
+type slackItem struct {
+	Type    string `json:"type"`
+	Channel string `json:"channel"`
+	TS      string `json:"ts"`
 }
 
 type slackMessage struct {
-	Type     string       `json:"type"`
-	Subtype  string       `json:"subtype"`
-	Channel  string       `json:"channel"`
-	User     string       `json:"user"`
-	BotID    string       `json:"bot_id"`
-	Text     string       `json:"text"`
-	TS       string       `json:"ts"`
-	ThreadTS string       `json:"thread_ts"`
-	Files    []slackFile  `json:"files"`
-	Edited   *slackEdited `json:"edited"`
+	Type        string            `json:"type"`
+	Subtype     string            `json:"subtype"`
+	Channel     string            `json:"channel"`
+	User        string            `json:"user"`
+	BotID       string            `json:"bot_id"`
+	Username    string            `json:"username"`
+	Text        string            `json:"text"`
+	TS          string            `json:"ts"`
+	ThreadTS    string            `json:"thread_ts"`
+	ReplyCount  int               `json:"reply_count"`
+	Files       []slackFile       `json:"files"`
+	Attachments []slackAttachment `json:"attachments"`
+	Edited      *slackEdited      `json:"edited"`
+	BotProfile  *slackBotProfile  `json:"bot_profile,omitempty"`
+}
+
+type slackBotProfile struct {
+	Name string `json:"name"`
 }
 
 type slackEdited struct {
@@ -66,14 +80,34 @@ type slackEdited struct {
 }
 
 type slackFile struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Title     string `json:"title"`
-	Mimetype  string `json:"mimetype"`
-	Filetype  string `json:"filetype"`
-	Size      int64  `json:"size"`
-	URL       string `json:"url_private_download"`
-	Permalink string `json:"permalink"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Title      string `json:"title"`
+	Mimetype   string `json:"mimetype"`
+	Filetype   string `json:"filetype"`
+	Size       int64  `json:"size"`
+	URL        string `json:"url_private_download"`
+	URLPrivate string `json:"url_private"`
+	Permalink  string `json:"permalink"`
+}
+
+// slackAttachment is a Slack unfurl or forward. Slack puts the linked
+// message's snapshot here, so a link's preview never needs a network read.
+type slackAttachment struct {
+	FromURL       string      `json:"from_url"`
+	OriginalURL   string      `json:"original_url"`
+	AuthorID      string      `json:"author_id"`
+	AuthorName    string      `json:"author_name"`
+	AuthorSubname string      `json:"author_subname"`
+	AuthorLink    string      `json:"author_link"`
+	Text          string      `json:"text"`
+	Title         string      `json:"title"`
+	Fallback      string      `json:"fallback"`
+	ServiceName   string      `json:"service_name"`
+	TS            string      `json:"ts"`
+	IsMsgUnfurl   bool        `json:"is_msg_unfurl"`
+	IsShare       bool        `json:"is_share"`
+	Files         []slackFile `json:"files"`
 }
 
 // normalizeEvent turns one Slack event into a normalized record. It returns
@@ -99,17 +133,24 @@ func normalizeEvent(key boardsync.Key, envelope webhookEnvelope, event slackEven
 	case "reaction_added", "reaction_removed":
 		return normalizeReaction(key, occurrence, event, cfg)
 	default:
-		// app_mention duplicates message.channels; other events aren't content.
+		// app_mention duplicates message.channels; link_shared asks for an
+		// unfurl, which the board never fetches. Other events aren't content.
 		return boardsync.Record{}, false, nil
 	}
 }
 
 func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cfg Config) (boardsync.Record, bool, error) {
-	if event.Channel == "" || event.TS == "" {
-		return boardsync.Record{}, false, fmt.Errorf("%w: slack message has no channel or ts", boardsync.ErrBadRequest)
+	if event.Channel == "" || !isTS(event.TS) {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack message has no channel or valid ts", boardsync.ErrBadRequest)
 	}
-	if isOwnMessage(event.User, event.BotID, cfg) {
+	if event.ThreadTS != "" && !isTS(event.ThreadTS) {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack message has an invalid thread ts", boardsync.ErrBadRequest)
+	}
+	if isOwnMessage(event.User, event.BotID, cfg) || isOwnText(event.Text, key) {
 		return boardsync.Record{}, false, nil
+	}
+	if event.User == "" && event.BotID == "" {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack message has no author", boardsync.ErrBadRequest)
 	}
 	rootTS := event.ThreadTS
 	if rootTS == "" {
@@ -117,8 +158,17 @@ func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cf
 	}
 	thread := event.Channel + ":" + rootTS
 	text := mrkdwnToMarkdown(event.Text)
-	files := filesOf(event.Files)
+	if isOwnText(text, key) {
+		return boardsync.Record{}, false, nil
+	}
+	files := filesOf(event.Files, cfg)
+	links := linksOf(key, event.Text, event.Attachments, cfg)
+	if text == "" && len(files) == 0 && hasSharedSnapshots(links) {
+		// A forward has no text of its own; say what it shares.
+		text = forwardText(links)
+	}
 	if text == "" && len(files) == 0 {
+		// Links alone carry no message: a board message needs text or files.
 		return boardsync.Record{}, false, nil
 	}
 	record := boardsync.Record{
@@ -132,6 +182,7 @@ func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cf
 			Text:    boardsync.StorableText(text, boardsync.MaxTextBytes),
 			Author:  authorOf(event.User, event.BotID),
 			Files:   files,
+			Links:   links,
 		},
 	}
 	return record, true, nil
@@ -145,34 +196,84 @@ func normalizeEdited(key boardsync.Key, occurrence string, event slackEvent, cfg
 	if message.Channel == "" {
 		message.Channel = event.Channel
 	}
-	if message.TS == "" || message.Channel == "" {
-		return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has no channel or ts", boardsync.ErrBadRequest)
+	if message.Channel == "" || !isTS(message.TS) {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has no channel or valid ts", boardsync.ErrBadRequest)
 	}
-	if isOwnMessage(message.User, message.BotID, cfg) {
+	if message.ThreadTS != "" && !isTS(message.ThreadTS) {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has an invalid thread ts", boardsync.ErrBadRequest)
+	}
+	if message.User == "" {
+		message.User = event.User
+	}
+	if message.User == "" && message.BotID == "" && event.PreviousMessage != nil {
+		message.User = event.PreviousMessage.User
+		message.BotID = event.PreviousMessage.BotID
+	}
+	if isOwnMessage(message.User, message.BotID, cfg) || isOwnText(message.Text, key) {
 		return boardsync.Record{}, false, nil
+	}
+	if message.User == "" && message.BotID == "" {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has no author", boardsync.ErrBadRequest)
 	}
 	rootTS := message.ThreadTS
 	if rootTS == "" {
 		rootTS = message.TS
 	}
 	thread := message.Channel + ":" + rootTS
+	text := mrkdwnToMarkdown(message.Text)
+	if isOwnText(text, key) {
+		return boardsync.Record{}, false, nil
+	}
+	links := linksOf(key, message.Text, message.Attachments, cfg)
 	editedAt := time.Time{}
 	if message.Edited != nil {
 		editedAt = tsToTime(message.Edited.TS)
 	}
-	text := mrkdwnToMarkdown(message.Text)
+	if editedAt.IsZero() && event.EventTS != "" {
+		editedAt = tsToTime(event.EventTS)
+	}
+	dedupe := boardsync.EditedDedupe(key, thread, message.TS, text, editedAt)
+	if editedAt.IsZero() {
+		// Slack normally stamps an edit. Without one, the envelope's event ID
+		// keeps a redelivery stable and two identical edits distinct; with
+		// neither, there is no identity to rely on.
+		if occurrence == "" {
+			return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has no event identity", boardsync.ErrBadRequest)
+		}
+		dedupe = boardsync.EditedDedupe(key, thread, message.TS, text+"\x00"+occurrence, time.Time{})
+	}
+	if isUnfurlOnly(event, message) {
+		dedupe = unfurlDedupe(key, occurrence, thread, message.TS, links)
+	}
 	record := boardsync.Record{
-		Dedupe: boardsync.EditedDedupe(key, thread, message.TS, text, editedAt),
+		Dedupe: dedupe,
 		Event: boardsync.Event{
 			Key: key, Platform: "slack",
 			Kind: boardsync.KindEdited, Type: boardsync.TypeMessageEdited,
 			Channel: message.Channel, Thread: thread,
 			Message: message.TS,
+			IsRoot:  rootTS == message.TS,
 			Text:    boardsync.StorableText(text, boardsync.MaxTextBytes),
 			Author:  authorOf(message.User, message.BotID),
+			Links:   links,
 		},
 	}
 	return record, true, nil
+}
+
+// isUnfurlOnly reports whether Slack is attaching an unfurl to a message
+// whose text did not change. It is an edit for the board's links, not for its
+// text, and gets its own identity.
+func isUnfurlOnly(event slackEvent, message *slackMessage) bool {
+	if event.PreviousMessage == nil || event.PreviousMessage.Text != message.Text {
+		return false
+	}
+	for _, attachment := range message.Attachments {
+		if attachment.IsMsgUnfurl {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeDeleted(key boardsync.Key, occurrence string, event slackEvent, cfg Config) (boardsync.Record, bool, error) {
@@ -193,8 +294,11 @@ func normalizeDeleted(key boardsync.Key, occurrence string, event slackEvent, cf
 		user = previous.User
 		botID = previous.BotID
 	}
-	if ts == "" || channel == "" {
-		return boardsync.Record{}, false, fmt.Errorf("%w: slack deletion has no channel or ts", boardsync.ErrBadRequest)
+	if channel == "" || !isTS(ts) {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack deletion has no channel or valid ts", boardsync.ErrBadRequest)
+	}
+	if threadTS != "" && !isTS(threadTS) {
+		threadTS = ""
 	}
 	if isOwnMessage(user, botID, cfg) {
 		return boardsync.Record{}, false, nil
@@ -219,8 +323,12 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 	if event.Item.Type != "" && event.Item.Type != "message" {
 		return boardsync.Record{}, false, nil
 	}
-	if event.Item.Channel == "" || event.Item.TS == "" || event.User == "" {
-		return boardsync.Record{}, false, fmt.Errorf("%w: slack reaction has no channel, ts, or user", boardsync.ErrBadRequest)
+	channel := event.Item.Channel
+	if channel == "" {
+		channel = event.Channel
+	}
+	if channel == "" || !isTS(event.Item.TS) || event.User == "" {
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack reaction has no channel, valid ts, or user", boardsync.ErrBadRequest)
 	}
 	if isOwnMessage(event.User, "", cfg) {
 		return boardsync.Record{}, false, nil
@@ -229,10 +337,15 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 	if emoji == "" {
 		return boardsync.Record{}, false, nil
 	}
+	if occurrence == "" {
+		// Without Slack's event ID or event_ts, two add/remove/add
+		// occurrences would look alike. Refuse rather than merge them.
+		return boardsync.Record{}, false, fmt.Errorf("%w: slack reaction has no event identity", boardsync.ErrBadRequest)
+	}
 	// Slack reaction events don't carry thread_ts. The message ts is the only
 	// thread anchor the payload has; the board resolves the copy by channel and
 	// platform message ID. See docs/SYNC.md.
-	thread := event.Item.Channel + ":" + event.Item.TS
+	thread := channel + ":" + event.Item.TS
 	added := event.Type == "reaction_added"
 	typeName := boardsync.TypeReactionRemove
 	if added {
@@ -243,9 +356,8 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 		Event: boardsync.Event{
 			Key: key, Platform: "slack",
 			Kind: boardsync.KindReaction, Type: typeName,
-			Channel: event.Item.Channel, Thread: thread, Message: event.Item.TS,
+			Channel: channel, Thread: thread, Message: event.Item.TS,
 			Emoji: emoji, Added: added, Author: authorOf(event.User, ""),
-			Raw: json.RawMessage(occurrence),
 		},
 	}
 	return record, true, nil
@@ -256,6 +368,13 @@ func isOwnMessage(user, botID string, cfg Config) bool {
 		return true
 	}
 	return user != "" && cfg.BotUserID != "" && user == cfg.BotUserID
+}
+
+// isOwnText is the second echo check. Slack doesn't add markers to what the
+// adapter posts, but a marker copied into a message still names this entry;
+// dropping it is safer than importing a copy of our own post.
+func isOwnText(text string, key boardsync.Key) bool {
+	return text != "" && boardsync.IsOwnMarker(text, key)
 }
 
 func authorOf(user, botID string) boardsync.Author {
@@ -271,10 +390,10 @@ func authorOf(user, botID string) boardsync.Author {
 	}
 }
 
-func filesOf(files []slackFile) []boardsync.File {
+func filesOf(files []slackFile, cfg Config) []boardsync.File {
 	out := make([]boardsync.File, 0, len(files))
 	for _, file := range files {
-		if len(out) >= 20 {
+		if len(out) >= cfg.maxFiles() {
 			break
 		}
 		name := file.Name
@@ -286,20 +405,55 @@ func filesOf(files []slackFile) []boardsync.File {
 		}
 		url := file.URL
 		if url == "" {
-			url = file.Permalink
+			url = file.URLPrivate
 		}
-		kind := "file"
-		if strings.HasPrefix(file.Mimetype, "image/") {
-			kind = "image"
-		} else if strings.HasPrefix(file.Mimetype, "video/") {
-			kind = "video"
-		} else if strings.HasPrefix(file.Mimetype, "audio/") {
-			kind = "audio"
+		if !isSlackFileURL(url) {
+			// A payload is untrusted: only a Slack download URL may be
+			// fetched later, and only the server holds the token for it.
+			url = ""
 		}
 		out = append(out, boardsync.File{
-			Type: kind, Name: name, MIMEType: file.Mimetype,
-			Size: file.Size, URL: url,
+			Type:     fileKind(file.Mimetype),
+			Name:     boardsync.StorableText(cleanText(name), 1024),
+			MIMEType: file.Mimetype,
+			Size:     file.Size,
+			URL:      url,
 		})
+	}
+	return out
+}
+
+func fileKind(mimeType string) string {
+	switch {
+	case strings.HasPrefix(mimeType, "image/"):
+		return "image"
+	case strings.HasPrefix(mimeType, "video/"):
+		return "video"
+	case strings.HasPrefix(mimeType, "audio/"):
+		return "audio"
+	default:
+		return "file"
+	}
+}
+
+func linkFilesOf(files []slackFile) []boardsync.LinkFile {
+	out := make([]boardsync.LinkFile, 0, len(files))
+	for _, file := range files {
+		if len(out) >= 20 {
+			break
+		}
+		name := file.Name
+		if name == "" {
+			name = file.Title
+		}
+		if name == "" {
+			name = "file"
+		}
+		url := ""
+		if isSlackWebURL(file.Permalink) {
+			url = file.Permalink
+		}
+		out = append(out, boardsync.LinkFile{Name: boardsync.StorableText(name, 512), URL: url})
 	}
 	return out
 }
@@ -311,7 +465,7 @@ var (
 	slackBroadcast = regexp.MustCompile(`<!(channel|here|everyone)(?:\|[^<>]*)?>`)
 )
 
-// mrkdwnToMarkdown is the small, deliberate conversion this skeleton does:
+// mrkdwnToMarkdown is the small, deliberate conversion this adapter does:
 // Slack's HTML escapes, user mentions, channel mentions, links, and
 // broadcasts. Slack's *bold*, _italic_, and ~strike~ are left as written;
 // a full converter belongs in the adapter, not in the board.
@@ -333,5 +487,20 @@ func mrkdwnToMarkdown(text string) string {
 		return parts[1]
 	})
 	text = slackBroadcast.ReplaceAllString(text, "@$1")
-	return strings.TrimSpace(text)
+	return cleanText(strings.TrimSpace(text))
+}
+
+// cleanText drops the control characters a JSON payload may carry. NUL and
+// invalid UTF-8 are left to StorableText; other controls have no place in a
+// board message.
+func cleanText(text string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return r
+		}
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, text)
 }

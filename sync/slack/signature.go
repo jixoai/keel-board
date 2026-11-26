@@ -1,6 +1,7 @@
-// Package slack is the Slack adapter skeleton: signature verification, webhook
-// normalization, and chat.postMessage-style calls, with no real network in
-// tests and no Vercel Connect dependency.
+// Package slack is the Slack adapter: signature verification, webhook
+// normalization (messages, edits, deletes, reactions, files, and links), Web
+// API calls for posting and changes, file transfer, source reads, and typing
+// status. Tests use httptest and no real token.
 package slack
 
 import (

@@ -1,0 +1,27 @@
+{
+  "token": "verification-token",
+  "team_id": "T0123ABC",
+  "api_app_id": "A0123ABC",
+  "event": {
+    "type": "message",
+    "channel": "C0123ABC",
+    "channel_type": "channel",
+    "user": "U0456ABC",
+    "text": "",
+    "ts": "1727000800.000100",
+    "event_ts": "1727000800.000100",
+    "attachments": [
+      {
+        "is_share": true,
+        "is_msg_unfurl": true,
+        "from_url": "https://acme.slack.com/archives/C0123ABC/p1727000000123456",
+        "author_name": "Ada",
+        "text": "deploys are down",
+        "ts": "1727000000.123456"
+      }
+    ]
+  },
+  "type": "event_callback",
+  "event_id": "Ev0204ABC",
+  "event_time": 1727000800
+}
