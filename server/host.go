@@ -293,9 +293,6 @@ func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportReques
 			return nil
 		}
 		offset := h.emitActorSeen(tx, event)
-		if offset > 0 {
-			_ = offset
-		}
 		id := tx.NextID(offset)
 		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
 			ID: id, Channel: channel, Text: text,
@@ -408,14 +405,13 @@ func (h *SyncHost) importEdit(ctx context.Context, req boardsync.ImportRequest, 
 			return nil
 		}
 		root := tx.RootOf(message.ID)
-		offset := h.emitActorSeen(tx, event)
+		h.emitActorSeen(tx, event)
 		tx.Emit(log.EventMessageEdited, &log.MessageEditedPayload{
 			ID: message.ID, Thread: message.Thread, Text: text,
 			By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
 		})
 		tx.RecordResult(message.ID)
 		result = boardsync.ImportResult{Root: root.ID, Message: message.ID}
-		_ = offset
 		return nil
 	})
 	return result, err
