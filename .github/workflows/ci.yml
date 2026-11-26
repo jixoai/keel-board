@@ -24,7 +24,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
       - name: postgres
         run: |
           command -v pg_isready >/dev/null 2>&1 || export PATH="/opt/homebrew/bin:$PATH"
@@ -37,3 +37,6 @@ jobs:
         run: go test -count=1 ./...
       - name: race
         run: go test -race -count=1 ./...
+      - name: cleanup go cache
+        if: always()
+        run: go clean -cache
