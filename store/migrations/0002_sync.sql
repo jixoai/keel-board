@@ -4,9 +4,11 @@
 --
 -- Every table carries tenant_id, so a worker or a webhook handler can only see
 -- the rows of the tenant it resolved. The application supplies the tenant
--- predicate on every statement; this schema does not enable RLS because a
--- deployment that did would need a session variable set on every pooled
--- connection (0001 makes the same choice).
+-- predicate on every statement. RLS is added separately in 0003: that
+-- migration enables and forces a keel.tenant_id policy on all seven tables,
+-- which is why syncstore sets the tenant transaction-locally on every write and
+-- read. Keeping the DDL in 0003 means a database that already applied this
+-- file still receives the policies.
 --
 -- board_sync_entries is the connection record: a key belongs to a tenant and
 -- names a platform. It stores no secret; credentials come from a resolver.

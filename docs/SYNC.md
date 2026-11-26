@@ -487,9 +487,9 @@ type Host interface {
 }
 ```
 
-`ImportRequest` carries the entry key, the inbox event ID, the destination
-board channel for a new root, the normalized event, and the overrides.
-`Host.Import` must:
+`ImportRequest` carries the tenant, entry key, the inbox event ID, the
+destination board channel for a new root, the normalized event, and the
+overrides. `Host.Import` must:
 
 * derive its writes' IDs from `EventID` and the order of calls, so a retry
   that writes in the same order finds its own messages instead of posting
@@ -504,7 +504,11 @@ board channel for a new root, the normalized event, and the overrides.
 `message.files_synced`, or `message.sync_failed`. These receipts are what makes
 `vb sync <id>`, `vb read <link>`, and `--source` filters work. In the full
 service they also carry the principal that recorded them, so another
-deployment's copy isn't changed by this one.
+deployment's copy isn't changed by this one. A `BoardEvent` carries its
+`Tenant`. `Host.Record` must be idempotent per `(message, target)`: a
+`message.synced` may be retried after its copy was saved, and the retry must
+not duplicate the fact or drop `Files`/`FilesSet`. The sync-server `Host`
+implements this; `sync/fake.Host` records the calls for tests.
 
 The subscription that feeds `Runner.Outbound` is a board consumer, like a
 watcher: it follows the log (or its feed) and sees board events in order. It is
@@ -777,21 +781,35 @@ Recommended shape, matching the repository layout:
    req, gate, inbox)` → write the returned `WebhookResponse`. Add `GET` only
    where a platform requires it. `syncstore.WebhookHandler` implements the
    tenant/entry checks and store-before-ack path.
-3. **Gate.** `Routes` consults the entry's `RouteFunc` (from `Channels` /
-   `Repos`-style mappings) against native channel IDs. `ThreadSynced` asks the
-   server's sync records whether the external thread is already attached.
-   A name that can't be resolved returns an error, not false.
-4. **Inbox.** Start with `MemoryInbox` for development; replace it with a
-   store table keyed by `(key, dedupe)` and a leased work queue. Persist raw
-   events in the same transaction as the dedupe insert.
+   The handler answers a silent 200 without reading the body for a key the
+   tenant doesn't own or has disabled; 503 for an owned, enabled entry this
+   process hasn't registered (platform retries); and 500 for an entry/provider
+   platform mismatch.
+3. **Gate.** `Routes` first consults the entry's own `RouteFunc` (from
+   `Channels` / `Repos`-style mappings); if the entry has none, it asks the
+   tenant/key-scoped gate. `ThreadSynced` asks a gate built for the same
+   `(tenant, key)` whether the external thread is attached; `syncstore.StoreGate`
+   answers from `board_sync_threads`. A name that can't be resolved returns an
+   error, not false. A nil gate is fail-closed: only an entry `Routes` match keeps
+   a record. Do not share one static gate across tenants; build it per request
+   through `WebhookConfig.GateFactory`.
+4. **Inbox.** Start with `MemoryInbox`, which is single-tenant and for
+   development only; use `syncstore.Store`'s tenant-scoped inbox for a
+   deployment. Persist raw events in the same transaction as the dedupe insert.
 5. **Workers.** One consumer per key (or a lease per lane) calls
    `Inbox.Lease`, then `Runner.Inbound`, then `Ack` with the error. The
    `Event.ID` is the idempotency key for `Host.Import`.
 6. **Outbound.** Subscribe to board events. For each event, load the thread's
-   targets, call `TargetsForDelivery`, and enqueue one job per target on the
-   board thread's outbox lane. The job calls `Runner.Outbound`. Record
-   receipts and failures through `Host.Record`; the message projection shows
-   `undelivered`.
+   targets, call `TargetsForDelivery`, and call `Store.EnqueueOutbox`; it
+   creates one deterministic job per target on the board thread's lane.
+   `OutboundWorker` drains it and calls `Runner.OutboundWithOptions` with a
+   `CopySink` that persists the copy after the provider succeeds and before
+   `Host.Record`. A receipt retry therefore finds the copy and doesn't post
+   again. A `SaveCopy` failure still leaves the narrow provider-success-to-
+   copy-commit window in which a retry can duplicate a platform post; a host
+   that needs exactness must make its platform call idempotent or persist the
+   copy in the same durable step. Record receipts and failures through
+   `Host.Record`; the message projection shows `undelivered`.
 7. **Secrets.** Per entry, from the environment or keel's secret store:
    `KEEL_SYNC_<KEY>_WEBHOOK_SECRET`, `KEEL_SYNC_<KEY>_TOKEN`, plus non-secret
    config (`repos`, `teams`, `botUserID`, base URLs). Never place a token in a
