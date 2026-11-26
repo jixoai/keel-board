@@ -285,7 +285,7 @@ func (w *OutboundWorker) copyFor(ctx context.Context, job Delivery) (Copy, error
 func (w *OutboundWorker) recordSynced(ctx context.Context, job Delivery, copy Copy) error {
 	ref := boardsync.ThreadRef{
 		Key: copy.Key, Platform: copy.Target.Platform, Channel: copy.Target.Channel,
-		Thread: copy.ExternalThread,
+		Thread: copy.ExternalThread, Subthread: copy.Target.Subthread,
 	}
 	return w.host.Record(ctx, boardsync.BoardEvent{
 		Tenant: w.tenant, Type: boardsync.BoardMessageSynced, Thread: job.Message.Thread,
