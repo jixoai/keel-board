@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"path"
 	"strings"
-	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -86,32 +85,17 @@ func (c *Client) UploadExternal(ctx context.Context, uploadURL, filename string,
 	return nil
 }
 
-// CompleteUploadResult is Slack's answer to files.completeUploadExternal:
-// the file IDs and the message ts each channel holds them under, when Slack
-// includes the shares.
-type CompleteUploadResult struct {
-	IDs    []string
-	Shares map[string]string
-}
-
 // CompleteUploadExternal shares uploaded files in a channel or thread.
 func (c *Client) CompleteUploadExternal(ctx context.Context, files []UploadFileRef, channelID, threadTS, comment string) ([]string, error) {
-	result, err := c.CompleteUploadExternalShares(ctx, files, channelID, threadTS, comment)
-	return result.IDs, err
-}
-
-// CompleteUploadExternalShares shares files and keeps the shares Slack
-// returns, so the caller does not need a second files.info read.
-func (c *Client) CompleteUploadExternalShares(ctx context.Context, files []UploadFileRef, channelID, threadTS, comment string) (CompleteUploadResult, error) {
 	if len(files) == 0 {
-		return CompleteUploadResult{}, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
+		return nil, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
 	}
 	if channelID == "" {
-		return CompleteUploadResult{}, fmt.Errorf("%w: slack upload has no channel", boardsync.ErrBadRequest)
+		return nil, fmt.Errorf("%w: slack upload has no channel", boardsync.ErrBadRequest)
 	}
 	payload, err := json.Marshal(files)
 	if err != nil {
-		return CompleteUploadResult{}, err
+		return nil, err
 	}
 	form := url.Values{
 		"files":      {string(payload)},
@@ -126,67 +110,32 @@ func (c *Client) CompleteUploadExternalShares(ctx context.Context, files []Uploa
 	var response struct {
 		apiEnvelope
 		Files []struct {
-			ID     string `json:"id"`
-			Shares map[string]map[string][]struct {
-				TS string `json:"ts"`
-			} `json:"shares"`
+			ID string `json:"id"`
 		} `json:"files"`
 	}
 	if err := c.call(ctx, "files.completeUploadExternal", form, &response); err != nil {
-		return CompleteUploadResult{}, err
-	}
-	result := CompleteUploadResult{Shares: make(map[string]string)}
-	for _, file := range response.Files {
-		if file.ID != "" {
-			result.IDs = append(result.IDs, file.ID)
-		}
-		for _, scope := range []string{"public", "private"} {
-			for channel, entries := range file.Shares[scope] {
-				for _, entry := range entries {
-					if entry.TS != "" {
-						result.Shares[channel] = entry.TS
-						break
-					}
-				}
-			}
-		}
-	}
-	if len(result.IDs) == 0 {
-		return CompleteUploadResult{}, errors.New("slack files.completeUploadExternal answered no file IDs")
-	}
-	return result, nil
-}
-
-// FileShares returns the message ts each channel holds a file under. Slack
-// shares an uploaded file in a moment-later message, so this is how the
-// adapter finds the message an upload made.
-func (c *Client) FileShares(ctx context.Context, fileID string) (map[string]string, error) {
-	if fileID == "" {
-		return nil, fmt.Errorf("%w: slack file info needs a file ID", boardsync.ErrBadRequest)
-	}
-	var response struct {
-		apiEnvelope
-		File struct {
-			Shares map[string]map[string][]struct {
-				TS string `json:"ts"`
-			} `json:"shares"`
-		} `json:"file"`
-	}
-	if err := c.call(ctx, "files.info", url.Values{"file": {fileID}}, &response); err != nil {
 		return nil, err
 	}
-	shares := make(map[string]string)
-	for _, scope := range []string{"public", "private"} {
-		for channel, entries := range response.File.Shares[scope] {
-			for _, entry := range entries {
-				if entry.TS != "" {
-					shares[channel] = entry.TS
-					break
-				}
-			}
+	ids := make([]string, 0, len(response.Files))
+	for _, file := range response.Files {
+		if file.ID != "" {
+			ids = append(ids, file.ID)
 		}
 	}
-	return shares, nil
+	if len(ids) == 0 {
+		return nil, errors.New("slack files.completeUploadExternal answered no file IDs")
+	}
+	return ids, nil
+}
+
+// DeleteFile removes an uploaded file that was never shared. Cleanup is
+// best-effort; a file Slack already dropped is not an error worth failing a
+// message for.
+func (c *Client) DeleteFile(ctx context.Context, fileID string) error {
+	if fileID == "" {
+		return nil
+	}
+	return c.call(ctx, "files.delete", url.Values{"file": {fileID}}, nil)
 }
 
 // FetchFile downloads one file a Slack message carried. Only a Slack file URL
@@ -253,10 +202,7 @@ func failureNotes(files []boardsync.OutboundFile, boardMessage uint64, err error
 	reason := failureReason(err)
 	notes := make([]string, 0, len(files))
 	for _, file := range files {
-		name := cleanText(file.Filename)
-		if name == "" {
-			name = "file"
-		}
+		name := fileDisplayName(file.Filename)
 		parts := []string{humanBytes(int64(len(file.Data)))}
 		if reason != "" {
 			parts = append(parts, reason)
@@ -303,10 +249,7 @@ func planUploads(files []boardsync.OutboundFile, cfg Config) uploadPlan {
 	maxFiles := cfg.maxFiles()
 	maxBytes := cfg.maxFileBytes()
 	for index, file := range files {
-		name := cleanText(file.Filename)
-		if name == "" {
-			name = "file"
-		}
+		name := fileDisplayName(file.Filename)
 		switch {
 		case index >= maxFiles:
 			plan.notes = append(plan.notes, fileNote(name, "too many files in one message"))
@@ -322,7 +265,7 @@ func planUploads(files []boardsync.OutboundFile, cfg Config) uploadPlan {
 }
 
 func fileNote(name, why string) string {
-	return fmt.Sprintf("📎 %s didn't come over: %s", name, why)
+	return fmt.Sprintf("📎 %s didn't come over: %s", fileDisplayName(name), why)
 }
 
 func humanBytes(size int64) string {
@@ -336,35 +279,6 @@ func humanBytes(size int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(size)/float64(div), "KMGTPE"[exp])
-}
-
-func (p *Provider) findShare(ctx context.Context, channel, fileID string) (string, error) {
-	polls := p.cfg.fileSharePolls()
-	delay := 250 * time.Millisecond
-	var last error
-	for attempt := 0; attempt < polls; attempt++ {
-		shares, err := p.client.FileShares(ctx, fileID)
-		if err != nil {
-			if isFileRefusal(err) || boardsync.IsPermanent(err) {
-				return "", err
-			}
-			last = err
-		} else if ts := shares[channel]; ts != "" {
-			return ts, nil
-		}
-		if attempt+1 < polls {
-			if err := p.cfg.sleep(ctx, delay); err != nil {
-				return "", err
-			}
-			if delay < 2*time.Second {
-				delay *= 2
-			}
-		}
-	}
-	if last != nil {
-		return "", fmt.Errorf("slack: couldn't find the message uploading %s made in %s: %w", fileID, channel, last)
-	}
-	return "", fmt.Errorf("slack: couldn't find the message uploading %s made in %s", fileID, channel)
 }
 
 // uploadFilename names a file as Slack should receive it. Slack picks a

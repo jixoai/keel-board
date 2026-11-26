@@ -146,6 +146,9 @@ func normalizeMessage(key boardsync.Key, occurrence string, event slackEvent, cf
 	if event.ThreadTS != "" && !isTS(event.ThreadTS) {
 		return boardsync.Record{}, false, fmt.Errorf("%w: slack message has an invalid thread ts", boardsync.ErrBadRequest)
 	}
+	if isDirectChannel(event.ChannelType, event.Channel) {
+		return boardsync.Record{}, false, nil
+	}
 	if isOwnMessage(event.User, event.BotID, cfg) || isOwnText(event.Text, key) {
 		return boardsync.Record{}, false, nil
 	}
@@ -201,6 +204,9 @@ func normalizeEdited(key boardsync.Key, occurrence string, event slackEvent, cfg
 	}
 	if message.ThreadTS != "" && !isTS(message.ThreadTS) {
 		return boardsync.Record{}, false, fmt.Errorf("%w: slack edit has an invalid thread ts", boardsync.ErrBadRequest)
+	}
+	if isDirectChannel(event.ChannelType, message.Channel) {
+		return boardsync.Record{}, false, nil
 	}
 	if message.User == "" {
 		message.User = event.User
@@ -300,6 +306,9 @@ func normalizeDeleted(key boardsync.Key, occurrence string, event slackEvent, cf
 	if threadTS != "" && !isTS(threadTS) {
 		threadTS = ""
 	}
+	if isDirectChannel(event.ChannelType, channel) {
+		return boardsync.Record{}, false, nil
+	}
 	if isOwnMessage(user, botID, cfg) {
 		return boardsync.Record{}, false, nil
 	}
@@ -329,6 +338,9 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 	}
 	if channel == "" || !isTS(event.Item.TS) || event.User == "" {
 		return boardsync.Record{}, false, fmt.Errorf("%w: slack reaction has no channel, valid ts, or user", boardsync.ErrBadRequest)
+	}
+	if isDirectChannel(event.ChannelType, channel) {
+		return boardsync.Record{}, false, nil
 	}
 	if isOwnMessage(event.User, "", cfg) {
 		return boardsync.Record{}, false, nil
@@ -361,6 +373,13 @@ func normalizeReaction(key boardsync.Key, occurrence string, event slackEvent, c
 		},
 	}
 	return record, true, nil
+}
+
+// isDirectChannel rejects DMs and group DMs. They are not sync targets: a
+// board reader may not be in them, and a workspace app should not mirror a
+// private conversation it wasn't configured for.
+func isDirectChannel(channelType, channel string) bool {
+	return channelType == "im" || channelType == "mpim" || strings.HasPrefix(channel, "D")
 }
 
 func isOwnMessage(user, botID string, cfg Config) bool {

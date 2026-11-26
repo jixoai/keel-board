@@ -600,11 +600,13 @@ Known limits:
   `assistant.threads.setStatus`, which needs `assistant:write` and the Agents
   & AI Apps feature; a channel target is a no-op and an unsupported workspace
   returns `ErrUnsupported`.
-* **Files**: uploads use `files.getUploadURLExternal` → the pre-signed URL →
-  `files.completeUploadExternal`; finding the message needs `files:read`
-  (Slack's own shares are used first, then a bounded `files.info` poll).
-  Without `files:read` the text posts first and files follow. A message
-  deletion does not cascade to uploaded files.
+* **Files**: the text always posts first and its real `ts` is the receipt;
+  files follow through `files.getUploadURLExternal` → the pre-signed URL →
+  `files.completeUploadExternal` in the same thread. The adapter never guesses
+  a file message ID, so a later edit/delete cannot hit the thread root or a
+  file ID. A failed upload is a note on the text, and uploaded-but-unshared
+  files are deleted best-effort. A message deletion does not cascade to
+  already-shared files.
 * **Links**: only Slack message permalinks plus the unfurl/forward snapshots
   Slack includes in the webhook are imported. No URL is fetched; external
   links are left to the board.

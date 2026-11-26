@@ -172,12 +172,14 @@ func TestPostThreadReply(t *testing.T) {
 func TestPostFileRoot(t *testing.T) {
 	var uploads, completes int
 	var uploadForm *multipartForm
-	var completeForm url.Values
+	var completeForm, postForm url.Values
 	var gotUploadAuth string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
+		case "/chat.postMessage":
+			_ = r.ParseForm()
+			postForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
 		case "/files.getUploadURLExternal":
 			_ = r.ParseForm()
 			if uploads == 0 {
@@ -212,9 +214,6 @@ func TestPostFileRoot(t *testing.T) {
 			_ = r.ParseForm()
 			completeForm = r.PostForm
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"},{"id":"F2"}]}`))
-		case "/files.info":
-			_ = r.ParseForm()
-			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{"public":{"C0123ABC":[{"ts":"1727000010.000200"}]}}}}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
@@ -242,16 +241,20 @@ func TestPostFileRoot(t *testing.T) {
 	if gotUploadAuth != "" {
 		t.Fatalf("an upload URL got the bot token: %q", gotUploadAuth)
 	}
-	if completeForm.Get("channel_id") != "C0123ABC" || completeForm.Get("thread_ts") != "" {
+	if postForm.Get("text") != "see attached" {
+		t.Fatalf("text = %q", postForm.Get("text"))
+	}
+	// Files follow the text in its thread; the receipt is the text message.
+	if completeForm.Get("channel_id") != "C0123ABC" || completeForm.Get("thread_ts") != "1727000009.000100" {
 		t.Fatalf("complete form = %v", completeForm)
 	}
-	if completeForm.Get("initial_comment") != "see attached" {
+	if completeForm.Get("initial_comment") != "" {
 		t.Fatalf("comment = %q", completeForm.Get("initial_comment"))
 	}
 	if !strings.Contains(completeForm.Get("files"), `"id":"F1"`) {
 		t.Fatalf("files = %q", completeForm.Get("files"))
 	}
-	if posted.Thread != "C0123ABC:1727000010.000200" || posted.Message != "1727000010.000200" {
+	if posted.Thread != "C0123ABC:1727000009.000100" || posted.Message != "1727000009.000100" {
 		t.Fatalf("posted = %+v", posted)
 	}
 	if len(posted.Files) != 2 || posted.Files[0] != "F1" {
@@ -265,11 +268,13 @@ type multipartForm struct {
 }
 
 func TestPostFileReply(t *testing.T) {
-	var completeForm url.Values
+	var completeForm, postForm url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
+		case "/chat.postMessage":
+			_ = r.ParseForm()
+			postForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000011.000300"}`))
 		case "/files.getUploadURLExternal":
 			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
 		case "/upload/v1/abc":
@@ -278,8 +283,6 @@ func TestPostFileReply(t *testing.T) {
 			_ = r.ParseForm()
 			completeForm = r.PostForm
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
-		case "/files.info":
-			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{"public":{"C0123ABC":[{"ts":"1727000011.000300"}]}}}}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
@@ -295,26 +298,36 @@ func TestPostFileReply(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if postForm.Get("thread_ts") != "1727000000.123456" {
+		t.Fatalf("post form = %v", postForm)
+	}
 	if completeForm.Get("thread_ts") != "1727000000.123456" {
 		t.Fatalf("complete form = %v", completeForm)
 	}
-	if posted.Thread != "C0123ABC:1727000000.123456" || posted.Message != "1727000011.000300" {
+	// The receipt is the real text message ts, never the thread root or a
+	// file ID: an edit/delete must not hit the root.
+	if posted.Message != "1727000011.000300" || posted.Message == "1727000000.123456" {
 		t.Fatalf("posted = %+v", posted)
+	}
+	if posted.Thread != "C0123ABC:1727000000.123456" {
+		t.Fatalf("posted thread = %+v", posted)
 	}
 }
 
 func TestPostFileRefusedFallsBackToText(t *testing.T) {
-	var postForm url.Values
+	var postForm, updateForm url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
 			_, _ = w.Write([]byte(`{"ok":false,"error":"file_uploads_disabled"}`))
 		case "/chat.postMessage":
 			_ = r.ParseForm()
 			postForm = r.PostForm
 			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
+		case "/chat.update":
+			_ = r.ParseForm()
+			updateForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
@@ -331,8 +344,14 @@ func TestPostFileRefusedFallsBackToText(t *testing.T) {
 	if posted.Files == nil || len(posted.Files) != 0 {
 		t.Fatalf("posted files = %#v, want an empty non-nil list", posted.Files)
 	}
-	if !strings.Contains(postForm.Get("text"), "📎 a.png") || !strings.Contains(postForm.Get("text"), "on the board: #812") {
-		t.Fatalf("text = %q", postForm.Get("text"))
+	if posted.Message != "1727000009.000100" {
+		t.Fatalf("posted = %+v", posted)
+	}
+	if postForm.Get("text") != "see attached" {
+		t.Fatalf("initial text = %q", postForm.Get("text"))
+	}
+	if !strings.Contains(updateForm.Get("text"), "📎 a.png") || !strings.Contains(updateForm.Get("text"), "on the board: #812") {
+		t.Fatalf("edited text = %q", updateForm.Get("text"))
 	}
 }
 
@@ -340,8 +359,6 @@ func TestPostFileSizeAndCountLimits(t *testing.T) {
 	var uploads int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
 			uploads++
 			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
@@ -349,10 +366,11 @@ func TestPostFileSizeAndCountLimits(t *testing.T) {
 			_, _ = w.Write([]byte(`OK`))
 		case "/files.completeUploadExternal":
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
-		case "/files.info":
-			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{"public":{"C0123ABC":[{"ts":"1727000010.000200"}]}}}}`))
 		case "/chat.postMessage":
 			_ = r.ParseForm()
+			if r.PostForm.Get("text") == "" || !strings.Contains(r.PostForm.Get("text"), "📎") {
+				t.Fatalf("notes missing from text: %q", r.PostForm.Get("text"))
+			}
 			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
@@ -378,7 +396,7 @@ func TestPostFileSizeAndCountLimits(t *testing.T) {
 	if uploads != 1 {
 		t.Fatalf("uploads = %d, want only the first file", uploads)
 	}
-	if len(posted.Files) != 1 || posted.Files[0] != "F1" {
+	if len(posted.Files) != 1 || posted.Files[0] != "F1" || posted.Message != "1727000009.000100" {
 		t.Fatalf("posted = %+v", posted)
 	}
 }

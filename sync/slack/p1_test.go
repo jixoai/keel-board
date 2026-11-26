@@ -138,60 +138,46 @@ func TestCanonicalReactions(t *testing.T) {
 	}
 }
 
-type fileScenario struct {
-	getStatus    int
-	getBody      string
-	getCalls     int
-	completeBody string
-	completeCall int
-	uploadCalls  int
+type fileCapture struct {
+	post    url.Values
+	update  url.Values
+	posts   atomic.Int64
+	updates atomic.Int64
+	deletes atomic.Int64
 }
 
-func fileProvider(t *testing.T, scenario *fileScenario) (*slack.Provider, *httptest.Server, *url.Values, *atomic.Int64) {
+func fileServer(t *testing.T, handle func(w http.ResponseWriter, r *http.Request, cap *fileCapture)) (*slack.Provider, *fileCapture) {
 	t.Helper()
-	var postForm url.Values
-	var posts atomic.Int64
+	cap := &fileCapture{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
-		case "/files.getUploadURLExternal":
-			scenario.getCalls++
-			if scenario.getStatus != 0 {
-				w.WriteHeader(scenario.getStatus)
-				_, _ = w.Write([]byte(scenario.getBody))
-				return
-			}
-			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
-		case "/upload/v1/abc":
-			scenario.uploadCalls++
-			_, _ = w.Write([]byte(`OK`))
-		case "/files.completeUploadExternal":
-			scenario.completeCall++
-			if scenario.completeBody != "" {
-				_, _ = w.Write([]byte(scenario.completeBody))
-				return
-			}
-			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
-		case "/files.info":
-			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{"public":{"C0123ABC":[{"ts":"1727000010.000200"}]}}}}`))
 		case "/chat.postMessage":
-			posts.Add(1)
+			cap.posts.Add(1)
 			_ = r.ParseForm()
-			postForm = r.PostForm
+			cap.post = r.PostForm
 			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
-		default:
-			t.Fatalf("path = %s", r.URL.Path)
+			return
+		case "/chat.update":
+			cap.updates.Add(1)
+			_ = r.ParseForm()
+			cap.update = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		case "/files.delete":
+			cap.deletes.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
 		}
+		handle(w, r, cap)
 	}))
 	t.Cleanup(server.Close)
 	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
 		c.Sleep = func(context.Context, time.Duration) error { return nil }
 	})
-	return p, server, &postForm, &posts
+	return p, cap
 }
 
-func TestFileFailureDegradesAnyPreShareError(t *testing.T) {
+func TestFileFailureEditsNotes(t *testing.T) {
 	cases := []struct {
 		name   string
 		status int
@@ -203,8 +189,12 @@ func TestFileFailureDegradesAnyPreShareError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			scenario := &fileScenario{getStatus: tc.status}
-			p, _, form, posts := fileProvider(t, scenario)
+			p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
+				if r.URL.Path != "/files.getUploadURLExternal" {
+					t.Fatalf("path = %s", r.URL.Path)
+				}
+				w.WriteHeader(tc.status)
+			})
 			posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 				Markdown: "see attached", BoardMessage: 812,
 				Files: []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
@@ -212,26 +202,28 @@ func TestFileFailureDegradesAnyPreShareError(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Post = %v", err)
 			}
-			if posts.Load() != 1 || !strings.Contains(form.Get("text"), "📎 a.png") || !strings.Contains(form.Get("text"), "on the board: #812") {
-				t.Fatalf("posts=%d text=%q", posts.Load(), form.Get("text"))
+			if posted.Message != "1727000009.000100" {
+				t.Fatalf("posted = %+v", posted)
 			}
 			if posted.Files == nil || len(posted.Files) != 0 {
-				t.Fatalf("posted = %+v", posted)
+				t.Fatalf("posted files = %+v", posted.Files)
+			}
+			if cap.posts.Load() != 1 || cap.updates.Load() != 1 {
+				t.Fatalf("posts=%d updates=%d", cap.posts.Load(), cap.updates.Load())
+			}
+			if !strings.Contains(cap.update.Get("text"), "📎 a.png") || !strings.Contains(cap.update.Get("text"), "on the board: #812") {
+				t.Fatalf("text = %q", cap.update.Get("text"))
 			}
 		})
 	}
 }
 
 func TestFileUploadRetriesThenSucceeds(t *testing.T) {
-	// The first two calls fail; later calls succeed.
-	var calls atomic.Int64
-	var postForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var gets atomic.Int64
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
-			if calls.Add(1) <= 2 {
+			if gets.Add(1) <= 2 {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
@@ -239,17 +231,10 @@ func TestFileUploadRetriesThenSucceeds(t *testing.T) {
 		case "/upload/v1/abc":
 			_, _ = w.Write([]byte(`OK`))
 		case "/files.completeUploadExternal":
-			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1","shares":{"public":{"C0123ABC":[{"ts":"1727000010.000200"}]}}}]}`))
-		case "/chat.postMessage":
-			_ = r.ParseForm()
-			postForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached",
@@ -258,32 +243,22 @@ func TestFileUploadRetriesThenSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 3 || postForm.Get("text") != "" {
-		t.Fatalf("calls=%d post=%v", calls.Load(), postForm)
+	if gets.Load() != 3 || cap.posts.Load() != 1 || cap.updates.Load() != 0 {
+		t.Fatalf("gets=%d posts=%d updates=%d", gets.Load(), cap.posts.Load(), cap.updates.Load())
 	}
-	if len(posted.Files) != 1 || posted.Message != "1727000010.000200" {
+	if len(posted.Files) != 1 || posted.Message != "1727000009.000100" {
 		t.Fatalf("posted = %+v", posted)
 	}
 }
 
 func TestFileUploadRetriesExhaustedKeepsText(t *testing.T) {
 	var gets atomic.Int64
-	var posts atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
-		case "/files.getUploadURLExternal":
-			gets.Add(1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		case "/chat.postMessage":
-			posts.Add(1)
-			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
+		if r.URL.Path != "/files.getUploadURLExternal" {
+			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, nil, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
+		gets.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached", BoardMessage: 812,
@@ -292,17 +267,15 @@ func TestFileUploadRetriesExhaustedKeepsText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gets.Load() != 3 || posts.Load() != 1 || len(posted.Files) != 0 {
-		t.Fatalf("gets=%d posts=%d posted=%+v", gets.Load(), posts.Load(), posted)
+	if gets.Load() != 3 || cap.posts.Load() != 1 || cap.updates.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
+		t.Fatalf("gets=%d posts=%d updates=%d posted=%+v", gets.Load(), cap.posts.Load(), cap.updates.Load(), posted)
 	}
 }
 
-func TestFilePartialUploadDegradesWithoutDoubleText(t *testing.T) {
-	var gets, completes, posts atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestFilePartialUploadCleansOrphanAndKeepsText(t *testing.T) {
+	var gets, completes atomic.Int64
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
 			if gets.Add(1) == 1 {
 				_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
@@ -314,16 +287,9 @@ func TestFilePartialUploadDegradesWithoutDoubleText(t *testing.T) {
 		case "/files.completeUploadExternal":
 			completes.Add(1)
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
-		case "/chat.postMessage":
-			posts.Add(1)
-			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached", BoardMessage: 812,
@@ -335,48 +301,26 @@ func TestFilePartialUploadDegradesWithoutDoubleText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if gets.Load() != 2 || completes.Load() != 0 || posts.Load() != 1 || len(posted.Files) != 0 {
-		t.Fatalf("gets=%d completes=%d posts=%d posted=%+v", gets.Load(), completes.Load(), posts.Load(), posted)
+	if gets.Load() != 2 || completes.Load() != 0 || cap.posts.Load() != 1 || cap.updates.Load() != 1 || cap.deletes.Load() != 1 {
+		t.Fatalf("gets=%d completes=%d posts=%d updates=%d deletes=%d", gets.Load(), completes.Load(), cap.posts.Load(), cap.updates.Load(), cap.deletes.Load())
+	}
+	if len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
+		t.Fatalf("posted = %+v", posted)
 	}
 }
 
 func TestFileCompleteFailureDegrades(t *testing.T) {
-	scenario := &fileScenario{completeBody: `{"ok":false,"error":"invalid_arguments"}`}
-	p, _, form, posts := fileProvider(t, scenario)
-	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
-		Markdown: "see attached",
-		Files:    []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scenario.completeCall != 1 || posts.Load() != 1 || len(posted.Files) != 0 || !strings.Contains(form.Get("text"), "📎 a.png") {
-		t.Fatalf("complete=%d posts=%d posted=%+v text=%q", scenario.completeCall, posts.Load(), posted, form.Get("text"))
-	}
-}
-
-func TestFileSharesReusedWithoutFileInfo(t *testing.T) {
-	var infoCalls atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
 			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
 		case "/upload/v1/abc":
 			_, _ = w.Write([]byte(`OK`))
 		case "/files.completeUploadExternal":
-			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1","shares":{"public":{"C0123ABC":[{"ts":"1727000010.000200"}]}}}]}`))
-		case "/files.info":
-			infoCalls.Add(1)
-			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{}}}`))
+			_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_arguments"}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached",
@@ -385,17 +329,18 @@ func TestFileSharesReusedWithoutFileInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if infoCalls.Load() != 0 || posted.Message != "1727000010.000200" {
-		t.Fatalf("info=%d posted=%+v", infoCalls.Load(), posted)
+	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
+		t.Fatalf("posts=%d updates=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), posted)
+	}
+	if !strings.Contains(cap.update.Get("text"), "📎 a.png") {
+		t.Fatalf("text = %q", cap.update.Get("text"))
 	}
 }
 
-func TestFindShareFailureIsPartialSuccess(t *testing.T) {
-	var posts atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestFilePostNeverCallsFileInfo(t *testing.T) {
+	var infoCalls atomic.Int64
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
 		case "/files.getUploadURLExternal":
 			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
 		case "/upload/v1/abc":
@@ -403,16 +348,11 @@ func TestFindShareFailureIsPartialSuccess(t *testing.T) {
 		case "/files.completeUploadExternal":
 			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
 		case "/files.info":
-			w.WriteHeader(http.StatusInternalServerError)
-		case "/chat.postMessage":
-			posts.Add(1)
+			infoCalls.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true,"file":{"shares":{}}}`))
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached",
@@ -421,35 +361,60 @@ func TestFindShareFailureIsPartialSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if posts.Load() != 0 || len(posted.Files) != 1 || posted.Message == "" {
-		t.Fatalf("posts=%d posted=%+v", posts.Load(), posted)
+	if infoCalls.Load() != 0 || cap.posts.Load() != 1 || posted.Message != "1727000009.000100" || len(posted.Files) != 1 {
+		t.Fatalf("info=%d posts=%d posted=%+v", infoCalls.Load(), cap.posts.Load(), posted)
 	}
 }
 
-func TestTextThenFilesFailureIsPartialSuccess(t *testing.T) {
-	var posts, updates atomic.Int64
-	var updateForm url.Values
+func TestFileReplyReceiptIsTextTS(t *testing.T) {
+	var completeForm url.Values
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["chat:write"]}}`))
 		case "/chat.postMessage":
-			posts.Add(1)
-			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
-		case "/files.getUploadURLExternal":
-			w.WriteHeader(http.StatusForbidden)
-		case "/chat.update":
-			updates.Add(1)
 			_ = r.ParseForm()
-			updateForm = r.PostForm
-			_, _ = w.Write([]byte(`{"ok":true}`))
+			if r.PostForm.Get("thread_ts") != "1727000000.123456" {
+				t.Fatalf("post form = %v", r.PostForm)
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000011.000300"}`))
+		case "/files.getUploadURLExternal":
+			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
+		case "/upload/v1/abc":
+			_, _ = w.Write([]byte(`OK`))
+		case "/files.completeUploadExternal":
+			_ = r.ParseForm()
+			completeForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
+		case "/files.info":
+			t.Fatal("the adapter must not guess a file message ID")
 		default:
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 	}))
 	defer server.Close()
-	p := newProvider(t, server.URL, nil, func(c *slack.Config) {
+	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
 		c.Sleep = func(context.Context, time.Duration) error { return nil }
+	})
+	posted, err := p.Post(context.Background(), "slack", postTarget(true), boardsync.OutboundMessage{
+		Markdown: "see attached",
+		Files:    []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posted.Message != "1727000011.000300" || posted.Message == "1727000000.123456" {
+		t.Fatalf("posted = %+v", posted)
+	}
+	if posted.Thread != "C0123ABC:1727000000.123456" || completeForm.Get("thread_ts") != "1727000000.123456" {
+		t.Fatalf("posted=%+v complete=%v", posted, completeForm)
+	}
+}
+
+func TestTextThenFilesFailureIsPartialSuccess(t *testing.T) {
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
+		if r.URL.Path != "/files.getUploadURLExternal" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusForbidden)
 	})
 	posted, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
 		Markdown: "see attached", BoardMessage: 812,
@@ -458,33 +423,22 @@ func TestTextThenFilesFailureIsPartialSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if posts.Load() != 1 || updates.Load() != 1 || len(posted.Files) != 0 {
-		t.Fatalf("posts=%d updates=%d posted=%+v", posts.Load(), updates.Load(), posted)
+	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || len(posted.Files) != 0 || posted.Message != "1727000009.000100" {
+		t.Fatalf("posts=%d updates=%d posted=%+v", cap.posts.Load(), cap.updates.Load(), posted)
 	}
-	if !strings.Contains(updateForm.Get("text"), "📎 a.png") || !strings.Contains(updateForm.Get("text"), "on the board: #812") {
-		t.Fatalf("text = %q", updateForm.Get("text"))
+	if !strings.Contains(cap.update.Get("text"), "📎 a.png") || !strings.Contains(cap.update.Get("text"), "on the board: #812") {
+		t.Fatalf("text = %q", cap.update.Get("text"))
 	}
 }
 
-func TestOutboxDoesNotRetryPartialFileSuccess(t *testing.T) {
-	var posts, gets atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/auth.test":
-			_, _ = w.Write([]byte(`{"ok":true,"response_metadata":{"scopes":["files:read","files:write"]}}`))
-		case "/chat.postMessage":
-			posts.Add(1)
-			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
-		case "/files.getUploadURLExternal":
-			gets.Add(1)
-			w.WriteHeader(http.StatusServiceUnavailable)
-		default:
+func TestOutboxDoesNotRetryFilePartialSuccess(t *testing.T) {
+	var gets atomic.Int64
+	p, cap := fileServer(t, func(w http.ResponseWriter, r *http.Request, _ *fileCapture) {
+		if r.URL.Path != "/files.getUploadURLExternal" {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
-	}))
-	defer server.Close()
-	p := newProvider(t, server.URL, nil, func(c *slack.Config) {
-		c.Sleep = func(context.Context, time.Duration) error { return nil }
+		gets.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	outbox := boardsync.NewOutbox(boardsync.RetryPolicy{MaxAttempts: 3, BaseDelay: 0}, 8)
 	if err := outbox.Enqueue("slack:C0123ABC:1727000000.123456", func(ctx context.Context) error {
@@ -500,7 +454,7 @@ func TestOutboxDoesNotRetryPartialFileSuccess(t *testing.T) {
 	if result.Done != 1 || result.Retried != 0 || result.Dead != 0 {
 		t.Fatalf("drain = %+v", result)
 	}
-	if posts.Load() != 1 || gets.Load() != 3 {
-		t.Fatalf("posts=%d gets=%d", posts.Load(), gets.Load())
+	if cap.posts.Load() != 1 || cap.updates.Load() != 1 || gets.Load() != 3 {
+		t.Fatalf("posts=%d updates=%d gets=%d", cap.posts.Load(), cap.updates.Load(), gets.Load())
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -244,5 +245,177 @@ func TestReceiveCleansFormatCharacters(t *testing.T) {
 	text := receive(t, provider(t), data).Records[0].Event.Text
 	if text != "abc\u200dd" {
 		t.Fatalf("text = %q", text)
+	}
+}
+
+func TestExternalEditOmitsMarkdownText(t *testing.T) {
+	var got url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat.update":
+			_ = r.ParseForm()
+			got = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	thread := boardsync.ThreadRef{Key: "slack", Platform: "slack", Channel: "C0123ABC", Thread: "C0123ABC:1727000000.123456"}
+	if err := p.Edit(context.Background(), "slack", thread, "1727000000.123456", boardsync.OutboundMessage{
+		Markdown: "<!channel>", External: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got.Get("text") != "&lt;!channel&gt;" || got.Get("markdown_text") != "" {
+		t.Fatalf("form = %v", got)
+	}
+}
+
+func TestEscapedTextIsClampedAfterEscaping(t *testing.T) {
+	var got url.Values
+	server := capturePostServer(t, &got)
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Markdown: strings.Repeat("<", 30000), External: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Get("text")) > 39000 {
+		t.Fatalf("text is %d bytes after escaping", len(got.Get("text")))
+	}
+}
+
+func TestFileNameIsBounded(t *testing.T) {
+	var got url.Values
+	server := capturePostServer(t, &got)
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, func(c *slack.Config) { c.MaxFileBytes = 1 })
+	name := strings.Repeat("x", 5000)
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Markdown: "file",
+		Files:    []boardsync.OutboundFile{{Data: []byte("too large"), Filename: name}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	text := got.Get("text")
+	if len(text) > 1000 || strings.Contains(text, name) {
+		t.Fatalf("file name was not bounded: %d bytes", len(text))
+	}
+}
+
+func TestReceiveRejectsDirectMessages(t *testing.T) {
+	for _, channelType := range []string{"im", "mpim"} {
+		var body map[string]any
+		if err := json.Unmarshal(fixture(t, "message.json"), &body); err != nil {
+			t.Fatal(err)
+		}
+		event := body["event"].(map[string]any)
+		event["channel_type"] = channelType
+		if channelType == "im" {
+			event["channel"] = "D0123ABC"
+		}
+		data, _ := json.Marshal(body)
+		if intake := receive(t, provider(t), data); len(intake.Records) != 0 {
+			t.Fatalf("%s imported: %+v", channelType, intake.Records)
+		}
+	}
+}
+
+func TestURLIsUnsupported(t *testing.T) {
+	p := newProvider(t, "http://127.0.0.1:1", nil, nil)
+	if _, err := p.URL("C0123ABC:1727000000.123456", "1727000000.123456"); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("URL = %v", err)
+	}
+}
+
+func TestUploadURLIsRedactedFromErrors(t *testing.T) {
+	client := slack.NewClient("", &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("request to " + req.URL.String() + " with " + testToken)
+	})}, boardsync.Secret(testToken))
+	err := client.UploadExternal(context.Background(), "https://files.slack.com/upload/secret-path", "a.txt", []byte("x"))
+	if err == nil {
+		t.Fatal("UploadExternal succeeded")
+	}
+	if strings.Contains(err.Error(), "secret-path") || strings.Contains(err.Error(), testToken) {
+		t.Fatalf("error leaked the upload URL or token: %v", err)
+	}
+}
+
+func TestFileURLIsRedactedFromErrors(t *testing.T) {
+	client := slack.NewClient("", &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, errors.New("request to " + req.URL.String() + " with " + testToken)
+	})}, boardsync.Secret(testToken))
+	_, err := client.FetchFile(context.Background(), boardsync.File{
+		URL: "https://files.slack.com/files-pri/T-F/secret.txt",
+	}, 1024)
+	if err == nil {
+		t.Fatal("FetchFile succeeded")
+	}
+	if strings.Contains(err.Error(), "secret.txt") || strings.Contains(err.Error(), testToken) {
+		t.Fatalf("error leaked the file URL or token: %v", err)
+	}
+}
+
+func TestUploadRetryHonorsRetryAfter(t *testing.T) {
+	var sleeps []time.Duration
+	var gets atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/chat.postMessage":
+			_, _ = w.Write([]byte(`{"ok":true,"ts":"1727000009.000100"}`))
+		case "/files.getUploadURLExternal":
+			if gets.Add(1) == 1 {
+				w.Header().Set("Retry-After", "2")
+				w.WriteHeader(http.StatusTooManyRequests)
+				return
+			}
+			_, _ = w.Write([]byte(`{"ok":true,"upload_url":"https://files.slack.com/upload/v1/abc","file_id":"F1"}`))
+		case "/upload/v1/abc":
+			_, _ = w.Write([]byte(`OK`))
+		case "/files.completeUploadExternal":
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F1"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, &http.Client{Transport: rewriteTransport{target: server.URL}}, func(c *slack.Config) {
+		c.Sleep = func(_ context.Context, d time.Duration) error {
+			sleeps = append(sleeps, d)
+			return nil
+		}
+	})
+	if _, err := p.Post(context.Background(), "slack", postTarget(false), boardsync.OutboundMessage{
+		Markdown: "see attached",
+		Files:    []boardsync.OutboundFile{{Data: []byte("x"), Filename: "a.png"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range sleeps {
+		if d >= 2*time.Second {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("sleeps = %v, want a Retry-After wait", sleeps)
+	}
+}
+
+func TestFetchRootCleansFileNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1727000000.123456","user":"U0456ABC","text":"","files":[{"name":"a\u0000b.txt"}]}]}`))
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	root, err := p.FetchRoot(context.Background(), "slack", "C0123ABC:1727000000.123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.ContainsRune(root.Text, 0) || root.Text != "📎 ab.txt" {
+		t.Fatalf("root text = %q", root.Text)
 	}
 }

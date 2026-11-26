@@ -59,7 +59,7 @@ func (p *Provider) renderBody(rawText string, notes []string, external bool, key
 			text += "\n\n" + escaped
 		}
 	}
-	return text
+	return boardsync.StorableText(text, maxOutboundText)
 }
 
 // restoreMentions turns the board's explicit mention token for this entry
@@ -340,6 +340,16 @@ func (c *Client) SetAssistantStatus(ctx context.Context, channel, threadTS, stat
 	return c.call(ctx, "assistant.threads.setStatus", form, nil)
 }
 
+// fileDisplayName is a file name for a message or a note: cleaned, non-empty,
+// and bounded before it is escaped.
+func fileDisplayName(name string) string {
+	name = cleanText(name)
+	if name == "" {
+		name = "file"
+	}
+	return boardsync.StorableText(name, 256)
+}
+
 // canonicalReactions maps the board's canonical reaction names to the
 // emoji Slack recognizes. A name already in Slack's form passes through.
 var canonicalReactions = map[string]string{
@@ -407,8 +417,7 @@ func (p *Provider) UploadFiles(ctx context.Context, key boardsync.Key, thread bo
 	if len(plan.files) == 0 {
 		return nil, fmt.Errorf("%w: slack upload has no files", boardsync.ErrBadRequest)
 	}
-	ids, _, err := p.uploadFiles(ctx, thread.Channel, threadTS, "", plan.files)
-	return ids, err
+	return p.uploadFiles(ctx, thread.Channel, threadTS, "", plan.files)
 }
 
 // fileUploadAttempts bounds the retries of the steps before Slack shares the
@@ -426,7 +435,12 @@ func (p *Provider) retryFile(ctx context.Context, fn func() error, allow func(er
 		if !allow(err) || attempt+1 == fileUploadAttempts {
 			return err
 		}
-		if waitErr := p.cfg.sleep(ctx, time.Duration(100*(1<<attempt))*time.Millisecond); waitErr != nil {
+		delay := time.Duration(100*(1<<attempt)) * time.Millisecond
+		var rate *RateLimitError
+		if errors.As(err, &rate) && rate.RetryAfter > delay {
+			delay = rate.RetryAfter
+		}
+		if waitErr := p.cfg.sleep(ctx, delay); waitErr != nil {
 			return waitErr
 		}
 	}
@@ -437,10 +451,8 @@ func retryableFileError(err error) bool {
 	return !boardsync.IsPermanent(err)
 }
 
-// uploadFiles uploads files and shares them in one message. shares holds the
-// message ts Slack reported; callers may still need a files.info read when
-// Slack omitted it.
-func (p *Provider) uploadFiles(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) ([]string, map[string]string, error) {
+// uploadFiles uploads files and shares them in one message.
+func (p *Provider) uploadFiles(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) ([]string, error) {
 	refs := make([]UploadFileRef, 0, len(files))
 	for _, file := range files {
 		name := uploadFilename(file.Filename, file.MIMEType)
@@ -451,45 +463,40 @@ func (p *Provider) uploadFiles(ctx context.Context, channel, threadTS, comment s
 			return callErr
 		}, retryableFileError)
 		if err != nil {
-			return nil, nil, err
+			p.cleanupUploads(ctx, refs)
+			return nil, err
 		}
 		if err := p.retryFile(ctx, func() error {
 			return p.client.UploadExternal(ctx, uploadURL, name, file.Data)
 		}, retryableFileError); err != nil {
-			return nil, nil, err
+			p.cleanupUploads(ctx, refs)
+			return nil, err
 		}
 		refs = append(refs, UploadFileRef{ID: fileID, Title: name})
 	}
-	var result CompleteUploadResult
 	// Completing twice could share the files twice; only a rate limit is
 	// retried, where Slack refused before doing the work.
+	var ids []string
 	err := p.retryFile(ctx, func() error {
 		var callErr error
-		result, callErr = p.client.CompleteUploadExternalShares(ctx, refs, channel, threadTS, comment)
+		ids, callErr = p.client.CompleteUploadExternal(ctx, refs, channel, threadTS, comment)
 		return callErr
 	}, func(err error) bool { return errors.Is(err, boardsync.ErrRateLimited) })
 	if err != nil {
-		return nil, nil, err
+		if boardsync.IsPermanent(err) || errors.Is(err, boardsync.ErrRateLimited) {
+			p.cleanupUploads(ctx, refs)
+		}
+		return nil, err
 	}
-	return result.IDs, result.Shares, nil
+	return ids, nil
 }
 
-// uploadAndShare uploads files and finds the message Slack made for them.
-// shared says the files reached Slack; a later failure then must not be
-// mistaken for a refusal and re-post the text.
-func (p *Provider) uploadAndShare(ctx context.Context, channel, threadTS, comment string, files []boardsync.OutboundFile) (ids []string, ts string, shared bool, err error) {
-	ids, shares, err := p.uploadFiles(ctx, channel, threadTS, comment, files)
-	if err != nil {
-		return nil, "", false, err
+// cleanupUploads deletes files uploaded but never shared. It is best-effort:
+// the text is already posted, and a failed cleanup must not fail delivery.
+func (p *Provider) cleanupUploads(ctx context.Context, refs []UploadFileRef) {
+	for _, ref := range refs {
+		_ = p.client.DeleteFile(context.WithoutCancel(ctx), ref.ID)
 	}
-	if found := shares[channel]; found != "" {
-		return ids, found, true, nil
-	}
-	ts, err = p.findShare(ctx, channel, ids[0])
-	if err != nil {
-		return ids, "", true, err
-	}
-	return ids, ts, true, nil
 }
 
 // attachmentNotes says what a file-only message carried when its files go as
@@ -497,10 +504,7 @@ func (p *Provider) uploadAndShare(ctx context.Context, channel, threadTS, commen
 func attachmentNotes(files []boardsync.OutboundFile) []string {
 	notes := make([]string, 0, len(files))
 	for _, file := range files {
-		name := cleanText(file.Filename)
-		if name == "" {
-			name = "file"
-		}
+		name := fileDisplayName(file.Filename)
 		notes = append(notes, fmt.Sprintf("📎 %s (%s)", name, humanBytes(int64(len(file.Data)))))
 	}
 	return notes

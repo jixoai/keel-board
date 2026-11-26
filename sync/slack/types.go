@@ -46,10 +46,7 @@ type Config struct {
 	// limit stays in the event but FetchFile refuses it.
 	MaxFiles     int
 	MaxFileBytes int64
-	// FileSharePolls bounds how many times an upload looks for the message
-	// Slack made. The default is 10, with Slack's short backoff.
-	FileSharePolls int
-	// Sleep is the wait between file-share polls. Tests replace it.
+	// Sleep is the wait between upload retries. Tests replace it.
 	Sleep func(ctx context.Context, d time.Duration) error
 	// JoinChannels opts in to conversations.join for source reads. It is off
 	// by default: joining announces the app in a channel and Slack starts
@@ -80,7 +77,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("%w: slack API base URL must be http or https", boardsync.ErrBadRequest)
 		}
 	}
-	if c.MaxFiles < 0 || c.MaxFileBytes < 0 || c.FileSharePolls < 0 {
+	if c.MaxFiles < 0 || c.MaxFileBytes < 0 {
 		return fmt.Errorf("%w: slack file limits can't be negative", boardsync.ErrBadRequest)
 	}
 	return nil
@@ -130,13 +127,6 @@ func (c Config) maxFileBytes() int64 {
 		return c.MaxFileBytes
 	}
 	return 25 << 20
-}
-
-func (c Config) fileSharePolls() int {
-	if c.FileSharePolls > 0 {
-		return c.FileSharePolls
-	}
-	return 10
 }
 
 func (c Config) sleep(ctx context.Context, d time.Duration) error {
