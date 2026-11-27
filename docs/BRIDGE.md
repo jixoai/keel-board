@@ -207,3 +207,6 @@ not return credentials, another entry's IDs, or a URL the board should call.
   webhooks: inbound events must arrive through the bridge route.
 - The reference sidecar fixture lives in `sync/chatsdk/sidecartest` and is
   test-only. It is never wired into the production server.
+- The shared provider contract (`sync/conformance`) runs unchanged against
+  Slack, GitHub, Linear, and a bridge-backed provider, so the generic path is
+  substitutable for a native platform adapter.
