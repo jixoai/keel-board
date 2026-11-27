@@ -53,9 +53,21 @@ func rebuild(args []string) error {
 		}
 	}
 	reports, err := rebuildLog(ctx, events, selected)
+	failed := printReports(reports)
 	if err != nil {
+		// Print what was rebuilt before the failure: an operator needs the
+		// per-tenant digests even when a later tenant's log is broken.
 		return err
 	}
+	if failed > 0 {
+		return fmt.Errorf("board rebuild: %d tenant(s) are not consistent; events are intact, so restore the log or head row and retry", failed)
+	}
+	return nil
+}
+
+// printReports writes each tenant's result and returns how many were not
+// consistent.
+func printReports(reports []log.ProjectionReport) int {
 	failed := 0
 	for _, report := range reports {
 		fmt.Printf("%s: head=%d digest=%s consistent=%t\n", report.Tenant, report.LogHead, report.Digest, report.Consistent)
@@ -66,23 +78,23 @@ func rebuild(args []string) error {
 			failed++
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("board rebuild: %d tenant(s) are not consistent; events are intact, so restore the log or head row and retry", failed)
-	}
-	return nil
+	return failed
 }
 
-// rebuildLog rebuilds each tenant on one board over events, in order. It stops
-// at the first store failure and returns what it has already rebuilt.
+// rebuildLog rebuilds each tenant on its own board, so one tenant's
+// projection is released before the next is loaded. It stops at the first
+// failure and returns what it has already rebuilt, including a partial report
+// the failing tenant produced.
 func rebuildLog(ctx context.Context, events store.EventStore, tenants []string) ([]log.ProjectionReport, error) {
-	board := log.New(log.Options{Store: events})
 	reports := make([]log.ProjectionReport, 0, len(tenants))
 	for _, tenant := range tenants {
-		report, err := board.Rebuild(ctx, tenant)
+		report, err := log.New(log.Options{Store: events}).Rebuild(ctx, tenant)
+		if report.Tenant != "" {
+			reports = append(reports, report)
+		}
 		if err != nil {
 			return reports, fmt.Errorf("board rebuild: %s: %w", tenant, err)
 		}
-		reports = append(reports, report)
 	}
 	return reports, nil
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -105,5 +107,74 @@ func TestStringListFlag(t *testing.T) {
 	}
 	if err := list.Set("  "); err == nil {
 		t.Fatal("an empty tenant should be refused")
+	}
+}
+
+// failingTenantStore fails one tenant's Load, as an unreadable log would.
+type failingTenantStore struct {
+	*store.Memory
+	fail string
+}
+
+func (s *failingTenantStore) Load(ctx context.Context, tenant string) ([]store.Record, error) {
+	if tenant == s.fail {
+		return nil, errors.New("injected load failure")
+	}
+	return s.Memory.Load(ctx, tenant)
+}
+
+// TestRebuildLogReturnsPartialReports proves a later tenant's failure still
+// leaves the earlier rebuilt results available to print.
+func TestRebuildLogReturnsPartialReports(t *testing.T) {
+	ctx := context.Background()
+	memory := store.NewMemory()
+	board := log.New(log.Options{Store: memory})
+	author := protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"}
+	if err := board.Update(ctx, "a", log.UpdateOptions{}, func(tx *log.Tx) error {
+		id := tx.NextID(0)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: "work", Text: "hello", Thread: log.ThreadKey(id),
+			By: author, Labels: map[string]string{},
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+
+	reports, err := rebuildLog(ctx, &failingTenantStore{Memory: memory, fail: "b"}, []string{"a", "b"})
+	if err == nil {
+		t.Fatal("an unreadable tenant should fail the rebuild")
+	}
+	if len(reports) != 1 || reports[0].Tenant != "a" || !reports[0].Consistent {
+		t.Fatalf("partial reports: %+v", reports)
+	}
+}
+
+// gapStore serves a log with a missing seq, so it cannot replay.
+type gapStore struct{}
+
+func (gapStore) Load(context.Context, string) ([]store.Record, error) {
+	record := func(seq uint64) store.Record {
+		return store.Record{
+			Seq: seq, Type: string(log.EventMessagePosted), Channel: "work",
+			Payload: []byte(fmt.Sprintf(`{"id":%d,"channel":"work","text":"one","thread":"1","labels":{},"by":{"actor":"local:user:alice","principal":"local:user:alice"}}`, seq)),
+		}
+	}
+	return []store.Record{record(1), record(3)}, nil
+}
+
+func (gapStore) Append(context.Context, string, []store.Record, uint64) (store.AppendResult, error) {
+	return store.AppendResult{}, store.ErrLogInconsistent
+}
+
+// TestRebuildLogReportsABrokenLog proves a gap is classified as an
+// inconsistent log and still yields a per-tenant report with the reason.
+func TestRebuildLogReportsABrokenLog(t *testing.T) {
+	reports, err := rebuildLog(context.Background(), gapStore{}, []string{"broken"})
+	if !errors.Is(err, log.ErrLogInconsistent) {
+		t.Fatalf("gap rebuild error: %v", err)
+	}
+	if len(reports) != 1 || reports[0].Tenant != "broken" || len(reports[0].Problems) == 0 {
+		t.Fatalf("broken-log report: %+v", reports)
 	}
 }
