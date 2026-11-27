@@ -1,0 +1,2 @@
+# E2E harness output (generated reports, logs, binaries) is never committed.
+scripts/e2e/out/
