@@ -183,6 +183,10 @@ func (s *Sidecar) deliver(w http.ResponseWriter, body []byte) {
 		s.writeError(w, boardsync.ErrBadRequest)
 		return
 	}
+	if err := request.Validate(); err != nil {
+		s.writeError(w, err)
+		return
+	}
 	s.mu.Lock()
 	s.delivered = append(s.delivered, request)
 	if posted, ok := s.byDelivery[request.DeliveryID]; ok {
