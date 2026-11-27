@@ -45,23 +45,28 @@ type WatcherWorkerConfig struct {
 	PollInterval time.Duration
 	// Defer is how long a disabled watcher's delivery is released for. Zero
 	// means one second.
-	Defer  time.Duration
-	Logger *slog.Logger
+	Defer time.Duration
+	// ActionTimeout bounds one action run. A timed-out action is a retryable
+	// failure; an action that ignores its context can still block this worker,
+	// so plugins must honor it. Zero means two minutes.
+	ActionTimeout time.Duration
+	Logger        *slog.Logger
 }
 
 // WatcherWorker matches board events to watchers and runs their actions.
 type WatcherWorker struct {
-	store     Store
-	board     Board
-	actions   *Registry
-	authorize Authorizer
-	tenant    string
-	owner     string
-	limit     int
-	planLimit int
-	poll      time.Duration
-	deferFor  time.Duration
-	logger    *slog.Logger
+	store         Store
+	board         Board
+	actions       *Registry
+	authorize     Authorizer
+	tenant        string
+	owner         string
+	limit         int
+	planLimit     int
+	poll          time.Duration
+	deferFor      time.Duration
+	actionTimeout time.Duration
+	logger        *slog.Logger
 }
 
 // NewWatcherWorker validates cfg.
@@ -84,6 +89,9 @@ func NewWatcherWorker(cfg WatcherWorkerConfig) (*WatcherWorker, error) {
 	if cfg.Defer <= 0 {
 		cfg.Defer = time.Second
 	}
+	if cfg.ActionTimeout <= 0 {
+		cfg.ActionTimeout = 2 * time.Minute
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -91,7 +99,7 @@ func NewWatcherWorker(cfg WatcherWorkerConfig) (*WatcherWorker, error) {
 		store: cfg.Store, board: cfg.Board, actions: cfg.Actions,
 		authorize: cfg.Authorize, tenant: cfg.Tenant, owner: leaseOwner(cfg.Owner),
 		limit: cfg.Limit, planLimit: cfg.PlanLimit, poll: cfg.PollInterval,
-		deferFor: cfg.Defer, logger: cfg.Logger,
+		deferFor: cfg.Defer, actionTimeout: cfg.ActionTimeout, logger: cfg.Logger,
 	}, nil
 }
 
@@ -318,7 +326,9 @@ func (w *WatcherWorker) execute(ctx context.Context) (WorkResult, error) {
 			}
 			continue
 		}
-		jobErr := w.run(ctx, watcher, job)
+		actionCtx, cancel := context.WithTimeout(ctx, w.actionTimeout)
+		jobErr := w.run(actionCtx, watcher, job)
+		cancel()
 		if err := ctx.Err(); err != nil {
 			// The action may not have finished; leave the lease to expire
 			// rather than recording a failure it didn't have.

@@ -676,3 +676,53 @@ func TestWatcherActionPanicIsIsolated(t *testing.T) {
 	// The board and other workers keep working.
 	postMessage(t, board, "t1", "work", "third", nil)
 }
+
+func TestWatcherActionTimeoutRetriesThenDead(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	cfg := testConfig()
+	cfg.Retry.MaxAttempts = 2
+	memory, err := automation.NewMemory(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "hang",
+		Fn: func(ctx context.Context, _ *automation.ActionCall) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "first", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "hang", Channel: "work", Cursor: 1, Enabled: true,
+		Action: automation.ActionSpec{Name: "hang"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Tenant: "t1",
+		PollInterval: time.Hour, ActionTimeout: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "second", nil)
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	depth, _ := memory.DeliveryDepth(ctx, "t1", "hang")
+	if depth.Pending != 1 {
+		t.Fatalf("depth after timeout = %+v", depth)
+	}
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	depth, _ = memory.DeliveryDepth(ctx, "t1", "hang")
+	if depth.Dead != 1 {
+		t.Fatalf("depth after two timeouts = %+v", depth)
+	}
+}

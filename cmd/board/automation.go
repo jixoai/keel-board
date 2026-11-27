@@ -19,11 +19,12 @@ import (
 // DSN it uses the board's DSN, and without either it keeps declarations in
 // memory (development only).
 type automationFlags struct {
-	tenant string
-	dsn    string
-	schema string
-	poll   time.Duration
-	lease  time.Duration
+	tenant        string
+	dsn           string
+	schema        string
+	poll          time.Duration
+	lease         time.Duration
+	actionTimeout time.Duration
 }
 
 // registerAutomationFlags adds the automation flags to a serve flag set.
@@ -34,16 +35,18 @@ func registerAutomationFlags(flags *flag.FlagSet) *automationFlags {
 	flags.StringVar(&cfg.schema, "automation-schema", "", "schema for the automation tables; empty uses the database default")
 	flags.DurationVar(&cfg.poll, "automation-poll", time.Second, "how long an idle automation worker waits between passes")
 	flags.DurationVar(&cfg.lease, "automation-lease", time.Minute, "how long a worker holds a delivery or schedule lease")
+	flags.DurationVar(&cfg.actionTimeout, "automation-action-timeout", 2*time.Minute, "how long one watcher action may run before it is retried")
 	return cfg
 }
 
 // automationRuntime is what the serve process starts and stops.
 type automationRuntime struct {
-	store      automation.Store
-	closeStore func()
-	registry   *automation.Registry
-	tenant     string
-	poll       time.Duration
+	store         automation.Store
+	closeStore    func()
+	registry      *automation.Registry
+	tenant        string
+	poll          time.Duration
+	actionTimeout time.Duration
 }
 
 // options returns the management API's configuration.
@@ -95,9 +98,13 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 	if poll <= 0 {
 		poll = time.Second
 	}
+	actionTimeout := flags.actionTimeout
+	if actionTimeout <= 0 {
+		actionTimeout = 2 * time.Minute
+	}
 	return &automationRuntime{
 		store: store, closeStore: closeStore, registry: registry,
-		tenant: tenant, poll: poll,
+		tenant: tenant, poll: poll, actionTimeout: actionTimeout,
 	}, nil
 }
 
@@ -111,7 +118,7 @@ func startAutomationWorkers(ctx context.Context, logger *slog.Logger, runtime *a
 	watchers, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
 		Store: runtime.store, Board: board, Actions: runtime.registry,
 		Authorize: authorize, Tenant: runtime.tenant, Owner: "board-watcher",
-		PollInterval: runtime.poll, Logger: logger,
+		PollInterval: runtime.poll, ActionTimeout: runtime.actionTimeout, Logger: logger,
 	})
 	if err != nil {
 		runtime.closeStore()

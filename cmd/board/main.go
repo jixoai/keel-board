@@ -72,7 +72,7 @@ Usage:
               [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
               [--sync-start key=platformChannel]
               [--automation-tenant <tenant>] [--automation-dsn <dsn>] [--automation-schema <schema>]
-              [--automation-poll 1s] [--automation-lease 5m]
+              [--automation-poll 1s] [--automation-lease 1m] [--automation-action-timeout 2m]
   board rebuild --dsn postgres://... [--tenant <tenant>]...
   board version
 
