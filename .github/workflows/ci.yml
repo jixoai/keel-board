@@ -12,12 +12,13 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   test:
+    # A new push supersedes an older test run; the stress job has its own,
+    # non-cancelling group so a docs push cannot kill a 40-minute release gate.
+    concurrency:
+      group: ci-test-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: [self-hosted, macOS]
     env:
       # The org self-hosted runner (mac-ext-01) has PostgreSQL 18 on the
@@ -59,6 +60,9 @@ jobs:
     # bounds, and replay/hash state. Scheduled weekly and runnable by hand
     # before a tag; a single green run must be attached to the phase evidence.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    concurrency:
+      group: ci-stress-main
+      cancel-in-progress: false
     runs-on: [self-hosted, macOS]
     timeout-minutes: 120
     env:
