@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    # Weekly stress gate. -count=10 takes tens of minutes, so it is not on
+    # every push; a release must have a green run (workflow_dispatch) first.
+    - cron: "30 3 * * 1"
 
 permissions:
   contents: read
@@ -46,6 +50,31 @@ jobs:
           if-no-files-found: warn
       - name: race
         run: go test -race -count=1 ./...
+      - name: cleanup go cache
+        if: always()
+        run: go clean -cache || true
+
+  stress:
+    # The release gate: ten repetitions of the packages that carry leases,
+    # bounds, and replay/hash state. Scheduled weekly and runnable by hand
+    # before a tag; a single green run must be attached to the phase evidence.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 120
+    env:
+      KEEL_BOARD_TEST_DSN: postgres://kzf@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: postgres
+        run: |
+          command -v pg_isready >/dev/null 2>&1 || export PATH="/opt/homebrew/bin:$PATH"
+          pg_isready -h 127.0.0.1 -p 5432
+      - name: stress (-count=10)
+        run: go test -count=10 ./store ./log ./syncstore ./automation ./conformance
       - name: cleanup go cache
         if: always()
         run: go clean -cache || true
