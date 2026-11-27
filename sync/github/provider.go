@@ -290,7 +290,7 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 // GitHub accepts at most MaxCommentLength characters; a longer board message is
 // cut at a rune boundary with an ellipsis rather than failing delivery.
 func (p *Provider) commentBody(key boardsync.Key, thread boardsync.ThreadRef, msg boardsync.OutboundMessage) string {
-	body := boardsync.StorableText(msg.Markdown, boardsync.MaxTextBytes)
+	body := nativeMentions(boardsync.StorableText(msg.Markdown, boardsync.MaxTextBytes), key)
 	if p.cfg.DisableMarker {
 		return clampComment(body, MaxCommentLength)
 	}
@@ -412,7 +412,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 			return nil, err
 		}
 		return &boardsync.RootDraft{
-			Text:   boardsync.StorableText(fmt.Sprintf("Issue #%d: %s\n%s\n\n%s", item.Number, item.Title, item.HTMLURL, item.Body), boardsync.MaxTextBytes),
+			Text:   boardsync.StorableText(fmt.Sprintf("Issue #%d: %s\n%s\n\n%s", item.Number, item.Title, item.HTMLURL, boardMentions(item.Body, key)), boardsync.MaxTextBytes),
 			Labels: issueLabels(&item, repo),
 			Author: authorOf(item.User),
 		}, nil
@@ -422,7 +422,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 		return nil, err
 	}
 	return &boardsync.RootDraft{
-		Text:   boardsync.StorableText(fmt.Sprintf("PR #%d: %s\n%s\n\n%s", pr.Number, pr.Title, pr.HTMLURL, pr.Body), boardsync.MaxTextBytes),
+		Text:   boardsync.StorableText(fmt.Sprintf("PR #%d: %s\n%s\n\n%s", pr.Number, pr.Title, pr.HTMLURL, boardMentions(pr.Body, key)), boardsync.MaxTextBytes),
 		Labels: prLabels(&pr, repo),
 		Author: authorOf(pr.User),
 	}, nil

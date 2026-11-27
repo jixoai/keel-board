@@ -502,6 +502,28 @@ func TestPostComment(t *testing.T) {
 	}
 }
 
+func TestPostLeavesBoardMentionsAsLiteralText(t *testing.T) {
+	var variables map[string]any
+	server := graphServer(t, func(_ string, vars map[string]any) any {
+		variables = vars
+		return map[string]any{"commentCreate": map[string]any{"success": true, "comment": map[string]any{"id": "comment-9"}}}
+	})
+	defer server.Close()
+	p := newProvider(t, server.URL)
+	target := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID,
+		Kind: boardsync.TargetThread}
+	// Linear's API renders a mention from a profile URL, and this adapter has
+	// no workspace slug to build one. A literal token notifies no one, which is
+	// the safe fallback; inventing @name would ping whoever holds that name.
+	body := "hi @[linear:user:" + testIssueID + "] and @[slack:user:U1]"
+	if _, err := p.Post(context.Background(), "linear", target, boardsync.OutboundMessage{Markdown: body}); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+	if variables["body"] != body {
+		t.Fatalf("linear rewrote mentions: %q", variables["body"])
+	}
+}
+
 func TestPostCreateIssue(t *testing.T) {
 	var queries []string
 	server := graphServer(t, func(q string, vars map[string]any) any {

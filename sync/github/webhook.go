@@ -104,7 +104,7 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery, eventName strin
 			event.Context = sanitizeContext(comment.Path)
 		}
 	}
-	text := boardsync.StripMarker(comment.Body)
+	text := boardMentions(boardsync.StripMarker(comment.Body), key)
 	if text == "" {
 		text = "(no text)"
 	}
@@ -154,7 +154,7 @@ func (p *Provider) normalizePullRequest(key boardsync.Key, delivery string, body
 		Type:   "pr." + pl.Action,
 		Title:  storableTitle("PR #%d: %s", pr.Number, pr.Title),
 		URL:    pr.HTMLURL,
-		Body:   boardsync.StorableText(pr.Body, boardsync.MaxTextBytes),
+		Body:   boardsync.StorableText(boardMentions(pr.Body, key), boardsync.MaxTextBytes),
 		Labels: labels,
 		Owns:   ownedBy(pr.Labels, pr.Assignees),
 	}
@@ -234,7 +234,7 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 		Type:   "issue." + pl.Action,
 		Title:  storableTitle("Issue #%d: %s", item.Number, item.Title),
 		URL:    item.HTMLURL,
-		Body:   boardsync.StorableText(item.Body, boardsync.MaxTextBytes),
+		Body:   boardsync.StorableText(boardMentions(item.Body, key), boardsync.MaxTextBytes),
 		Labels: labels,
 		Owns:   ownedBy(item.Labels, item.Assignees),
 	}
@@ -290,7 +290,7 @@ func (p *Provider) normalizeReview(key boardsync.Key, delivery string, body []by
 			return nil, nil
 		}
 		if pl.Review.Body != "" {
-			lifecycle.Reply += "\n\n" + pl.Review.Body
+			lifecycle.Reply += "\n\n" + boardMentions(pl.Review.Body, key)
 		}
 		lifecycle.Reply = boardsync.StorableText(lifecycle.Reply, boardsync.MaxTextBytes)
 	default:
