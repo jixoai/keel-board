@@ -44,6 +44,9 @@ jobs:
         run: go run ./scripts/e2e -report-dir "$RUNNER_TEMP/keel-e2e"
       - name: upload e2e report
         if: always()
+        # A GitHub artifact-upload outage must not hide a green test/race run;
+        # the report is also kept in the job log and the evidence bundle.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: keel-e2e-report
