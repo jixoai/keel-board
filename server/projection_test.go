@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -266,7 +267,7 @@ func TestProjectionRebuildClassifiesBrokenLogs(t *testing.T) {
 	valid := func(seq uint64) store.Record {
 		return store.Record{
 			Seq: seq, Type: string(log.EventMessagePosted), Channel: "work",
-			Payload: []byte(`{"id":` + string(rune('0'+seq)) + `,"channel":"work","text":"one","thread":"1","labels":{},"by":{"actor":"local:user:alice","principal":"local:user:alice"}}`),
+			Payload: []byte(fmt.Sprintf(`{"id":%d,"channel":"work","text":"one","thread":"1","labels":{},"by":{"actor":"local:user:alice","principal":"local:user:alice"}}`, seq)),
 		}
 	}
 	cases := []struct {
