@@ -185,6 +185,7 @@ func TestPostgresInconsistentHeadRejectsWrites(t *testing.T) {
 	conn := connectPGTestSchema(t, dsn, schema)
 	board := newProjectionBoard(events)
 	message := appendProjectionMessage(t, board, "default", "one")
+	corruptProjection(t, board, "default", message)
 
 	// Move the head row without an event: the store must refuse to extend the
 	// log.
@@ -217,13 +218,21 @@ func TestPostgresInconsistentHeadRejectsWrites(t *testing.T) {
 	if _, err := board.Rebuild(t.Context(), "default"); !errors.Is(err, store.ErrLogInconsistent) {
 		t.Fatalf("rebuild over a mismatched head: %v", err)
 	}
-	if text := messageText(t, board, "default", message); text != "one" {
+	if text := messageText(t, board, "default", message); text != "corrupted" {
 		t.Fatalf("the refused rebuild replaced the cache: %q", text)
 	}
 
-	// Restoring the head makes writes work again without losing the event.
+	// Restoring the head makes a rebuild work again, and it repairs the
+	// deliberately corrupted cache.
 	if _, err := conn.Exec(t.Context(), `UPDATE board_heads SET seq = 1 WHERE tenant_id = $1`, "default"); err != nil {
 		t.Fatalf("restoring the head: %v", err)
+	}
+	rebuilt, err := board.Rebuild(t.Context(), "default")
+	if err != nil || !rebuilt.Consistent {
+		t.Fatalf("rebuild after restore: %+v, %v", rebuilt, err)
+	}
+	if text := messageText(t, board, "default", message); text != "one" {
+		t.Fatalf("the repaired cache is %q", text)
 	}
 	appendProjectionMessage(t, board, "default", "two")
 	if got := recordCount(t, events, "default"); got != 2 {
@@ -237,8 +246,9 @@ func TestPostgresMissingTailRejectsWrites(t *testing.T) {
 	events := openPGTestStore(t, dsn, schema)
 	conn := connectPGTestSchema(t, dsn, schema)
 	board := newProjectionBoard(events)
-	appendProjectionMessage(t, board, "default", "one")
+	message := appendProjectionMessage(t, board, "default", "one")
 	appendProjectionMessage(t, board, "default", "two")
+	corruptProjection(t, board, "default", message)
 
 	// Remove the newest event; the head row now names a seq the log lacks.
 	if _, err := conn.Exec(t.Context(), `DELETE FROM board_events WHERE tenant_id = $1 AND seq = 2`, "default"); err != nil {
@@ -261,6 +271,63 @@ func TestPostgresMissingTailRejectsWrites(t *testing.T) {
 	}
 	if report.Consistent || !hasProblem(report, "head row") {
 		t.Fatalf("the check should name the missing tail: %+v", report)
+	}
+	if _, err := board.Rebuild(t.Context(), "default"); !errors.Is(err, store.ErrLogInconsistent) {
+		t.Fatalf("rebuild over a missing tail: %v", err)
+	}
+	if text := messageText(t, board, "default", message); text != "corrupted" {
+		t.Fatalf("the refused rebuild replaced the cache: %q", text)
+	}
+}
+
+func TestPostgresIntegrityDirections(t *testing.T) {
+	dsn := pgTestDSN(t)
+	schema := newPGTestSchema(t, dsn)
+	events := openPGTestStore(t, dsn, schema)
+	conn := connectPGTestSchema(t, dsn, schema)
+	board := newProjectionBoard(events)
+
+	for _, tc := range []struct {
+		tenant string
+		tamper string
+	}{
+		{"behind", `UPDATE board_heads SET seq = 0 WHERE tenant_id = $1`},
+		{"missing", `DELETE FROM board_heads WHERE tenant_id = $1`},
+	} {
+		t.Run(tc.tenant, func(t *testing.T) {
+			message := appendProjectionMessage(t, board, tc.tenant, "one")
+			if _, err := conn.Exec(t.Context(), tc.tamper, tc.tenant); err != nil {
+				t.Fatalf("tampering: %v", err)
+			}
+			integrity, err := events.Integrity(t.Context(), tc.tenant)
+			if err != nil {
+				t.Fatalf("integrity: %v", err)
+			}
+			if integrity.Head != 0 || integrity.MaxSeq != 1 || integrity.Consistent() {
+				t.Fatalf("integrity after %s: %+v", tc.tenant, integrity)
+			}
+			report, err := board.CheckProjection(t.Context(), tc.tenant)
+			if err != nil {
+				t.Fatalf("check: %v", err)
+			}
+			if report.Consistent || !hasProblem(report, "head row") {
+				t.Fatalf("the check should name the %s head: %+v", tc.tenant, report)
+			}
+			err = board.Update(t.Context(), tc.tenant, UpdateOptions{}, func(tx *Tx) error {
+				id := tx.NextID(0)
+				tx.Emit(EventMessagePosted, &MessagePostedPayload{
+					ID: id, Channel: "work", Text: "refused", Thread: ThreadKey(id),
+					By: projectionAuthor, Labels: map[string]string{},
+				})
+				return nil
+			})
+			if !errors.Is(err, store.ErrLogInconsistent) {
+				t.Fatalf("a write with a %s head: %v", tc.tenant, err)
+			}
+			if text := messageText(t, board, tc.tenant, message); text != "one" {
+				t.Fatalf("the cache changed after a refused write: %q", text)
+			}
+		})
 	}
 }
 

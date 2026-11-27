@@ -138,6 +138,55 @@ func recordCount(t *testing.T, events store.EventStore, tenant string) int {
 	return len(records)
 }
 
+// headOnlyStore implements EventStore and HeadStore but not IntegrityStore,
+// as a third-party store may. Its head is the log's length.
+type headOnlyStore struct {
+	events *store.Memory
+}
+
+func (s *headOnlyStore) Load(ctx context.Context, tenant string) ([]store.Record, error) {
+	return s.events.Load(ctx, tenant)
+}
+
+func (s *headOnlyStore) Append(ctx context.Context, tenant string, records []store.Record, expectedHead uint64) (store.AppendResult, error) {
+	return s.events.Append(ctx, tenant, records, expectedHead)
+}
+
+func (s *headOnlyStore) Head(ctx context.Context, tenant string) (uint64, error) {
+	integrity, err := s.events.Integrity(ctx, tenant)
+	if err != nil {
+		return 0, err
+	}
+	return integrity.Head, nil
+}
+
+// TestProjectionWithHeadStoreOnly proves a store without IntegrityStore isn't
+// reported as corrupt just because it can't answer a separate MaxSeq.
+func TestProjectionWithHeadStoreOnly(t *testing.T) {
+	ctx := context.Background()
+	events := &headOnlyStore{events: store.NewMemory()}
+	board := newProjectionBoard(events)
+	seedProjection(t, board, "default")
+
+	report, err := board.CheckProjection(ctx, "default")
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !report.Consistent {
+		t.Fatalf("a head-only store's projection should be consistent: %+v", report)
+	}
+	if report.HeadRow != report.LogHead || report.HeadRow == 0 {
+		t.Fatalf("head-only watermarks: %+v", report)
+	}
+	rebuilt, err := board.Rebuild(ctx, "default")
+	if err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if !rebuilt.Consistent || rebuilt.Digest != report.Digest {
+		t.Fatalf("rebuild over a head-only store: %+v", rebuilt)
+	}
+}
+
 func TestProjectionDigestMatchesReplay(t *testing.T) {
 	ctx := context.Background()
 	events := store.NewMemory()
@@ -176,6 +225,139 @@ func TestProjectionDigestMatchesReplay(t *testing.T) {
 	}
 	if corrupt.Consistent || corrupt.Digest == corrupt.ReplayDigest {
 		t.Fatalf("corruption wasn't detected: %+v", corrupt)
+	}
+}
+
+// projectionFixture folds the seeded log into a fresh state.
+func projectionFixture(t *testing.T) (*State, uint64, uint64) {
+	t.Helper()
+	events := store.NewMemory()
+	board := newProjectionBoard(events)
+	root, reply := seedProjection(t, board, "default")
+	records, err := events.Load(context.Background(), "default")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	state, err := foldRecords(records, ^uint64(0))
+	if err != nil {
+		t.Fatalf("fold: %v", err)
+	}
+	return state, root, reply
+}
+
+// digestState hashes a fixture and fails on an encoding error.
+func digestState(t *testing.T, state *State) string {
+	t.Helper()
+	digest, err := ProjectionDigest(state)
+	if err != nil {
+		t.Fatalf("digest: %v", err)
+	}
+	return digest
+}
+
+// TestProjectionDigestCoversEachField proves omitting any projection field
+// from the digest would be caught: every mutation changes the hash.
+func TestProjectionDigestCoversEachField(t *testing.T) {
+	base, _, _ := projectionFixture(t)
+	want := digestState(t, base)
+
+	cases := []struct {
+		name   string
+		mutate func(*State, uint64, uint64)
+	}{
+		{"head", func(state *State, _ uint64, _ uint64) { state.Head++ }},
+		{"replies", func(state *State, root, _ uint64) {
+			state.Replies[root] = state.Replies[root][:len(state.Replies[root])-1]
+		}},
+		{"channels", func(state *State, _ uint64, _ uint64) { state.Channels["work"].Messages++ }},
+		{"actors", func(state *State, _ uint64, _ uint64) {
+			state.Actors[projectionAuthor.Actor].Name = "changed"
+		}},
+		{"by-handle", func(state *State, _ uint64, _ uint64) {
+			state.ByHandle["alice"] = append(state.ByHandle["alice"], "local:user:other")
+		}},
+		{"labels", func(state *State, root, _ uint64) { state.Messages[root].Labels["step"] = "changed" }},
+		{"reactions", func(state *State, root, _ uint64) {
+			state.Messages[root].Reactions["thumbs_up"] = append(state.Messages[root].Reactions["thumbs_up"], "local:user:bob")
+		}},
+		{"message-channel", func(state *State, root, _ uint64) { state.Messages[root].Channel = "other" }},
+		{"message-thread", func(state *State, root, _ uint64) { state.Messages[root].Thread = "other" }},
+		{"message-by", func(state *State, root, _ uint64) { state.Messages[root].By.Actor = "local:user:other" }},
+		{"message-version", func(state *State, root, _ uint64) { state.Messages[root].Version++ }},
+		{"message-deleted", func(state *State, root, _ uint64) { state.Messages[root].Deleted = true }},
+		{"task-state", func(state *State, root, _ uint64) { state.Messages[root].Task.State = "blocked" }},
+		{"task-owner", func(state *State, root, _ uint64) { state.Messages[root].Task.Owner = "local:user:other" }},
+		{"task-needs", func(state *State, root, _ uint64) { state.Messages[root].Task.Needs = []uint64{99} }},
+		{"task-for", func(state *State, root, _ uint64) {
+			forActor := "local:user:alice+bot"
+			state.Messages[root].Task.For = &forActor
+		}},
+		{"task-epoch", func(state *State, root, _ uint64) { state.Messages[root].Task.Epoch++ }},
+		{"task-result", func(state *State, root, _ uint64) {
+			result := "done"
+			state.Messages[root].Task.Result = &result
+		}},
+		{"task-reason", func(state *State, root, _ uint64) {
+			reason := "because"
+			state.Messages[root].Task.Reason = &reason
+		}},
+		{"task-blocked", func(state *State, root, _ uint64) {
+			state.Messages[root].Task.Blocked = &Hold{Reason: "held"}
+		}},
+		{"claim-actor", func(state *State, root, _ uint64) { state.Messages[root].Task.Claim.Actor = "local:user:other" }},
+		{"claim-token", func(state *State, root, _ uint64) { state.Messages[root].Task.Claim.TokenHash = "changed" }},
+		{"claim-until", func(state *State, root, _ uint64) {
+			state.Messages[root].Task.Claim.Until = state.Messages[root].Task.Claim.Until.Add(time.Second)
+		}},
+		{"attachments", func(state *State, root, _ uint64) {
+			state.Messages[root].Attachments = []protocol.Attachment{{ID: "file", Name: "file.txt", Type: "text/plain", Size: 1}}
+		}},
+		{"origin", func(state *State, root, _ uint64) {
+			state.Messages[root].Origin = &MessageOrigin{Channel: "c", Message: "m"}
+		}},
+		{"sync", func(state *State, root, _ uint64) {
+			state.Messages[root].Sync = &SyncState{Threads: []SyncTarget{{Key: "k", Platform: "slack", Channel: "c"}}}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state, root, reply := projectionFixture(t)
+			tc.mutate(state, root, reply)
+			if got := digestState(t, state); got == want {
+				t.Fatalf("changing %s didn't change the digest %s", tc.name, got)
+			}
+		})
+	}
+}
+
+// TestProjectionDigestTimeZoneInsensitive proves the same instant in two
+// zones hashes the same, while a different instant doesn't.
+func TestProjectionDigestTimeZoneInsensitive(t *testing.T) {
+	instant := time.Date(2026, 2, 3, 4, 5, 6, 123456000, time.UTC)
+	zone := time.FixedZone("UTC+8", 8*60*60)
+
+	first, firstRoot, _ := projectionFixture(t)
+	first.Messages[firstRoot].CreatedAt = instant.UTC()
+	first.Messages[firstRoot].EditedAt = &instant
+	first.Messages[firstRoot].Task.Claim.Until = instant
+
+	second, secondRoot, _ := projectionFixture(t)
+	local := instant.In(zone)
+	second.Messages[secondRoot].CreatedAt = local
+	second.Messages[secondRoot].EditedAt = &local
+	second.Messages[secondRoot].Task.Claim.Until = local
+
+	if a, b := digestState(t, first), digestState(t, second); a != b {
+		t.Fatalf("the same instant in two zones hashed differently: %s vs %s", a, b)
+	}
+
+	later := instant.Add(time.Second)
+	third, thirdRoot, _ := projectionFixture(t)
+	third.Messages[thirdRoot].CreatedAt = later
+	third.Messages[thirdRoot].EditedAt = &later
+	third.Messages[thirdRoot].Task.Claim.Until = later
+	if digestState(t, third) == digestState(t, first) {
+		t.Fatal("a different instant should change the digest")
 	}
 }
 
@@ -533,4 +715,85 @@ func hasProblem(report ProjectionReport, want string) bool {
 		}
 	}
 	return false
+}
+
+// blockingStore blocks one Load until released, to prove a rebuild doesn't
+// hold the board lock while the log is read.
+type blockingStore struct {
+	*store.Memory
+	block   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingStore) Load(ctx context.Context, tenant string) ([]store.Record, error) {
+	if s.block.CompareAndSwap(true, false) {
+		close(s.entered)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.Memory.Load(ctx, tenant)
+}
+
+func TestRebuildDoesNotHoldTheBoardLockWhileLoading(t *testing.T) {
+	ctx := context.Background()
+	events := &blockingStore{
+		Memory:  store.NewMemory(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	board := newProjectionBoard(events)
+	appendProjectionMessage(t, board, "default", "before")
+
+	events.block.Store(true)
+	rebuilt := make(chan error, 1)
+	go func() {
+		_, err := board.Rebuild(ctx, "default")
+		rebuilt <- err
+	}()
+	select {
+	case <-events.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the rebuild never reached its load")
+	}
+
+	// The load is blocked; a write must still get the board lock.
+	written := make(chan error, 1)
+	go func() {
+		written <- board.Update(ctx, "default", UpdateOptions{}, func(tx *Tx) error {
+			id := tx.NextID(0)
+			tx.Emit(EventMessagePosted, &MessagePostedPayload{
+				ID: id, Channel: "work", Text: "during", Thread: ThreadKey(id),
+				By: projectionAuthor, Labels: map[string]string{},
+			})
+			return nil
+		})
+	}()
+	select {
+	case err := <-written:
+		if err != nil {
+			t.Fatalf("write during rebuild: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(events.release)
+		t.Fatal("a rebuild held the board lock while loading the log")
+	}
+	close(events.release)
+	if err := <-rebuilt; err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+
+	report, err := board.CheckProjection(ctx, "default")
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if !report.Consistent || report.LogHead != 2 {
+		t.Fatalf("the rebuild lost the concurrent write: %+v", report)
+	}
+	if got := recordCount(t, events, "default"); got != 2 {
+		t.Fatalf("events after the rebuild: %d", got)
+	}
 }

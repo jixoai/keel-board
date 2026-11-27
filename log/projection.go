@@ -178,8 +178,13 @@ func (b *Board) CheckProjection(ctx context.Context, tenantName string) (Project
 	return analyzeProjection(tenant, current.state, records, integrity), nil
 }
 
+// projectionRebuildTimeout bounds one rebuild's store reads and catch-up, so
+// a hung store can't hold the board's lock indefinitely.
+const projectionRebuildTimeout = 5 * time.Minute
+
 // Rebuild replaces a tenant's projection with a replay of its durable log. It
-// loads and folds the log before touching the live cache, so a failed or
+// loads and folds the log outside the board lock, then takes the lock only to
+// catch up what landed meanwhile, verify the log, and swap. A failed or
 // interrupted rebuild leaves the old projection serving; a retry is safe.
 // Events are never written or deleted, a repeated rebuild is idempotent, and
 // the cache's pointer is kept so feeds waiting on it wake to the new state.
@@ -187,13 +192,9 @@ func (b *Board) Rebuild(ctx context.Context, tenantName string) (ProjectionRepor
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	current, err := b.ensure(ctx, tenantName)
-	if err != nil {
-		return ProjectionReport{}, err
-	}
+	ctx, cancel := context.WithTimeout(ctx, projectionRebuildTimeout)
+	defer cancel()
 	tenant := normalizeTenant(tenantName)
-	b.mu.Lock()
-	defer b.mu.Unlock()
 
 	records, err := b.store.Load(ctx, tenant)
 	if err != nil {
@@ -201,13 +202,24 @@ func (b *Board) Rebuild(ctx context.Context, tenantName string) (ProjectionRepor
 	}
 	rebuilt := newTenant()
 	if err := rebuilt.apply(records); err != nil {
-		return ProjectionReport{}, err
+		problem := fmt.Sprintf("the log does not replay: %v", err)
+		return ProjectionReport{Tenant: tenant, Problems: []string{problem}},
+			fmt.Errorf("%w: %s", ErrLogInconsistent, problem)
 	}
-	// Hash before the swap: a projection that can't be hashed is not a
-	// rebuild we want to serve.
+	// Hash once before taking the lock: a projection that can't be hashed is
+	// not a rebuild we want to serve.
 	if _, err := ProjectionDigest(rebuilt.state); err != nil {
 		return ProjectionReport{}, err
 	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current := b.tenants[tenant]
+	if current == nil {
+		current = newTenant()
+		b.tenants[tenant] = current
+	}
+
 	integrity, err := b.integrityLocked(ctx, tenant)
 	if err != nil {
 		return ProjectionReport{}, err
@@ -221,16 +233,103 @@ func (b *Board) Rebuild(ctx context.Context, tenantName string) (ProjectionRepor
 		return report, fmt.Errorf("%w: %s", ErrLogInconsistent, strings.Join(report.Problems, "; "))
 	}
 
+	// Writes in this process were blocked while the log was loaded; catch up
+	// those (and any other process's) events before swapping. The target is
+	// fixed by the integrity read, so sustained writers can't keep this loop
+	// going past one observed head.
+	target := ^uint64(0)
+	if integrity != nil {
+		target = integrity.MaxSeq
+	}
+	tail, err := b.catchUpLocked(ctx, tenant, rebuilt, target)
+	if err != nil {
+		if errors.Is(err, ErrLogInconsistent) {
+			return ProjectionReport{Tenant: tenant, Problems: []string{err.Error()}}, err
+		}
+		return ProjectionReport{}, err
+	}
+	records = append(records, tail...)
+	if integrity != nil && rebuilt.state.Head < integrity.MaxSeq {
+		report := analyzeProjection(tenant, current.state, records, integrity)
+		return report, fmt.Errorf("%w: the log ends at #%d but the head row names #%d",
+			ErrLogInconsistent, rebuilt.state.Head, integrity.MaxSeq)
+	}
+
+	digest, err := ProjectionDigest(rebuilt.state)
+	if err != nil {
+		return ProjectionReport{}, err
+	}
 	current.state = rebuilt.state
 	current.events = rebuilt.events
 	current.idem = rebuilt.idem
 	current.active = rebuilt.active
 	// Force the next read to compare with the store: an event another process
-	// wrote after this Load is caught up rather than hidden by freshness.
+	// wrote after the integrity read is caught up rather than hidden by
+	// freshness.
 	current.checked = time.Time{}
 	current.wake()
 
-	return analyzeProjection(tenant, current.state, records, integrity), nil
+	return rebuiltReport(tenant, current.state, records, integrity, digest), nil
+}
+
+// catchUpLocked folds events after a rebuilt state's head, through target
+// (^uint64(0) means until the store has no more), and returns the records it
+// folded. The caller holds the board lock; target bounds the work.
+func (b *Board) catchUpLocked(ctx context.Context, tenant string, rebuilt *tenant, target uint64) ([]store.Record, error) {
+	const page = 1000
+	var tail []store.Record
+	for rebuilt.state.Head < target {
+		records, err := b.recordsAfter(ctx, tenant, rebuilt.state.Head, page)
+		if err != nil {
+			return tail, err
+		}
+		if len(records) == 0 {
+			return tail, nil
+		}
+		if err := rebuilt.apply(records); err != nil {
+			return tail, fmt.Errorf("%w: the log does not replay: %v", ErrLogInconsistent, err)
+		}
+		tail = append(tail, records...)
+		if len(records) < page {
+			return tail, nil
+		}
+	}
+	return tail, nil
+}
+
+// rebuiltReport builds a rebuild's report from the state just installed. The
+// replay, the projection and the whole log are the same state, so one digest
+// covers all three; validateLog still checks the records are contiguous.
+func rebuiltReport(tenant string, state *State, records []store.Record, integrity *store.Integrity, digest string) ProjectionReport {
+	report := ProjectionReport{
+		Tenant:         tenant,
+		LogHead:        state.Head,
+		HeadRow:        state.Head,
+		ProjectionHead: state.Head,
+		Digest:         digest,
+		ReplayDigest:   digest,
+		StoreDigest:    digest,
+	}
+	addProblem := func(format string, args ...any) {
+		report.Problems = append(report.Problems, fmt.Sprintf(format, args...))
+	}
+
+	logHead, logErr := validateLog(records)
+	report.LogHead = logHead
+	if logErr != nil {
+		addProblem("%v", logErr)
+	}
+	if integrity != nil {
+		report.HeadRow = integrity.Head
+		if !integrity.Consistent() {
+			addProblem("the store's head row is #%d but its newest event is #%d", integrity.Head, integrity.MaxSeq)
+		}
+	}
+	if state.Head != logHead {
+		addProblem("the rebuilt projection is at #%d but the log ends at #%d", state.Head, logHead)
+	}
+	report.Consistent = len(report.Problems) == 0
+	return report
 }
 
 // integrityLocked reads the store's durable head facts, when it reports them.
@@ -247,7 +346,10 @@ func (b *Board) integrityLocked(ctx context.Context, tenant string) (*store.Inte
 		if err != nil {
 			return nil, err
 		}
-		return &store.Integrity{Head: head}, nil
+		// A head-only store has no separate log-end query, so its head is the
+		// best end it can report. Leaving MaxSeq zero would claim every
+		// non-empty log is corrupt.
+		return &store.Integrity{Head: head, MaxSeq: head}, nil
 	}
 	return nil, nil
 }
