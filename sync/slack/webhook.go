@@ -489,27 +489,31 @@ var (
 // broadcasts. Slack's *bold*, _italic_, and ~strike~ are left as written;
 // a full converter belongs in the adapter, not in the board.
 func mrkdwnToMarkdown(key boardsync.Key, text string) string {
-	// Parse Slack's real markup first, then unescape what is left. Unescaping
-	// first would turn an escaped &lt;!channel&gt; inside code into a mention.
-	text = userMention.ReplaceAllStringFunc(text, func(match string) string {
-		parts := userMention.FindStringSubmatch(match)
-		return "@[" + string(key) + ":user:" + parts[1] + "]"
+	// Parse Slack's real markup in prose only: a token inside an inline code
+	// span or a fence is literal text, not a mention, link, or broadcast.
+	// Unescape after the prose pass, so an escaped &lt;!channel&gt; outside
+	// code still becomes literal text rather than a control.
+	text = boardsync.MapProse(text, func(prose string) string {
+		prose = userMention.ReplaceAllStringFunc(prose, func(match string) string {
+			parts := userMention.FindStringSubmatch(match)
+			return "@[" + string(key) + ":user:" + parts[1] + "]"
+		})
+		prose = channelMention.ReplaceAllStringFunc(prose, func(match string) string {
+			parts := channelMention.FindStringSubmatch(match)
+			if len(parts) > 2 && parts[2] != "" {
+				return "#" + parts[2]
+			}
+			return "#" + parts[1]
+		})
+		prose = slackLink.ReplaceAllStringFunc(prose, func(match string) string {
+			parts := slackLink.FindStringSubmatch(match)
+			if len(parts) > 2 && parts[2] != "" {
+				return "[" + parts[2] + "](" + parts[1] + ")"
+			}
+			return parts[1]
+		})
+		return slackBroadcast.ReplaceAllString(prose, "@$1")
 	})
-	text = channelMention.ReplaceAllStringFunc(text, func(match string) string {
-		parts := channelMention.FindStringSubmatch(match)
-		if len(parts) > 2 && parts[2] != "" {
-			return "#" + parts[2]
-		}
-		return "#" + parts[1]
-	})
-	text = slackLink.ReplaceAllStringFunc(text, func(match string) string {
-		parts := slackLink.FindStringSubmatch(match)
-		if len(parts) > 2 && parts[2] != "" {
-			return "[" + parts[2] + "](" + parts[1] + ")"
-		}
-		return parts[1]
-	})
-	text = slackBroadcast.ReplaceAllString(text, "@$1")
 	text = html.UnescapeString(text)
 	return cleanText(strings.TrimSpace(text))
 }
