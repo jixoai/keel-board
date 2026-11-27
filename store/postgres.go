@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io/fs"
 	"sort"
 	"strings"
@@ -81,9 +82,22 @@ func (p *Postgres) Close() {
 	p.pool.Close()
 }
 
+// defaultMigrationLockID names the advisory lock when a connection has no
+// current schema.
+const defaultMigrationLockID int64 = 0x6b65656c5f626f61
+
 // migrationLockID names the advisory lock a process holds while it applies
-// migrations, so two servers starting together don't race the schema.
-const migrationLockID int64 = 0x6b65656c5f626f61
+// migrations. It is derived from the current schema: two servers on the same
+// schema serialize, while test schemas (or tenants of one database confined by
+// search_path) migrate in parallel.
+func migrationLockID(schema string) int64 {
+	if schema == "" {
+		return defaultMigrationLockID
+	}
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(schema))
+	return int64(hash.Sum64())
+}
 
 // ApplyMigrations applies the embedded schema through pool. It is the same
 // run OpenPostgres performs, exported for a package that owns its own pool
@@ -121,10 +135,15 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("store: reserving a migration connection: %w", err)
 	}
 	defer conn.Release()
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, migrationLockID); err != nil {
+	var schema string
+	if err := conn.QueryRow(ctx, `SELECT COALESCE(current_schema(), '')`).Scan(&schema); err != nil {
+		return fmt.Errorf("store: reading the migration schema: %w", err)
+	}
+	lockID := migrationLockID(schema)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
 		return fmt.Errorf("store: taking the migration lock: %w", err)
 	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, migrationLockID)
+	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID)
 	for _, name := range names {
 		statement, err := migrations.ReadFile("migrations/" + name)
 		if err != nil {
@@ -305,11 +324,13 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 			return AppendResult{}, err
 		}
 	case errors.Is(err, pgx.ErrNoRows):
-		if expectedHead != 0 {
-			return AppendResult{}, ErrHeadMoved
-		}
+		// Check for events before deciding this is a new tenant: no head row
+		// with events is corruption, even when the caller expected a head.
 		if err := ensureEmptyLog(ctx, tx, tenant); err != nil {
 			return AppendResult{}, err
+		}
+		if expectedHead != 0 {
+			return AppendResult{}, ErrHeadMoved
 		}
 		err = tx.QueryRow(ctx, `
 			INSERT INTO board_heads (tenant_id, seq, version)
