@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -35,6 +36,12 @@ var ErrHeadMoved = errors.New("store: the log moved on")
 // ErrDuplicateRequest is returned by an append whose request key already
 // landed with another digest: 409 duplicate_id to the caller.
 var ErrDuplicateRequest = errors.New("store: the request key was used for another write")
+
+// ErrLogInconsistent is returned by a store whose head row and event log
+// disagree: the head names a seq the log doesn't end at. A write refuses to
+// extend such a log, and a projection rebuild cannot repair it; the log or the
+// head row must be restored first.
+var ErrLogInconsistent = errors.New("store: the log's head and events disagree")
 
 // ErrInvalidPayload is returned by an append whose payload isn't a JSON value
 // the stores can hold, or contains a NUL.
@@ -135,6 +142,33 @@ type Waiter interface {
 // without appending.
 type RequestStore interface {
 	Request(ctx context.Context, tenant, key string) (Request, bool, error)
+}
+
+// Integrity is a log's durable consistency facts. A healthy log has Head (its
+// head row) equal to MaxSeq (its newest event); a difference means an event or
+// a head update landed without the other.
+type Integrity struct {
+	// Head is the tenant's head row seq. A store without a head row reports
+	// the log's own head.
+	Head uint64
+	// MaxSeq is the tenant's newest event seq, or 0 for an empty log.
+	MaxSeq uint64
+}
+
+// Consistent reports whether the head row and the log end agree.
+func (i Integrity) Consistent() bool { return i.Head == i.MaxSeq }
+
+// IntegrityStore reports a tenant's durable consistency facts. It reads them
+// in one statement or snapshot, so a concurrent append cannot make Head and
+// MaxSeq describe different instants.
+type IntegrityStore interface {
+	Integrity(ctx context.Context, tenant string) (Integrity, error)
+}
+
+// TenantStore lists the tenants a store holds. It is for operations that
+// rebuild every projection: each tenant is rebuilt on its own.
+type TenantStore interface {
+	Tenants(ctx context.Context) ([]string, error)
 }
 
 // Memory is an in-process EventStore for tests and development. It keeps every
@@ -267,6 +301,27 @@ func (m *Memory) Request(_ context.Context, tenant, key string) (Request, bool, 
 	return Request{Digest: stored.digest, Result: copyResult(stored.result)}, true, nil
 }
 
+// Integrity implements IntegrityStore. The memory store has no separate head
+// row: its log's length is both.
+func (m *Memory) Integrity(_ context.Context, tenant string) (Integrity, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	head := uint64(len(m.byTenant[tenant]))
+	return Integrity{Head: head, MaxSeq: head}, nil
+}
+
+// Tenants implements TenantStore.
+func (m *Memory) Tenants(_ context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tenants := make([]string, 0, len(m.byTenant))
+	for tenant := range m.byTenant {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	return tenants, nil
+}
+
 // requestOf returns the key and digest a batch writes, if any. The log sets
 // them on the batch's first record.
 func requestOf(records []Record) (string, string) {
@@ -306,10 +361,12 @@ func copyRecords(records []Record) []Record {
 }
 
 var (
-	_ EventStore   = (*Memory)(nil)
-	_ HistoryStore = (*Memory)(nil)
-	_ Waiter       = (*Memory)(nil)
-	_ RequestStore = (*Memory)(nil)
+	_ EventStore     = (*Memory)(nil)
+	_ HistoryStore   = (*Memory)(nil)
+	_ Waiter         = (*Memory)(nil)
+	_ RequestStore   = (*Memory)(nil)
+	_ IntegrityStore = (*Memory)(nil)
+	_ TenantStore    = (*Memory)(nil)
 )
 
 // checkBatch verifies a batch's seqs start right after expectedHead and are

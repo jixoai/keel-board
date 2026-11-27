@@ -273,6 +273,12 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 	err = tx.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1 FOR UPDATE`, tenant).Scan(&current)
 	switch {
 	case err == nil:
+		// Check the log's own consistency before comparing the caller's head:
+		// a head row that names a seq the log doesn't hold is corruption, not
+		// a lost race, and must not be retried into.
+		if err := ensureLogEnd(ctx, tx, tenant, current); err != nil {
+			return AppendResult{}, err
+		}
 		if current != expectedHead {
 			// The head moved while this transaction waited. If it moved
 			// because this very key landed, answer a replay or a duplicate
@@ -301,6 +307,9 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 	case errors.Is(err, pgx.ErrNoRows):
 		if expectedHead != 0 {
 			return AppendResult{}, ErrHeadMoved
+		}
+		if err := ensureEmptyLog(ctx, tx, tenant); err != nil {
+			return AppendResult{}, err
 		}
 		err = tx.QueryRow(ctx, `
 			INSERT INTO board_heads (tenant_id, seq, version)
@@ -377,6 +386,86 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 		return AppendResult{}, err
 	}
 	return AppendResult{BatchResult: result}, nil
+}
+
+// ensureLogEnd refuses an append when the tenant's head row and its newest
+// event disagree. The caller holds the head row's lock, so no other writer can
+// move either half while this reads them.
+func ensureLogEnd(ctx context.Context, tx pgx.Tx, tenant string, head uint64) error {
+	var maxSeq uint64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(seq), 0) FROM board_events WHERE tenant_id = $1`, tenant).Scan(&maxSeq); err != nil {
+		return err
+	}
+	if maxSeq != head {
+		return fmt.Errorf("%w: head #%d, newest event #%d", ErrLogInconsistent, head, maxSeq)
+	}
+	return nil
+}
+
+// ensureEmptyLog refuses to create a tenant's head when events already exist.
+// The first SELECT may miss a head row another writer commits before the MAX
+// read (READ COMMITTED gives each statement its own snapshot), so a re-read
+// that finds the row is a lost race, not a corrupt log.
+func ensureEmptyLog(ctx context.Context, tx pgx.Tx, tenant string) error {
+	var maxSeq uint64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(seq), 0) FROM board_events WHERE tenant_id = $1`, tenant).Scan(&maxSeq); err != nil {
+		return err
+	}
+	if maxSeq == 0 {
+		return nil
+	}
+	var seq uint64
+	err := tx.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1`, tenant).Scan(&seq)
+	switch {
+	case err == nil:
+		return ErrHeadMoved
+	case errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("%w: no head row, newest event #%d", ErrLogInconsistent, maxSeq)
+	default:
+		return err
+	}
+}
+
+// Integrity implements IntegrityStore in one statement, so the head row and
+// the log end are read at one snapshot.
+func (p *Postgres) Integrity(ctx context.Context, tenant string) (Integrity, error) {
+	var integrity Integrity
+	if err := p.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE((SELECT seq FROM board_heads WHERE tenant_id = $1), 0),
+			COALESCE((SELECT MAX(seq) FROM board_events WHERE tenant_id = $1), 0)`,
+		tenant).Scan(&integrity.Head, &integrity.MaxSeq); err != nil {
+		return Integrity{}, err
+	}
+	return integrity, nil
+}
+
+// Tenants implements TenantStore over both the head rows and the log, so a
+// tenant whose head row is missing is still offered to a rebuild.
+func (p *Postgres) Tenants(ctx context.Context) ([]string, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT tenant_id FROM board_heads
+		UNION
+		SELECT tenant_id FROM board_events
+		ORDER BY tenant_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tenants := make([]string, 0)
+	for rows.Next() {
+		var tenant string
+		if err := rows.Scan(&tenant); err != nil {
+			return nil, err
+		}
+		tenants = append(tenants, tenant)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return tenants, nil
 }
 
 // Request implements RequestStore.
@@ -457,9 +546,11 @@ func (p *Postgres) Wait(ctx context.Context, tenant string, after uint64) error 
 }
 
 var (
-	_ EventStore   = (*Postgres)(nil)
-	_ HistoryStore = (*Postgres)(nil)
-	_ HeadStore    = (*Postgres)(nil)
-	_ Waiter       = (*Postgres)(nil)
-	_ RequestStore = (*Postgres)(nil)
+	_ EventStore     = (*Postgres)(nil)
+	_ HistoryStore   = (*Postgres)(nil)
+	_ HeadStore      = (*Postgres)(nil)
+	_ Waiter         = (*Postgres)(nil)
+	_ RequestStore   = (*Postgres)(nil)
+	_ IntegrityStore = (*Postgres)(nil)
+	_ TenantStore    = (*Postgres)(nil)
 )

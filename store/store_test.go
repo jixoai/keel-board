@@ -401,6 +401,48 @@ func storeContract(t *testing.T, open func(t *testing.T) store.EventStore) {
 			t.Fatal("wait ignored cancellation")
 		}
 	})
+
+	t.Run("integrity and tenants", func(t *testing.T) {
+		events := open(t)
+		ctx := context.Background()
+		integrity, ok := events.(store.IntegrityStore)
+		if !ok {
+			t.Fatalf("%T doesn't implement IntegrityStore", events)
+		}
+		tenants, ok := events.(store.TenantStore)
+		if !ok {
+			t.Fatalf("%T doesn't implement TenantStore", events)
+		}
+		empty, err := integrity.Integrity(ctx, "t1")
+		if err != nil {
+			t.Fatalf("empty integrity: %v", err)
+		}
+		if !empty.Consistent() || empty.Head != 0 || empty.MaxSeq != 0 {
+			t.Fatalf("empty integrity: %+v", empty)
+		}
+		mustAppend(t, events, "t1", 0, seqRecord(1, "event", `{"n":1}`))
+		mustAppend(t, events, "t1", 1, seqRecord(2, "event", `{"n":2}`))
+		got, err := integrity.Integrity(ctx, "t1")
+		if err != nil {
+			t.Fatalf("integrity: %v", err)
+		}
+		if !got.Consistent() || got.Head != 2 || got.MaxSeq != 2 {
+			t.Fatalf("integrity after appends: %+v", got)
+		}
+		names, err := tenants.Tenants(ctx)
+		if err != nil {
+			t.Fatalf("tenants: %v", err)
+		}
+		found := false
+		for _, name := range names {
+			if name == "t1" {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("tenants %v don't name t1", names)
+		}
+	})
 }
 
 // TestMemoryContract runs the store contract against the in-memory store.
