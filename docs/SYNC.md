@@ -25,7 +25,7 @@ worker daemon, and no live platform credential.
 | `sync/slack`: signature, webhook normalization (messages, edits, deletes, reactions, files, links), targets, post/edit/delete/react, files both ways, typing status, source read/join opt-in, channel lookup, permalink, root recovery | Implemented; Vercel deployment tables and full mrkdwn conversion are open |
 | `sync/github`: signature, delivery ID, repo and installation allowlists, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, viewer detection, root recovery, PR/issue/comment links | Implemented; reaction removal, review-thread URL variants beyond `#discussion_r`/`#r`, and review-conversation resolution are open |
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery, source reads (team/project/issue), permalinks, outbound labels/state/properties | Implemented and tested; non-issue comment payloads are ignored, links (`Locate`/`URL`) and reaction removal are open |
-| `sync/chatsdk`: generic webhook + send bridge, HMAC verifier, optional edit/delete/react/root/link hooks | Implemented bridge; no concrete third-party Chat SDK adapter is bundled |
+| `sync/chatsdk`: signed HTTP bridge v1, HMAC/nonce/timestamp, self identity, inbound batch intake, resolve/deliver client, optional edit/delete/react/root/link hooks | Implemented and tested; reference Go sidecar fixture only, no third-party Chat SDK adapter bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
 | `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies (with file IDs), failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested |
 | `server` sync wiring: `POST /webhooks/{key}`, supervised board-event subscription, thread attach/backfill with future-only targets, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
@@ -890,7 +890,8 @@ calls and need no credentials.
 | `sync/slack` | Signature vector, stale timestamp, challenge, message/reply/edit/delete/reaction/file/link fixtures, own-bot and marker skip, stable and distinct dedupe, store-before-ack, target parsing, `#name` lookup and cache, `chat.postMessage` form and customize fallback, edit/delete/react paths, file retry/refusal/partial success, typing status, source read/join, permalink, API error and Retry-After classification, fake Slack end-to-end |
 | `sync/github` | Signature vector, delivery ID and duplicate-delivery dedupe, ping, issue/PR/review comments, PR/issue full lifecycle, review approval/dismissal, CI pass/fail, repo/installation allowlists, marker and bot/viewer echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, comment length and file limits, error classification, root recovery, links, fake-server end-to-end |
 | `sync/linear` | Signature and timestamp, issue created/updated, comment created/updated/removed (real `issueId`-only payloads), team allowlist, own comment skip, identifier/native target resolution, comment/issue creation, edit/delete/react, labels/state/priority/project/assignee, source read (team/project/issue), permalinks, errors/limits, fake GraphQL end-to-end |
-| `sync/chatsdk` | HMAC verifier, decode/send delegation, target hook, optional operations |
+| `sync/chatsdk` | Bridge v1 schema/wire, HMAC/timestamp/nonce replay, self identity, body/event caps, NUL/ID bounds, resolve/deliver retry, sidecar fixture, PG bridge intake, provider conformance |
+| `sync/conformance` | Shared provider suite for Slack, GitHub, Linear and a bridge-backed adapter |
 
 Run:
 
