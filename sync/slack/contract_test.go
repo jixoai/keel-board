@@ -546,7 +546,7 @@ func TestSlackEndToEnd(t *testing.T) {
 	}
 
 	// Source read returns the thread oldest first.
-	read, err := p.ReadSource(ctx, "slack", thread, 50)
+	read, err := p.ReadSource(ctx, "slack", thread, boardsync.ReadOptions{Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -36,20 +36,24 @@ type Provider struct {
 	LabelsFunc         func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels, before map[string]string) error
 	LocateFunc         func(url string) (thread string, message string, ok bool)
 	URLFunc            func(thread, message string) (string, error)
+	ReadSourceFunc     func(ctx context.Context, key boardsync.Key, target string, opts boardsync.ReadOptions) (boardsync.SourceRead, error)
+	JoinSourceFunc     func(ctx context.Context, key boardsync.Key, target string) (boardsync.SourceJoin, error)
 
-	mu        sync.Mutex
-	receives  []ReceiveCall
-	resolves  []ResolveCall
-	targets   []TargetCall
-	posts     []PostCall
-	edits     []EditCall
-	deletes   []DeleteCall
-	reactions []ReactCall
-	uploads   []UploadCall
-	typings   []TypingCall
-	labels    []LabelsCall
-	permalink []PermalinkCall
-	starts    []StartCall
+	mu          sync.Mutex
+	receives    []ReceiveCall
+	resolves    []ResolveCall
+	targets     []TargetCall
+	posts       []PostCall
+	edits       []EditCall
+	deletes     []DeleteCall
+	reactions   []ReactCall
+	uploads     []UploadCall
+	typings     []TypingCall
+	labels      []LabelsCall
+	permalink   []PermalinkCall
+	starts      []StartCall
+	sourceReads []SourceReadCall
+	sourceJoins []SourceJoinCall
 }
 
 // ReceiveCall records one webhook.
@@ -135,6 +139,19 @@ type PermalinkCall struct {
 type StartCall struct {
 	Key     boardsync.Key
 	Channel string
+}
+
+// SourceReadCall records one on-demand source read.
+type SourceReadCall struct {
+	Key    boardsync.Key
+	Target string
+	Opts   boardsync.ReadOptions
+}
+
+// SourceJoinCall records one opt-in join.
+type SourceJoinCall struct {
+	Key    boardsync.Key
+	Target string
 }
 
 // New returns a fake provider for platform with the given capabilities.
@@ -311,6 +328,44 @@ func (p *Provider) URL(thread, message string) (string, error) {
 		return p.URLFunc(thread, message)
 	}
 	return "", nil
+}
+
+// ReadSource implements boardsync.SourceReader. Without a function it behaves
+// like an adapter that can't read sources: ErrUnsupported.
+func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target string, opts boardsync.ReadOptions) (boardsync.SourceRead, error) {
+	p.mu.Lock()
+	p.sourceReads = append(p.sourceReads, SourceReadCall{Key: key, Target: target, Opts: opts})
+	p.mu.Unlock()
+	if p.ReadSourceFunc == nil {
+		return boardsync.SourceRead{}, boardsync.ErrUnsupported
+	}
+	return p.ReadSourceFunc(ctx, key, target, opts)
+}
+
+// JoinSource implements boardsync.SourceJoiner. Without a function it behaves
+// like an adapter that can't join: ErrUnsupported.
+func (p *Provider) JoinSource(ctx context.Context, key boardsync.Key, target string) (boardsync.SourceJoin, error) {
+	p.mu.Lock()
+	p.sourceJoins = append(p.sourceJoins, SourceJoinCall{Key: key, Target: target})
+	p.mu.Unlock()
+	if p.JoinSourceFunc == nil {
+		return boardsync.SourceJoin{}, boardsync.ErrUnsupported
+	}
+	return p.JoinSourceFunc(ctx, key, target)
+}
+
+// SourceReads returns recorded source reads.
+func (p *Provider) SourceReads() []SourceReadCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]SourceReadCall(nil), p.sourceReads...)
+}
+
+// SourceJoins returns recorded joins.
+func (p *Provider) SourceJoins() []SourceJoinCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]SourceJoinCall(nil), p.sourceJoins...)
 }
 
 // Receives returns recorded webhooks.

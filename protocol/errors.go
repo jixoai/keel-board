@@ -28,6 +28,7 @@ const (
 	CodeTooLarge           Code = "too_large"
 	CodeNoFiles            Code = "no_files"
 	CodeNoDirectUploads    Code = "no_direct_uploads"
+	CodeUnsupported        Code = "unsupported"
 	CodeUploadNotFound     Code = "upload_not_found"
 	CodeNotUploaded        Code = "not_uploaded"
 	CodeSizeMismatch       Code = "size_mismatch"
@@ -71,6 +72,7 @@ var statuses = map[Code]int{
 	CodeTooLarge:           http.StatusRequestEntityTooLarge,
 	CodeNoFiles:            http.StatusNotImplemented,
 	CodeNoDirectUploads:    http.StatusNotImplemented,
+	CodeUnsupported:        http.StatusNotImplemented,
 	CodeUploadNotFound:     http.StatusNotFound,
 	CodeNotUploaded:        http.StatusConflict,
 	CodeSizeMismatch:       http.StatusBadRequest,

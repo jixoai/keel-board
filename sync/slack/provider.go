@@ -424,7 +424,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 	if !ok || !channelIDPattern.MatchString(channel) || !isTS(ts) {
 		return nil, fmt.Errorf("%w: %q isn't a slack thread", boardsync.ErrBadRequest, thread)
 	}
-	messages, _, err := p.client.Replies(ctx, channel, ts, 1)
+	messages, _, _, err := p.client.Replies(ctx, channel, ts, 1, "")
 	if err != nil {
 		return nil, err
 	}

@@ -106,6 +106,10 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		// another board.
 		tenant = func(*http.Request) (string, error) { return "t1", nil }
 	}
+	logger := opts.logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	srv := server.New(server.Options{
 		Board:     board,
 		Authorize: opts.authorize,
@@ -115,14 +119,14 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 			}
 			return "t1", nil
 		},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger: logger,
 		Blobs:  blobs,
 		Sync: &server.SyncOptions{
 			Store: serverStore, Registry: registry, Tenant: tenant,
 			Owned:         []server.SyncKey{{Tenant: "t1", Key: "slack"}},
 			StartChannels: map[server.SyncKey][]string{{Tenant: "t1", Key: "slack"}: {"C0123"}},
 			FileHosts:     []string{"files.example.test"},
-			Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Logger:        logger,
 		},
 	})
 	h.server = srv
@@ -206,6 +210,8 @@ type syncHarnessOptions struct {
 	wrapStore func(syncstore.Store) syncstore.Store
 	// blobs replaces the harness's memory store for attachment tests.
 	blobs blob.Store
+	// logger receives the server's and sync's logs; nil discards them.
+	logger *slog.Logger
 }
 
 func (h *syncHarness) request(method, path string, body any, extra map[string]string) (int, []byte) {

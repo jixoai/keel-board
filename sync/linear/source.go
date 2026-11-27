@@ -12,12 +12,13 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
-// ReadOptions page a source read. Limit defaults to 50 and is capped at 100;
-// After is an opaque Linear cursor from a previous read's Next.
-type ReadOptions struct {
-	Limit int
-	After string
-}
+// The shared source contract. ReadOptions is an alias so existing callers can
+// keep naming linear.ReadOptions; the fields and JSON are the sync package's.
+type (
+	ReadOptions   = boardsync.ReadOptions
+	SourceRead    = boardsync.SourceRead
+	SourceMessage = boardsync.SourceMessage
+)
 
 const (
 	// DefaultReadLimit is how many issues or comments one read returns.
@@ -28,39 +29,9 @@ const (
 	listedDescriptionBytes = 1500
 )
 
-// SourceFile is a file a source message carries. Linear comments don't carry
-// files through the webhook or this read; the field keeps the shape other
-// providers share.
-type SourceFile struct {
-	Name string `json:"name"`
-	URL  string `json:"url,omitempty"`
-}
-
-// SourceMessage is one issue or comment read on demand. Nothing about it is
-// stored on the board.
-type SourceMessage struct {
-	ID        string       `json:"id"`
-	Thread    string       `json:"thread"`
-	Author    string       `json:"author"`
-	Text      string       `json:"text"`
-	CreatedAt string       `json:"createdAt,omitempty"`
-	Replies   int          `json:"replies,omitempty"`
-	Files     []SourceFile `json:"files,omitempty"`
-}
-
-// SourceRead is a team, a project, or one issue with its comments, read for
-// whoever asked. Kind is "team", "project", or "issue".
-type SourceRead struct {
-	Kind     string          `json:"kind"`
-	Channel  string          `json:"channel"`
-	Name     string          `json:"name,omitempty"`
-	Thread   string          `json:"thread,omitempty"`
-	Messages []SourceMessage `json:"messages"`
-	More     bool            `json:"more"`
-	Next     string          `json:"next,omitempty"`
-}
-
 var (
+	_ boardsync.SourceReader = (*Provider)(nil)
+
 	issueURLPattern   = regexp.MustCompile(`(?i)^https://linear\.app/[^/\s]+/issue/([A-Z][A-Z0-9_]*-\d+)(?:[/?#].*)?$`)
 	projectURLPattern = regexp.MustCompile(`(?i)^https://linear\.app/[^/\s]+/project/(?:[^/?#\s]*?-)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,})(?:[/?#].*)?$`)
 	issueIDPattern    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -78,7 +49,7 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 	if target == "" {
 		return SourceRead{}, fmt.Errorf("%w: empty linear source", boardsync.ErrBadRequest)
 	}
-	limit := readLimit(opts.Limit)
+	limit := opts.LimitFor(DefaultReadLimit, MaxReadLimit)
 	switch {
 	case strings.HasPrefix(target, "project:"):
 		ref := strings.TrimSpace(strings.TrimPrefix(target, "project:"))
@@ -282,16 +253,6 @@ func (p *Provider) projectAllowed(project projectInfo) bool {
 		}
 	}
 	return true
-}
-
-func readLimit(limit int) int {
-	if limit <= 0 {
-		return DefaultReadLimit
-	}
-	if limit > MaxReadLimit {
-		return MaxReadLimit
-	}
-	return limit
 }
 
 func sourceIssueMessage(issue *issueData, thread string, descriptionMax int) SourceMessage {

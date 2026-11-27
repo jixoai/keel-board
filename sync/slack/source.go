@@ -9,60 +9,23 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
-// SourceReader is the on-demand read surface a server exposes. It is not a
-// sync: nothing read here is stored or subscribed.
-type SourceReader interface {
-	ReadSource(ctx context.Context, key boardsync.Key, target string, limit int) (SourceRead, error)
-}
-
-// SourceJoiner adds the app to a public channel when the entry opted in.
-type SourceJoiner interface {
-	JoinSource(ctx context.Context, key boardsync.Key, target string) (SourceJoin, error)
-}
-
-// SourceRead is a channel or thread read on demand. It is not a sync: nothing
-// is stored, and reading a channel does not subscribe to it.
-type SourceRead struct {
-	Channel  string          `json:"channel"`
-	Name     string          `json:"name,omitempty"`
-	Thread   string          `json:"thread,omitempty"`
-	Messages []SourceMessage `json:"messages"`
-	More     bool            `json:"more,omitempty"`
-}
-
-// SourceMessage is one message a source read returned, oldest first.
-type SourceMessage struct {
-	ID        string           `json:"id"`
-	Thread    string           `json:"thread"`
-	Author    string           `json:"author"`
-	AuthorID  string           `json:"authorId,omitempty"`
-	Text      string           `json:"text"`
-	CreatedAt string           `json:"createdAt,omitempty"`
-	Replies   int              `json:"replies,omitempty"`
-	Files     []boardsync.File `json:"files,omitempty"`
-}
-
-// SourceJoin is the answer to an opt-in join.
-type SourceJoin struct {
-	Channel string `json:"channel"`
-	Name    string `json:"name,omitempty"`
-	Joined  bool   `json:"joined"`
-}
+// The shared source contract. They are aliases so a caller can name either
+// package's type; the shape and the JSON are the sync package's.
+type (
+	SourceRead    = boardsync.SourceRead
+	SourceMessage = boardsync.SourceMessage
+	SourceJoin    = boardsync.SourceJoin
+)
 
 // ReadSource reads a public channel or a thread the app is already in. A
 // private channel, a DM, or a Slack Connect channel is refused: the app's
 // token reads more than the caller may see, and a snapshot is shown to every
 // board reader.
-func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target string, limit int) (SourceRead, error) {
+func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target string, opts boardsync.ReadOptions) (SourceRead, error) {
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return SourceRead{}, fmt.Errorf("%w: entry %q isn't this slack app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
 	}
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 200 {
-		limit = 200
-	}
+	limit := opts.LimitFor(boardsync.DefaultSourceLimit, boardsync.MaxSourceLimit)
 	resolved, err := p.ResolveTarget(ctx, key, target)
 	if err != nil {
 		return SourceRead{}, err
@@ -74,15 +37,17 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 	if err := readableChannel(info); err != nil {
 		return SourceRead{}, err
 	}
-	read := SourceRead{Channel: resolved.Channel, Name: info.Name}
+	read := SourceRead{Kind: "channel", Channel: resolved.Channel, Name: info.Name}
 	var messages []slackMessage
 	var more bool
+	var next string
 	if resolved.Kind == boardsync.TargetThread {
+		read.Kind = "thread"
 		threadTS, err := splitThread(resolved.Channel, resolved.Thread)
 		if err != nil {
 			return SourceRead{}, err
 		}
-		found, hasMore, err := p.client.Replies(ctx, resolved.Channel, threadTS, limit)
+		found, hasMore, cursor, err := p.client.Replies(ctx, resolved.Channel, threadTS, limit, opts.After)
 		if err != nil {
 			return SourceRead{}, err
 		}
@@ -90,15 +55,15 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 			// A reply's ts reads only that reply; the thread it belongs to is
 			// what the caller meant.
 			threadTS = found[0].ThreadTS
-			found, hasMore, err = p.client.Replies(ctx, resolved.Channel, threadTS, limit)
+			found, hasMore, cursor, err = p.client.Replies(ctx, resolved.Channel, threadTS, limit, opts.After)
 			if err != nil {
 				return SourceRead{}, err
 			}
 		}
 		read.Thread = resolved.Channel + ":" + threadTS
-		messages, more = found, hasMore
+		messages, more, next = found, hasMore, cursor
 	} else {
-		found, hasMore, err := p.client.History(ctx, resolved.Channel, limit)
+		found, hasMore, cursor, err := p.client.History(ctx, resolved.Channel, limit, opts.After)
 		if err != nil {
 			return SourceRead{}, err
 		}
@@ -106,13 +71,19 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 		for i, j := 0, len(found)-1; i < j; i, j = i+1, j-1 {
 			found[i], found[j] = found[j], found[i]
 		}
-		messages, more = found, hasMore
+		messages, more, next = found, hasMore, cursor
 	}
 	if len(messages) > limit {
+		// Slack's thread read includes the root beside its reply page, so a
+		// page can be one over the limit. Trimming keeps the read bounded, but
+		// the platform cursor would then resume past the trimmed message, so
+		// it isn't offered.
 		more = true
 		messages = messages[:limit]
+		next = ""
 	}
 	read.More = more
+	read.Next = next
 	read.Messages = sourceMessages(key, resolved.Channel, messages, p.cfg)
 	return read, nil
 }
@@ -239,43 +210,57 @@ func (c *Client) ChannelInfo(ctx context.Context, channel string) (Channel, erro
 	return response.Channel, nil
 }
 
-// Replies reads a thread, oldest first, including its root.
-func (c *Client) Replies(ctx context.Context, channel, ts string, limit int) ([]slackMessage, bool, error) {
+// Replies reads a thread, oldest first, including its root. A non-empty
+// cursor continues a previous read; the returned cursor continues this one.
+func (c *Client) Replies(ctx context.Context, channel, ts string, limit int, cursor string) ([]slackMessage, bool, string, error) {
 	if channel == "" || ts == "" {
-		return nil, false, fmt.Errorf("%w: slack replies need a channel and ts", boardsync.ErrBadRequest)
+		return nil, false, "", fmt.Errorf("%w: slack replies need a channel and ts", boardsync.ErrBadRequest)
 	}
 	var response struct {
 		apiEnvelope
 		Messages []slackMessage `json:"messages"`
 		HasMore  bool           `json:"has_more"`
+		Metadata struct {
+			NextCursor string `json:"next_cursor"`
+		} `json:"response_metadata"`
 	}
 	form := url.Values{"channel": {channel}, "ts": {ts}, "limit": {fmt.Sprintf("%d", clampLimit(limit))}}
-	if err := c.call(ctx, "conversations.replies", form, &response); err != nil {
-		return nil, false, err
+	if cursor != "" {
+		form.Set("cursor", cursor)
 	}
-	return response.Messages, response.HasMore, nil
+	if err := c.call(ctx, "conversations.replies", form, &response); err != nil {
+		return nil, false, "", err
+	}
+	return response.Messages, response.HasMore, response.Metadata.NextCursor, nil
 }
 
-// History reads a channel, newest first.
-func (c *Client) History(ctx context.Context, channel string, limit int) ([]slackMessage, bool, error) {
+// History reads a channel, newest first. A non-empty cursor continues a
+// previous read; the returned cursor continues this one.
+func (c *Client) History(ctx context.Context, channel string, limit int, cursor string) ([]slackMessage, bool, string, error) {
 	if channel == "" {
-		return nil, false, fmt.Errorf("%w: slack history needs a channel", boardsync.ErrBadRequest)
+		return nil, false, "", fmt.Errorf("%w: slack history needs a channel", boardsync.ErrBadRequest)
 	}
 	var response struct {
 		apiEnvelope
 		Messages []slackMessage `json:"messages"`
 		HasMore  bool           `json:"has_more"`
+		Metadata struct {
+			NextCursor string `json:"next_cursor"`
+		} `json:"response_metadata"`
 	}
 	form := url.Values{"channel": {channel}, "limit": {fmt.Sprintf("%d", clampLimit(limit))}}
-	if err := c.call(ctx, "conversations.history", form, &response); err != nil {
-		return nil, false, err
+	if cursor != "" {
+		form.Set("cursor", cursor)
 	}
-	return response.Messages, response.HasMore, nil
+	if err := c.call(ctx, "conversations.history", form, &response); err != nil {
+		return nil, false, "", err
+	}
+	return response.Messages, response.HasMore, response.Metadata.NextCursor, nil
 }
 
 var (
-	_ SourceReader = (*Provider)(nil)
-	_ SourceJoiner = (*Provider)(nil)
+	_ boardsync.SourceReader = (*Provider)(nil)
+	_ boardsync.SourceJoiner = (*Provider)(nil)
 )
 
 // JoinChannel adds the app to a public channel.

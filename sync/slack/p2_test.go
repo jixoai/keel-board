@@ -103,7 +103,7 @@ func TestReadSourceRejectsMPIM(t *testing.T) {
 	}))
 	defer server.Close()
 	p := newProvider(t, server.URL, nil, nil)
-	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 10); !errors.Is(err, boardsync.ErrUnsupported) {
+	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", boardsync.ReadOptions{Limit: 10}); !errors.Is(err, boardsync.ErrUnsupported) {
 		t.Fatalf("ReadSource = %v", err)
 	}
 }
@@ -580,14 +580,14 @@ func TestNonSlackKeySourceAndFetchRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	read, err := p.ReadSource(context.Background(), "support-slack", "C0123ABC", 10)
+	read, err := p.ReadSource(context.Background(), "support-slack", "C0123ABC", boardsync.ReadOptions{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if read.Messages[0].AuthorID != "support-slack:user:U0456ABC" || !strings.Contains(read.Messages[0].Text, "@[support-slack:user:U0999XYZ]") {
 		t.Fatalf("read = %+v", read.Messages)
 	}
-	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 10); !errors.Is(err, boardsync.ErrBadRequest) {
+	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", boardsync.ReadOptions{Limit: 10}); !errors.Is(err, boardsync.ErrBadRequest) {
 		t.Fatalf("wrong key ReadSource = %v", err)
 	}
 	root, err := p.FetchRoot(context.Background(), "support-slack", "C0123ABC:1727000000.123456")

@@ -23,7 +23,7 @@ func TestReadSourceChannel(t *testing.T) {
 		case "/conversations.history":
 			_ = r.ParseForm()
 			historyForm = r.PostForm
-			_, _ = w.Write([]byte(`{"ok":true,"has_more":true,"messages":[
+			_, _ = w.Write([]byte(`{"ok":true,"has_more":true,"response_metadata":{"next_cursor":"cur-2"},"messages":[
 				{"ts":"1727000005.000100","user":"U0999XYZ","text":"second <@U0456ABC>","thread_ts":"1727000000.123456"},
 				{"ts":"1727000000.123456","user":"U0456ABC","text":"first","reply_count":1,
 				 "files":[{"id":"F1","name":"a.log","size":2,"mimetype":"text/plain","url_private_download":"https://files.slack.com/f/a.log"},
@@ -35,15 +35,20 @@ func TestReadSourceChannel(t *testing.T) {
 	}))
 	defer server.Close()
 	p := newProvider(t, server.URL, nil, nil)
-	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 1)
+	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC", boardsync.ReadOptions{Limit: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if historyForm.Get("limit") != "1" {
 		t.Fatalf("limit = %q", historyForm.Get("limit"))
 	}
-	if read.Channel != "C0123ABC" || read.Name != "general" || read.Thread != "" || !read.More {
+	if read.Kind != "channel" || read.Channel != "C0123ABC" || read.Name != "general" || read.Thread != "" || !read.More {
 		t.Fatalf("read = %+v", read)
+	}
+	// A trimmed page must not offer the platform cursor: it would resume past
+	// the trimmed message.
+	if read.Next != "" {
+		t.Fatalf("next = %q", read.Next)
 	}
 	if len(read.Messages) != 1 {
 		t.Fatalf("messages = %+v", read.Messages)
@@ -80,7 +85,7 @@ func TestReadSourceThread(t *testing.T) {
 	}))
 	defer server.Close()
 	p := newProvider(t, server.URL, nil, nil)
-	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC:1727000000.123456", 50)
+	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC:1727000000.123456", boardsync.ReadOptions{Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,12 +120,42 @@ func TestReadSourceReplyTSReadsItsThread(t *testing.T) {
 	}))
 	defer server.Close()
 	p := newProvider(t, server.URL, nil, nil)
-	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC:1727000005.000100", 50)
+	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC:1727000005.000100", boardsync.ReadOptions{Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 2 || read.Thread != "C0123ABC:1727000000.123456" || read.Messages[0].ID != "1727000000.123456" {
 		t.Fatalf("calls=%d read=%+v", calls.Load(), read)
+	}
+}
+
+func TestReadSourceChannelPaginates(t *testing.T) {
+	var historyForm url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.info":
+			_, _ = w.Write([]byte(`{"ok":true,"channel":{"id":"C0123ABC","name":"general","is_member":true}}`))
+		case "/conversations.history":
+			_ = r.ParseForm()
+			historyForm = r.PostForm
+			_, _ = w.Write([]byte(`{"ok":true,"has_more":true,"response_metadata":{"next_cursor":"cur-2"},
+				"messages":[{"ts":"1727000010.000100","user":"U0456ABC","text":"next page"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	read, err := p.ReadSource(context.Background(), "slack", "C0123ABC",
+		boardsync.ReadOptions{Limit: 10, After: "cur-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if historyForm.Get("cursor") != "cur-1" {
+		t.Fatalf("cursor = %q", historyForm.Get("cursor"))
+	}
+	if read.Next != "cur-2" || !read.More || read.Kind != "channel" {
+		t.Fatalf("read = %+v", read)
 	}
 }
 
@@ -144,7 +179,7 @@ func TestReadSourcePermissions(t *testing.T) {
 			}))
 			defer server.Close()
 			p := newProvider(t, server.URL, nil, nil)
-			if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 10); !errors.Is(err, tc.want) {
+			if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", boardsync.ReadOptions{Limit: 10}); !errors.Is(err, tc.want) {
 				t.Fatalf("ReadSource = %v, want %v", err, tc.want)
 			}
 		})

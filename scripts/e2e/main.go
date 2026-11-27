@@ -196,10 +196,11 @@ func (e *e2eEnv) run() {
 		e.scenarioSlackRestart()
 		e.scenarioGitHub()
 		e.scenarioLinear()
+		e.scenarioSources()
 		e.scenarioAdapterTyping()
 		e.harness.Stop()
 	} else {
-		for _, group := range []string{"automation", "chatsdk", "slack-mirror", "slack-files", "board-typing", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "adapter-typing"} {
+		for _, group := range []string{"automation", "chatsdk", "slack-mirror", "slack-files", "board-typing", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "sources", "adapter-typing"} {
 			e.report.Scenario(group).Skip("场景未执行", group, "harness 服务器未启动（前置步骤失败），按 SKIP 记录而非假通过")
 		}
 	}
@@ -248,7 +249,8 @@ func (e *e2eEnv) addCoverage() {
 		"POST /watchers 后触发 board 事件 → bot post；一次性 schedule 到点写入 board；视图不回显 schedule text", r.StepsIn("automation"))
 	r.AddCoverage("Chat SDK bridge（sidecar fixture）", r.GroupStatus("chatsdk"),
 		"sidecar /deliver message/edit/reaction/delete；PushInbound 签名事件入站/编辑；HMAC/重放 nonce/时间窗；self 身份丢弃", r.StepsIn("chatsdk"))
-	r.AddCoverage("source read / join（本期范围外）", StatusSkip, "本 harness 未覆盖；非本期 Phase 0 E2E 范围，适配器单测覆盖", "skips")
+	r.AddCoverage("source read / join（§14.10）", r.GroupStatus("sources"),
+		"Slack conversations.info/history/replies 归一化只读结果（不写 board）；Slack opt-in join 幂等；Linear issue 读取只读；501/404/400 稳定错误", r.StepsIn("sources"))
 }
 
 // scenarioRealServe exercises the actual board serve binary over PostgreSQL.
@@ -512,10 +514,8 @@ func (e *e2eEnv) scenarioHarnessBoot() {
 // scenarioSkips records the explicitly missing product seams or changes.
 func (e *e2eEnv) scenarioSkips() {
 	sc := e.report.Scenario("skips")
-	sc.Skip("source read / join", "平台 source read/join", "本 harness 未覆盖（本期 Phase 0 E2E 范围外）：server 未挂载 sources/join 路由；适配器 source 单测覆盖")
 	sc.Skip("真实 cmd/board 承载镜像链路", "cmd/board 进程 + fake 平台双向镜像", "本 harness 用 harness-hosted server 跑镜像：cmd/board 没有平台 endpoint/transport 注入缝且约束不改产品代码；real-serve 组只验证真实二进制的 API/sync boot/重启")
 
-	e.report.AddSkip("source read / join", "本 harness 未覆盖/本期范围外", "task 4.6/4.7")
 	e.report.AddSkip("真实 cmd/board 承载镜像链路", "cmd/board 无平台 endpoint 注入；mirror 场景使用 harness-hosted server，装配差异见 README", "设计约束：不修改产品代码")
 }
 

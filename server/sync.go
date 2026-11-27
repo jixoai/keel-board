@@ -958,6 +958,9 @@ func (s *Server) handleSyncAttach(w http.ResponseWriter, r *http.Request) {
 // syncFailureFor maps a provider failure to a board error without copying a
 // platform's body or a redaction-only message into the response.
 func syncFailureFor(err error) *protocol.Error {
+	if errors.Is(err, boardsync.ErrUnsupported) {
+		return protocol.NewError(protocol.CodeUnsupported, "the platform can't do that")
+	}
 	switch boardsync.StatusCode(err) {
 	case http.StatusBadRequest:
 		return protocol.Invalid("target: the platform target isn't usable")

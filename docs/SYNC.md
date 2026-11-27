@@ -638,6 +638,7 @@ Routes:
 | --- | --- |
 | `POST /webhooks/{key}` | `syncstore.WebhookHandler`: tenant, entry, gate, store-before-ack |
 | `GET /v1/board/sync/entries` | connections, enabled/owned, no secrets |
+| `GET /v1/board/sync/entries/{key}/status` | one connection's status view: enabled/owned, inbox depth, tenant outbox depth |
 | `GET /v1/board/sync/status` | per-key inbox depth and the tenant's outbox depth |
 | `GET /v1/board/sync/inbox?key=` | dead-lettered inbound events (IDs, thread, attempts) |
 | `GET /v1/board/sync/outbox/failures?key=` | dead deliveries (message, target, attempts, error class) |
@@ -645,12 +646,17 @@ Routes:
 | `POST /v1/board/sync/outbox/{id}/retry` | retry a dead delivery |
 | `GET /v1/board/sync/threads?thread=` | a board thread's attachment rows |
 | `POST /v1/board/sync/threads` | attach `{key, thread, target}`; a channel target posts the root and backfills, a thread target receives only future messages |
+| `GET /v1/board/sources/{key}/read?target=&limit=&after=` | on-demand platform read (`sync.SourceReader`), normalized and not stored; `limit` defaults to 50 and caps at 200 |
+| `POST /v1/board/sources/{key}/join` | opt-in platform join (`sync.SourceJoiner`), body `{target}` |
 
 Every management route needs `manage` at `*`; the attach route also needs
 `read` on the board thread's channel. Another tenant's thread, a missing one,
 and one the caller can't read all answer 404. Management views carry no
 platform credential (the store holds none), no message text and no raw
-payload.
+payload. A source read answers `sync.SourceRead` and writes nothing: no board
+event, no projection row. A provider that doesn't implement `SourceReader` (or
+whose join isn't configured) answers a stable 501 `unsupported`; an unknown
+key is 404 whether or not it is well formed.
 
 The subscription follows each owned key's durable `board-events` cursor,
 delivers only `message.posted/edited/deleted`, `reaction.added/removed`, and

@@ -195,6 +195,8 @@ func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[bo
 	slackProvider, err := slack.New(slack.Config{
 		Key: "slack", SigningSecret: "slack-e2e-signing", BotToken: "xoxb-e2e",
 		BotUserID: "UBOT", BotID: "BBOT", HTTPClient: h.fake.HTTPClient(),
+		// The source scenario exercises the opt-in join against fake Slack.
+		JoinChannels: true,
 	})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("slack adapter: %w", err)

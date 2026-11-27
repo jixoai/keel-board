@@ -264,10 +264,20 @@ func (f *fakePlatform) SlackDeletes() []slackDelete          { return f.slack.de
 func (f *fakePlatform) SlackReactions() []slackReaction      { return f.slack.reactionsSnapshot() }
 func (f *fakePlatform) SlackTyping() []slackTyping           { return f.slack.typingSnapshot() }
 func (f *fakePlatform) SlackUploads() []slackUpload          { return f.slack.uploadsSnapshot() }
+func (f *fakePlatform) SlackJoins() []slackJoin              { return f.slack.joinsSnapshot() }
 func (f *fakePlatform) GitHubWrites() []githubWrite          { return f.github.writesSnapshot() }
 func (f *fakePlatform) LinearWrites() []linearWrite          { return f.linear.writesSnapshot() }
 func (f *fakePlatform) SlackFailText(text string, times int) { f.slack.failText(text, times) }
 func (f *fakePlatform) SlackClearFailures()                  { f.slack.clearFailures() }
+
+// SlackSeedChannel and SlackSeedMessage install source-read fixtures.
+func (f *fakePlatform) SlackSeedChannel(channel, name string, member, private bool) {
+	f.slack.seedChannel(channel, name, member, private)
+}
+
+func (f *fakePlatform) SlackSeedMessage(channel, ts, user, text, threadTS string) {
+	f.slack.seedMessage(channel, ts, user, text, threadTS)
+}
 
 // ResetSlack clears the Slack record slices and the platform access log, so a
 // scenario can assert "exactly what happened in this window". It keeps the
@@ -280,6 +290,7 @@ func (f *fakePlatform) ResetSlack() {
 	f.slack.reactions = nil
 	f.slack.typing = nil
 	f.slack.uploads = nil
+	f.slack.joins = nil
 	f.slack.mu.Unlock()
 	f.ResetCalls()
 }
@@ -324,6 +335,7 @@ type slackMessage struct {
 	ThreadTS string
 	Text     string
 	TS       string
+	User     string
 }
 
 type slackPost struct {
@@ -368,6 +380,17 @@ type slackUpload struct {
 	Bytes int    `json:"bytes"`
 }
 
+type slackJoin struct {
+	Channel string    `json:"channel"`
+	At      time.Time `json:"at"`
+}
+
+type slackChannel struct {
+	Name    string
+	Member  bool
+	Private bool
+}
+
 type slackFailRule struct {
 	substr    string
 	remaining int // -1 means forever
@@ -384,12 +407,14 @@ type slackBlockRule struct {
 type slackFake struct {
 	mu        sync.Mutex
 	messages  map[string]slackMessage
+	channels  map[string]slackChannel
 	posts     []slackPost
 	edits     []slackEdit
 	deletes   []slackDelete
 	reactions []slackReaction
 	typing    []slackTyping
 	uploads   []slackUpload
+	joins     []slackJoin
 	failures  []slackFailRule
 	blocks    []*slackBlockRule
 	nextTS    int64
@@ -399,6 +424,11 @@ type slackFake struct {
 func newSlackFake() *slackFake {
 	return &slackFake{
 		messages: make(map[string]slackMessage),
+		channels: map[string]slackChannel{
+			"C_SUPPORT":  {Name: "support", Member: true},
+			"C0BACKFILL": {Name: "backfill-e2e", Member: true},
+			"C0FUTURE":   {Name: "future-e2e", Member: true},
+		},
 		nextTS:   1_700_000_000,
 		nextFile: 100,
 	}
@@ -448,7 +478,7 @@ func (s *slackFake) serve(w http.ResponseWriter, r *http.Request) string {
 		}
 		s.mu.Lock()
 		s.posts = append(s.posts, post)
-		s.messages[ts] = slackMessage{Channel: channel, ThreadTS: threadTS, Text: text, TS: ts}
+		s.messages[ts] = slackMessage{Channel: channel, ThreadTS: threadTS, Text: text, TS: ts, User: "UBOT"}
 		s.mu.Unlock()
 		writeSlackJSON(w, map[string]any{"ok": true, "ts": ts, "channel": channel})
 		return "chat.postMessage"
@@ -484,29 +514,96 @@ func (s *slackFake) serve(w http.ResponseWriter, r *http.Request) string {
 		writeSlackJSON(w, map[string]any{"ok": true})
 		return method
 	case "conversations.list":
+		s.mu.Lock()
+		channels := make([]map[string]any, 0, len(s.channels))
+		for id, channel := range s.channels {
+			channels = append(channels, map[string]any{
+				"id": id, "name": channel.Name, "is_member": channel.Member,
+				"is_private": channel.Private,
+			})
+		}
+		s.mu.Unlock()
+		sort.Slice(channels, func(i, j int) bool {
+			return fmt.Sprint(channels[i]["id"]) < fmt.Sprint(channels[j]["id"])
+		})
 		writeSlackJSON(w, map[string]any{
-			"ok": true,
-			"channels": []map[string]any{
-				{"id": "C_SUPPORT", "name": "support", "is_member": true},
-				{"id": "C0BACKFILL", "name": "backfill-e2e", "is_member": true},
-				{"id": "C0FUTURE", "name": "future-e2e", "is_member": true},
-			},
+			"ok": true, "channels": channels,
 			"response_metadata": map[string]any{"next_cursor": ""},
+		})
+		return method
+	case "conversations.info":
+		channel := r.Form.Get("channel")
+		s.mu.Lock()
+		info, found := s.channels[channel]
+		s.mu.Unlock()
+		if !found {
+			writeSlackError(w, "channel_not_found")
+			return method + " channel_not_found"
+		}
+		writeSlackJSON(w, map[string]any{"ok": true, "channel": map[string]any{
+			"id": channel, "name": info.Name, "is_member": info.Member, "is_private": info.Private,
+		}})
+		return method
+	case "conversations.history":
+		channel := r.Form.Get("channel")
+		limit := 100
+		_, _ = fmt.Sscanf(r.Form.Get("limit"), "%d", &limit)
+		s.mu.Lock()
+		messages := make([]slackMessage, 0, len(s.messages))
+		for _, message := range s.messages {
+			if message.Channel == channel && message.ThreadTS == "" {
+				messages = append(messages, message)
+			}
+		}
+		s.mu.Unlock()
+		// Slack history is newest first.
+		sort.Slice(messages, func(i, j int) bool { return messages[i].TS > messages[j].TS })
+		if limit > 0 && len(messages) > limit {
+			messages = messages[:limit]
+		}
+		writeSlackJSON(w, map[string]any{
+			"ok": true, "channel": channel, "has_more": false,
+			"messages": slackMessagesJSON(messages),
 		})
 		return method
 	case "conversations.replies":
 		channel, ts := r.Form.Get("channel"), r.Form.Get("ts")
 		s.mu.Lock()
-		message, found := s.messages[ts]
-		s.mu.Unlock()
-		messages := []map[string]any{}
+		root, found := s.messages[ts]
+		messages := make([]slackMessage, 0, 2)
 		if found {
-			messages = append(messages, map[string]any{
-				"ts": ts, "text": message.Text, "user": "UBOT", "username": "keel-bot",
-				"thread_ts": message.ThreadTS,
-			})
+			messages = append(messages, root)
 		}
-		writeSlackJSON(w, map[string]any{"ok": true, "messages": messages, "has_more": false, "channel": channel})
+		for _, message := range s.messages {
+			if message.ThreadTS == ts && message.TS != ts {
+				messages = append(messages, message)
+			}
+		}
+		s.mu.Unlock()
+		sort.Slice(messages, func(i, j int) bool { return messages[i].TS < messages[j].TS })
+		payload := slackMessagesJSON(messages)
+		for index := range payload {
+			if payload[index]["ts"] == ts {
+				payload[index]["reply_count"] = len(messages) - 1
+			}
+		}
+		writeSlackJSON(w, map[string]any{"ok": true, "messages": payload, "has_more": false, "channel": channel})
+		return method
+	case "conversations.join":
+		channel := r.Form.Get("channel")
+		s.mu.Lock()
+		info, found := s.channels[channel]
+		if found {
+			info.Member = true
+			s.channels[channel] = info
+			s.joins = append(s.joins, slackJoin{Channel: channel, At: time.Now()})
+		}
+		s.mu.Unlock()
+		if !found {
+			writeSlackError(w, "channel_not_found")
+			return method + " channel_not_found"
+		}
+		writeSlackJSON(w, map[string]any{"ok": true})
 		return method
 	case "chat.getPermalink":
 		channel, ts := r.Form.Get("channel"), r.Form.Get("message_ts")
@@ -606,6 +703,41 @@ func (s *slackFake) recordUpload(path string, bytes int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.uploads = append(s.uploads, slackUpload{Path: path, Bytes: bytes})
+}
+
+// seedChannel registers a channel and its visibility, and stores messages
+// under it. It is the source-read fixture: no webhook and no board write.
+func (s *slackFake) seedChannel(channel, name string, member, private bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.channels[channel] = slackChannel{Name: name, Member: member, Private: private}
+}
+
+// seedMessage stores one Slack message so conversations.history/replies can
+// read it back. A non-empty threadTS makes it a reply.
+func (s *slackFake) seedMessage(channel, ts, user, text, threadTS string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages[ts] = slackMessage{Channel: channel, TS: ts, User: user, Text: text, ThreadTS: threadTS}
+}
+
+func (s *slackFake) joinsSnapshot() []slackJoin {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]slackJoin(nil), s.joins...)
+}
+
+// slackMessagesJSON renders stored messages the way the Web API does.
+func slackMessagesJSON(messages []slackMessage) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		entry := map[string]any{"ts": message.TS, "text": message.Text, "user": message.User}
+		if message.ThreadTS != "" {
+			entry["thread_ts"] = message.ThreadTS
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func (s *slackFake) nextTimestamp() string {
@@ -908,6 +1040,14 @@ func fakeLinearIssue(id string) map[string]any {
 		"priority": 2, "priorityLabel": "High",
 		"creator": map[string]any{"id": "user-1", "name": "Ada Lovelace", "displayName": "ada"},
 		"labels":  map[string]any{"nodes": []any{}},
+		"comments": map[string]any{
+			"nodes": []any{map[string]any{
+				"id": "comment-9200", "body": "source read comment",
+				"createdAt": "2026-01-02T05:00:00Z",
+				"user":      map[string]any{"id": "user-2", "name": "Julian", "displayName": "julian"},
+			}},
+			"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+		},
 	}
 }
 
