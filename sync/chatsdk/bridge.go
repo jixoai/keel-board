@@ -329,6 +329,8 @@ func ErrorCodeOf(err error) ErrorCode {
 		return ErrorUnsupported
 	case errors.Is(err, boardsync.ErrRateLimited):
 		return ErrorRateLimited
+	case boardsync.IsPermanent(err):
+		return ErrorPermanent
 	default:
 		return ErrorTransient
 	}

@@ -37,8 +37,8 @@ HMAC-SHA256(secret, timestamp_decimal + nonce + body)
   outside that window is `401`, even when its signature is otherwise valid.
 - A nonce is single-use inside the window. The board stores
   `(tenant, entry key, nonce)` durably in `board_sync_bridge_nonces` before
-  the events reach the inbox. A sidecar keeps the same rule for deliveries it
-  accepts.
+  the events reach the inbox. A sidecar should keep the same rule for
+  deliveries it accepts.
 - **Retries need a fresh nonce and timestamp.** The delivery ID, not the
   nonce, is the idempotency key; a sidecar must answer a repeated
   `deliveryId` idempotently rather than re-posting.
@@ -162,7 +162,7 @@ code:
 | `auth` | 401 | no |
 | `unsupported` | 422 | no |
 | `permanent` | 422 | no |
-| `rate_limited` | 429 | yes, after `retryAfter` |
+| `rate_limited` | 429 | yes, standard sync backoff |
 | `transient` | 503 | yes |
 
 ```json
@@ -171,9 +171,11 @@ code:
 
 The board retries `transient`, `rate_limited`, network errors and 5xx with the
 standard sync policy (five tries, 1s doubling to 30s, jitter), re-signing each
-attempt with a fresh nonce and timestamp but the same `deliveryId`. `auth`,
-`unsupported` and `permanent` are not retried; they surface as a permanent
-delivery failure and the board's outbox moves on.
+attempt with a fresh nonce and timestamp but the same `deliveryId`.
+`retryAfter` is carried for an operator or a caller that wants the platform's
+hint; the retry decision itself uses the code. `auth`, `unsupported` and
+`permanent` are not retried; they surface as a permanent delivery failure and
+the board's outbox moves on.
 
 ## Resolve
 
