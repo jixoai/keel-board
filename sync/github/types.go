@@ -91,6 +91,14 @@ func (c Config) Validate() error {
 	if c.BotUserID < 0 {
 		return fmt.Errorf("%w: github bot user ID can't be negative", boardsync.ErrBadRequest)
 	}
+	if c.DetectViewer {
+		if c.Token.Empty() {
+			return fmt.Errorf("%w: DetectViewer needs a user token; GitHub App installation tokens can't read GET /user", boardsync.ErrBadRequest)
+		}
+		if isInstallationToken(c.Token) {
+			return fmt.Errorf("%w: DetectViewer only supports user tokens; an installation token can't read GET /user, set BotUserID or BotLogin instead", boardsync.ErrBadRequest)
+		}
+	}
 	if c.APIBaseURL != "" {
 		if err := validateAPIBaseURL(c.APIBaseURL); err != nil {
 			return err
@@ -156,6 +164,13 @@ func validRepo(full string) bool {
 }
 
 var deliveryPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+
+// isInstallationToken reports the GitHub App installation token shape. Such a
+// token can call the REST API as the installation but not GET /user, which
+// names a human account.
+func isInstallationToken(token boardsync.Secret) bool {
+	return strings.HasPrefix(token.Reveal(), "ghs_")
+}
 
 // validDelivery reports whether X-GitHub-Delivery is a bounded, printable ID.
 // It is the replay identity a webhook redelivery keeps.
@@ -480,7 +495,7 @@ func stateOfPull(pr *pullRequest) string {
 	switch {
 	case pr.Merged:
 		return "merged"
-	case pr.State == "closed":
+	case strings.EqualFold(pr.State, "closed"):
 		return "closed"
 	case pr.Draft:
 		return "draft"
@@ -521,6 +536,9 @@ var shaPattern = regexp.MustCompile(`^[0-9a-fA-F]{7,64}$`)
 func validSHA(value string) bool { return shaPattern.MatchString(value) }
 
 func ciPrefix(repoID int64, number int) string {
+	if repoID <= 0 || number <= 0 {
+		return ""
+	}
 	return fmt.Sprintf("ci.%d-%d.", repoID, number)
 }
 

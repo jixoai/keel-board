@@ -89,10 +89,13 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 	return boardsync.Intake{Response: boardsync.OK(), Records: records}, nil
 }
 
-// Viewer reports the account the token authenticates as, fetching it once.
-// A deployment can call it at startup to learn BotUserID; an inbound comment
-// by that account is then skipped as the app's own.
+// Viewer reports the account a user token authenticates as, fetching it once.
+// GitHub App installation tokens cannot call GET /user; use BotUserID or
+// BotLogin for those. A deployment can call Viewer at startup to learn the ID.
 func (p *Provider) Viewer(ctx context.Context) (boardsync.Author, error) {
+	if isInstallationToken(p.cfg.Token) {
+		return boardsync.Author{}, fmt.Errorf("%w: GET /user needs a user token; installation tokens use BotUserID or BotLogin", boardsync.ErrUnsupported)
+	}
 	p.viewerMu.Lock()
 	defer p.viewerMu.Unlock()
 	if p.viewerKnown {
@@ -110,7 +113,10 @@ func (p *Provider) Viewer(ctx context.Context) (boardsync.Author, error) {
 	}
 	p.viewerErr = nil
 	if account.ID == 0 && account.Login == "" {
-		return boardsync.Author{}, fmt.Errorf("github answered an empty viewer")
+		err := fmt.Errorf("github answered an empty viewer")
+		p.viewerErr = err
+		p.viewerErrAt = now
+		return boardsync.Author{}, err
 	}
 	p.viewerUser = account
 	p.viewerKnown = true
@@ -345,7 +351,7 @@ func (p *Provider) Delete(ctx context.Context, key boardsync.Key, thread boardsy
 // so a removal is refused.
 func (p *Provider) React(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message, emoji string, added bool) error {
 	if !added {
-		return fmt.Errorf("%w: github reaction removal isn't implemented in this skeleton", boardsync.ErrUnsupported)
+		return fmt.Errorf("%w: github reaction removal needs a reaction ID lookup", boardsync.ErrUnsupported)
 	}
 	info, err := p.threadWhere(key, thread)
 	if err != nil {
@@ -491,8 +497,8 @@ func (p *Provider) commentWhere(key boardsync.Key, thread boardsync.ThreadRef, m
 		return threadInfo{}, 0, err
 	}
 	commentID, err := strconv.ParseInt(message, 10, 64)
-	if err != nil {
-		return threadInfo{}, 0, fmt.Errorf("%w: comment ID %q isn't numeric", boardsync.ErrBadRequest, message)
+	if err != nil || commentID <= 0 {
+		return threadInfo{}, 0, fmt.Errorf("%w: comment ID %q isn't a positive integer", boardsync.ErrBadRequest, message)
 	}
 	return info, commentID, nil
 }

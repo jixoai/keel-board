@@ -1,5 +1,5 @@
-// Package github is the GitHub adapter skeleton: webhook signature
-// verification, issue/PR/comment/review/CI normalization, and REST calls.
+// Package github is the GitHub adapter: webhook signature verification,
+// issue/PR/comment/review/CI normalization, and REST calls.
 package github
 
 import (

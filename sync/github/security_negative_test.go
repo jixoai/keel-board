@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -120,7 +121,7 @@ func TestResolveChannelAndTargetBoundaries(t *testing.T) {
 	if _, err := p.ResolveChannel(ctx, "github", "acme/www:branches"); !errors.Is(err, boardsync.ErrBadRequest) {
 		t.Fatalf("unknown channel suffix = %v", err)
 	}
-	if _, err := p.ResolveChannel(ctx, "github", "acme/www:pulls:issues"); !errors.Is(err, boardsync.ErrBadRequest) {
+	if _, err := p.ResolveChannel(ctx, "github", "acme/www:issues:pulls"); !errors.Is(err, boardsync.ErrBadRequest) {
 		t.Fatalf("double channel suffix = %v", err)
 	}
 	if _, err := p.ResolveTarget(ctx, "github", "other/repo:1"); !errors.Is(err, boardsync.ErrNotFound) {
@@ -163,6 +164,21 @@ func TestIssueStateFallbackAndInvalidHead(t *testing.T) {
 	if event.Lifecycle.Labels["state"] != "open" {
 		t.Fatalf("issue state = %q, want open", event.Lifecycle.Labels["state"])
 	}
+	editedWeird := mutateFixture(t, "issue_opened.json", func(payload map[string]any) {
+		payload["action"] = "edited"
+		payload["issue"].(map[string]any)["state"] = "mystery"
+	})
+	event = receive(t, newProvider(t, false), "issues", editedWeird)[0].Event
+	if event.Type != "issue.edited" || event.Lifecycle.Labels["state"] != "open" {
+		t.Fatalf("edited issue state = %q (%s), want open", event.Lifecycle.Labels["state"], event.Type)
+	}
+	upperClosed := mutateFixture(t, "pr_opened.json", func(payload map[string]any) {
+		payload["pull_request"].(map[string]any)["state"] = "CLOSED"
+	})
+	event = receive(t, newProvider(t, false), "pull_request", upperClosed)[0].Event
+	if event.Lifecycle.Labels["state"] != "closed" {
+		t.Fatalf("uppercase PR state = %q, want closed", event.Lifecycle.Labels["state"])
+	}
 	badSHA := mutateFixture(t, "pr_opened.json", func(payload map[string]any) {
 		payload["pull_request"].(map[string]any)["head"] = map[string]any{"sha": "not a sha"}
 	})
@@ -176,6 +192,82 @@ func TestIssueStateFallbackAndInvalidHead(t *testing.T) {
 	event = receive(t, newProvider(t, false), "pull_request", syncBad)[0].Event
 	if _, exists := event.Lifecycle.Labels["head"]; exists {
 		t.Fatalf("invalid synchronize SHA kept a head label: %+v", event.Lifecycle.Labels)
+	}
+	if !contains(event.Lifecycle.Unset, "head") {
+		t.Fatalf("invalid synchronize SHA didn't unset the old head: %v", event.Lifecycle.Unset)
+	}
+}
+
+func TestDetectViewerOnlySupportsUserTokens(t *testing.T) {
+	base := func(token string) github.Config {
+		return github.Config{
+			Key: "github", WebhookSecret: testSecret, Token: boardsync.Secret(token),
+			Repos: []string{"acme/www"}, DetectViewer: true,
+			APIBaseURL: "http://127.0.0.1:9",
+		}
+	}
+	if _, err := github.New(base("ghs_installation")); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("installation token + DetectViewer = %v", err)
+	}
+	if _, err := github.New(base("")); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("empty token + DetectViewer = %v", err)
+	}
+	if _, err := github.New(base("ghp_user")); err != nil {
+		t.Fatalf("user token + DetectViewer = %v", err)
+	}
+	// Viewer keeps failing closed even when called on a provider built with an
+	// installation token and detection off.
+	p, err := github.New(github.Config{
+		Key: "github", WebhookSecret: testSecret, Token: "ghs_installation",
+		Repos: []string{"acme/www"}, APIBaseURL: "http://127.0.0.1:9",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Viewer(context.Background()); !errors.Is(err, boardsync.ErrUnsupported) {
+		t.Fatalf("installation-token Viewer = %v", err)
+	}
+}
+
+func TestViewerCachesForbiddenAndEmptyResponses(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"forbidden user", http.StatusForbidden, `{"message":"Resource not accessible by integration"}`},
+		{"empty user", http.StatusOK, `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/user" {
+					t.Fatalf("path = %q", r.URL.Path)
+				}
+				calls++
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			p := writeProvider(t, server.URL, func(c *github.Config) { c.DetectViewer = true })
+			if _, err := p.Viewer(context.Background()); err == nil {
+				t.Fatal("Viewer succeeded")
+			}
+			if _, err := p.Viewer(context.Background()); err == nil {
+				t.Fatal("cached Viewer succeeded")
+			}
+			body := fixture(t, "pr_comment.json")
+			if _, err := receiveRequest(t, p, "issue_comment", "v-1", body); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := receiveRequest(t, p, "issue_comment", "v-2", body); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 {
+				t.Fatalf("viewer calls = %d, want one cached failure", calls)
+			}
+		})
 	}
 }
 

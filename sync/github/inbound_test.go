@@ -17,7 +17,7 @@ func providerWith(t *testing.T, mutate func(*github.Config)) *github.Provider {
 	cfg := github.Config{
 		Key:           "github",
 		WebhookSecret: testSecret,
-		Token:         "ghs_test_token",
+		Token:         "ghp_test_token",
 		Repos:         []string{"acme/www"},
 		// A closed loopback port: no test may reach the real api.github.com.
 		APIBaseURL: "http://127.0.0.1:9",

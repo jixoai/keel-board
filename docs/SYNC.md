@@ -612,7 +612,7 @@ github.New(github.Config{
     BotUserID: 4242,
     BotLogin: "keel-board[bot]",
     InstallationID: 777,   // optional: drop events from any other installation
-    DetectViewer: true,    // optional: resolve the token's own user once
+    DetectViewer: true,    // user token only; App tokens use BotUserID
     Repos: []string{"acme/www"},          // required inbound allowlist
     WriteRepos: []string{"acme/www"},    // empty means read-only
     // AllowAllRepos / AllowAllWrites are explicit opt-outs.
@@ -639,7 +639,7 @@ entry's are dropped before normalization: fail closed. Handled events:
 | `pull_request` edited | `pr.edited`, `Retitled` |
 | `pull_request` ready_for_review / converted_to_draft | `pr.ready` / `pr.draft`, create root if unseen |
 | `pull_request` reopened | `pr.reopened`, reply "reopened by …", create root if unseen |
-| `pull_request` synchronize | `pr.synchronized`, new `head`, owns `ci.<repo id>-<n>.` so stale CI labels unset |
+| `pull_request` synchronize | `pr.synchronized`, new `head` (an invalid or absent SHA unsets the old head), owns `ci.<repo id>-<n>.` so stale CI labels unset |
 | `pull_request` closed | reply "merged by …" or "closed by …", `state=merged\|closed` |
 | `pull_request` labeled/unlabeled/assigned/unassigned | reconcile `tag.*` / `assignee.*`, no reply |
 | `issues` opened/edited/closed/reopened | lifecycle `issue.*` with `state`, `issue=owner/repo#n`, `tag.*`, `assignee.*` |
@@ -676,9 +676,12 @@ a bare thread is an error (the endpoint is ambiguous if a receipt lost its
 sub-thread). `React` maps a small emoji table to GitHub's eight reactions.
 Roots never flow into GitHub: GitHub threads start on GitHub. `FetchRoot`
 recovers a PR/issue when a comment arrives on a thread the board hasn't seen.
-`Viewer` reads the token's own account; with `DetectViewer`, its comments are
-skipped even without `BotUserID` (a failed lookup is retried at most once a
-minute).
+`Viewer` reads the token's own account through `GET /user`; with
+`DetectViewer`, its comments are skipped even without `BotUserID` (a failed or
+empty lookup is retried at most once a minute). `GET /user` needs a user
+token: a GitHub App installation token cannot call it, so `DetectViewer` with
+an installation token is rejected at configuration time. App entries use
+`BotUserID`/`BotLogin` instead.
 
 Echo suppression fails closed. With `DisableMarker` set, an entry that has
 neither `BotUserID`/`BotLogin` nor a resolvable `Viewer` refuses `Post`,
@@ -703,8 +706,9 @@ Known limits:
   `#pullrequestreview-…` link, which names a review, not a comment) are open.
 * Resolving review conversations is not synced.
 * File upload and deployment-specific formatting are pending. Bot identity can
-  be configured (`BotUserID`/`BotLogin`) or detected (`Viewer`); when neither
-  is known, the hidden marker remains the echo guard.
+  be configured (`BotUserID`/`BotLogin`) or detected from a user token
+  (`Viewer`); a GitHub App installation token must configure the IDs. When
+  neither is known, the hidden marker remains the echo guard.
 
 ### Linear
 

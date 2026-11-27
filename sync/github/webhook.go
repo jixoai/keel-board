@@ -175,10 +175,15 @@ func (p *Provider) normalizePullRequest(key boardsync.Key, delivery string, body
 		lifecycle.Reply = "reopened by " + loginOrSomeone(login)
 	case "synchronize":
 		lifecycle.Type = "pr.synchronized"
-		lifecycle.Owns = append(lifecycle.Owns, ciPrefix(pl.Repository.ID, pr.Number))
+		if prefix := ciPrefix(pl.Repository.ID, pr.Number); prefix != "" {
+			lifecycle.Owns = append(lifecycle.Owns, prefix)
+		}
 		delete(lifecycle.Labels, "head")
 		if validSHA(pr.Head.SHA) {
 			lifecycle.Labels["head"] = pr.Head.SHA
+		} else {
+			// Without an explicit unset, a host would keep the old head label.
+			lifecycle.Unset = []string{"head"}
 		}
 	case "closed":
 		if pr.Merged {
@@ -331,6 +336,9 @@ func (p *Provider) normalizeWorkflowRun(key boardsync.Key, delivery string, body
 			continue
 		}
 		prefix := ciPrefix(pl.Repository.ID, pr.Number)
+		if prefix == "" {
+			continue
+		}
 		keyName := boundedKey(prefix, fileSlug)
 		labels := map[string]string{}
 		lifecycle := boardsync.Lifecycle{

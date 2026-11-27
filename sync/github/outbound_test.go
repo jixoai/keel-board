@@ -42,7 +42,7 @@ func TestViewerIsResolvedOnceAndSkipsOwnComments(t *testing.T) {
 			t.Fatalf("path = %q", r.URL.Path)
 		}
 		calls++
-		if r.Header.Get("Authorization") != "Bearer ghs_test_token" {
+		if r.Header.Get("Authorization") != "Bearer ghp_test_token" {
 			t.Fatalf("authorization = %q", r.Header.Get("Authorization"))
 		}
 		_, _ = w.Write([]byte(`{"login":"keel-board[bot]","id":4242,"type":"Bot"}`))
@@ -203,6 +203,19 @@ func TestViewerFailureIsNotRetriedOnEveryWebhook(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("viewer calls = %d, want one failed lookup inside the cooldown", calls)
+	}
+}
+
+func TestCommentIDsMustBePositive(t *testing.T) {
+	p := writeProvider(t, "http://127.0.0.1:1", nil)
+	thread := boardsync.ThreadRef{Key: "github", Platform: "github", Channel: "acme/www:pulls", Thread: "acme/www:123"}
+	for _, id := range []string{"0", "-1"} {
+		if err := p.Edit(context.Background(), "github", thread, id, boardsync.OutboundMessage{Markdown: "x"}); !errors.Is(err, boardsync.ErrBadRequest) {
+			t.Fatalf("Edit comment ID %q = %v", id, err)
+		}
+		if err := p.Delete(context.Background(), "github", thread, id); !errors.Is(err, boardsync.ErrBadRequest) {
+			t.Fatalf("Delete comment ID %q = %v", id, err)
+		}
 	}
 }
 
