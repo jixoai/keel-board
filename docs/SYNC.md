@@ -30,7 +30,7 @@ worker daemon, and no live platform credential.
 | `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies (with file IDs), failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested |
 | `server` sync wiring: `POST /webhooks/{key}`, supervised board-event subscription, thread attach/backfill with future-only targets, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
 | PostgreSQL end-to-end: Host, copies, mappings, future-only `since_seq`, outbox restart, concurrent root creation, target uniqueness | Implemented and tested with `KEEL_BOARD_TEST_DSN` |
-| Production engine gaps: file bytes, typing, cross-process lease for key ownership, full lifecycle reconciliation | Seams in place; listed under Open items |
+| Production engine gaps: cross-process lease for key ownership and full lifecycle reconciliation | Seams in place; listed under Open items. Inbound and outbound file bytes, typing status, and link snapshots are wired through the server host and workers |
 
 The upstream pin keeps all sync code in `packages/board/src/sync/`; the
 `src/sync-slack/`, `src/sync-github/`, `src/sync-linear/`, and
@@ -183,6 +183,61 @@ known kind, channel and thread present, an author on messages and reactions, a
 message ID where one is needed, a lifecycle type, and bounded text/raw sizes.
 Adapters clamp text with `StorableText`, which removes NULs, repairs invalid
 UTF-8, and cuts at a rune boundary.
+
+### Files, links, mentions, and typing
+
+Four side channels need explicit rules; none of them may lose a message.
+
+**Inbound files.** A provider emits `File` metadata (name, type, size, URL)
+and never bytes. `Call.Import` passes the entry's `FileFetcher` to the host.
+The host keeps a file only when its URL is https, on one of
+`SyncHostOptions.FileHosts`, without credentials or a literal IP, within
+`MaxFiles`, and within `MaxFileBytes`. It gives each file a deterministic
+22-character attachment ID derived from the inbox event, so a retry reuses the
+bytes and record instead of writing a second copy. The adapter fetches its own
+platform's URL (Slack's is Slack-domain only, with per-hop redirect checks and
+a client timeout); the host adds its own `FileFetchTimeout` and a final bound
+on the returned bytes. A successful fetch is written to the blob store and
+bound to the board message's `Attachments`. A refused, timed-out, oversized, or
+empty file keeps its metadata as a placeholder attachment and adds a note
+(`📎 name (size): reason`) to the message text. A file the adapter can't fetch
+at all keeps the placeholder without a note. The message is always imported;
+no fetch failure is an import failure.
+
+**Outbound files.** `OutboundOptions.Files` is a `FileLoader`; the outbox
+worker supplies the host's loader, which reads each attachment's bytes from the
+blob store just before a post. A provider whose `Capabilities.UploadsFiles` is
+false gets a note per attachment and no bytes: GitHub and Linear comments can't
+carry files. A provider that can upload either takes the files in `Post`
+(Slack posts text first, then the files into the same thread) or gets a second
+`FileUploader.UploadFiles` call. An upload failure is added to the already
+posted text with a best-effort edit and the receipt records `Files: []`,
+`FilesSet: true`; it never causes a retry that would duplicate the message.
+The receipt's file IDs are stored on the copy before the `message.synced`
+receipt, so a receipt retry preserves `Files`/`FilesSet`.
+
+**Links.** A link keeps only a safe https URL on an allowed host; the board
+never fetches one. A snapshot is stored only when the platform supplied it with
+the link (Slack's unfurl), as JSON in `LinkView.Snapshot`; there is no link
+fetch or snapshot crawl. An unsafe or disallowed URL becomes an `unavailable`
+placeholder without a URL. Outbound links are ordinary Markdown in the message
+text; no adapter resolves or unfurls them.
+
+**Mentions.** A platform mention is normalized to the board's exact token
+`@[<key>:user:<id>]`: Slack's `<@U…>`, GitHub's `@login`. Outbound, an adapter
+converts only tokens under its own key to its native mention; another
+connection's token is left literally as written, which notifies no one.
+GitHub's `@org/team` stays text because it names a team, not a user. Linear's
+API renders a mention from a profile URL and this adapter has no workspace
+slug, so Linear posts tokens as text rather than fabricating an `@name`. Code
+spans and fenced blocks are never rewritten.
+
+**Typing.** `Capabilities.Typing` plus the optional `Typist` interface carry an
+ephemeral status. `Runner.Typing` validates the entry and thread and answers
+`ErrUnsupported` when the platform can't show one. The outbox worker shows a
+typing status before a thread post, ignores every failure, and remembers an
+unsupported answer per key so it doesn't ask again. A platform with no typing
+is skipped, never an error for the message.
 
 ### `Import`, `Deliver`, and `Start`
 
@@ -430,7 +485,7 @@ Scope checklists, from the upstream platform pages:
 
 | Platform | Needed |
 | --- | --- |
-| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write` (files pending in the skeleton), `groups:read` for private names, `chat:write.customize` for sender names, `channels:join` only if on-demand join is enabled |
+| Slack | `channels:history`, `groups:history`, `channels:read`, `chat:write`, `reactions:read/write`, `users:read`, `files:read/write`, `groups:read` for private names, `chat:write.customize` for sender names, `assistant:write` for typing status, `channels:join` only if on-demand join is enabled |
 | GitHub | Issues and Pull requests read/write, Actions read; webhooks for Pull requests, Pull request reviews, Pull request review comments, Issues, Issue comments, Workflow runs |
 | Linear | `read`, `write`, `comments:create`, `issues:create`; webhooks for Issues and Comments; app actor |
 | Chat SDK adapter | Whatever the platform's adapter documents |
@@ -562,7 +617,9 @@ upstream's deployment ownership does.
   new board root may start a thread in; the entry's own `Mirror`/`Channels`
   route still decides.
 * `FileHosts` is the inbound file/link host allowlist. Empty refuses every URL;
-  the board never fetches one.
+  a listed host is fetched only through the adapter's `FileFetcher`, with the
+  host's size, count, literal-IP, and timeout checks. `--sync-file-host` sets
+  it from the command line.
 
 Routes:
 
@@ -687,10 +744,11 @@ Known limits of the skeleton:
   native thread is `channel:item.ts`. A reaction on a reply needs the host to
   find the copy by channel + platform message ID, or a richer adapter that
   caches the message's thread. Upstream gets it from the Chat SDK message.
-* Files, typing status, Vercel deployment tables, sender-name length rules,
-  `chat:write.customize` checks, and link unfurl reading are not implemented.
-* A message with no text and no files is dropped; file-only messages are
-  carried as files (their upload is pending).
+* Vercel deployment tables are not implemented; the sender name, scope check,
+  and file upload paths are.
+* A message with no text and no files is dropped. A file-only message posts
+  its text first (the attachment notes when there is no text) and then the
+  files into the same thread.
 
 ### GitHub
 
@@ -797,8 +855,10 @@ Known limits:
   never a target. Other review-thread URL shapes (for example a
   `#pullrequestreview-…` link, which names a review, not a comment) are open.
 * Resolving review conversations is not synced.
-* File upload and deployment-specific formatting are pending. Bot identity can
-  be configured (`BotUserID`/`BotLogin`) or detected from a user token
+* File upload is not implemented: GitHub comments can't carry files, so a
+  board message with attachments delivers a note instead, and inbound GitHub
+  events carry no files. Deployment-specific formatting is pending. Bot identity
+  can be configured (`BotUserID`/`BotLogin`) or detected from a user token
   (`Viewer`); a GitHub App installation token must configure the IDs. When
   neither is known, the hidden marker remains the echo guard.
 
@@ -849,8 +909,11 @@ Known limits of the skeleton:
   team and identifier to place it. The full adapter fetches the issue by ID.
 * Links (`Locate`/`URL`) are not implemented; the workspace slug is not part
   of the native IDs this skeleton stores.
-* File upload, issue move handling beyond a new thread, and automated
-  re-parenting are pending.
+* File upload is not implemented: Linear comments can't carry files, so a
+  board message with attachments delivers a note instead. Board mentions stay
+  literal text too: Linear renders a mention from a profile URL and this
+  adapter has no workspace slug. Issue move handling beyond a new thread and
+  automated re-parenting are pending.
 
 ### Chat SDK bridge
 
@@ -1002,8 +1065,9 @@ Recorded in `docs/PORTING.md` as well:
 * **The engine is a seam plus a durable store.** The memory inbox/outbox,
   `Runner`, and tenant-qualified `Registry` are executable; `syncstore` adds
   the durable PostgreSQL/memory inbox and outbox, copies, workers, webhook
-  handler and RLS. Subscription, backfill, files, typing, access checks, and
-  cross-process key ownership remain the server's work.
+  handler and RLS. Subscription, backfill, access checks, file bytes (through
+  the server host's blob store), typing, and cross-process key ownership remain
+  the server's work.
 * **The Chat SDK bridge is a Go interface.** `chatsdk.Adapter` is a Go
   contract; it does not load `chat` or call a JavaScript adapter. A platform
   client implements it directly.
@@ -1016,12 +1080,16 @@ Recorded in `docs/PORTING.md` as well:
 
 * SQLite durable `Inbox`/`Outbox` stores. PostgreSQL and memory are in
   `syncstore` with the same lease/lane semantics as `MemoryInbox`/`Outbox`.
-* File bytes both ways (Slack `files.uploadV2`, GitHub asset upload, Linear
-  attachments). Inbound files are safe metadata only: size, scheme, and host
-  are checked, `FetchMetadata` is dropped, and no URL is fetched. Outbound
-  attachments are listed on the message but not uploaded.
-* Typing status, and link snapshots (a safe link URL is kept; the snapshot is
-  not).
+* File bytes: Slack uploads both ways. GitHub and Linear have no upload path,
+  so their outbound attachments become notes; their inbound webhooks carry no
+  files. A platform without a `FileFetcher` keeps metadata placeholders, and an
+  inbound URL outside `FileHosts` is never fetched. The blob store holds bytes
+  under tenant- and attachment-ID keys; there is no garbage collection for
+  bytes written before an import's board write failed.
+* Typing is Slack's assistant thread status. Other platforms skip it
+  (`ErrUnsupported`) and the worker remembers the refusal per key. Link
+  snapshots come only from a platform's payload (Slack unfurl); the board never
+  crawls a link.
 * Cross-process key ownership: `Owned` is explicit configuration, not a lease.
   A second process must not be configured with the same key.
 * The PostgreSQL restart test replaces process-local stores, board caches,
