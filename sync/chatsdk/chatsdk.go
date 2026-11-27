@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -73,6 +74,12 @@ type (
 type Config struct {
 	Key     boardsync.Key
 	Adapter Adapter
+	// SelfIDs are the platform author IDs that belong to this connection:
+	// the sidecar's bot, app, or user identity. They are required so an
+	// inbound event authored by the bridge itself is dropped before it is
+	// stored. Without either this or an adapter that implements SelfIDs, New
+	// fails closed.
+	SelfIDs []string
 	// Caps defaults to StartThreads false, edits/deletes/reactions true if the
 	// adapter implements them.
 	Caps boardsync.Capabilities
@@ -83,9 +90,11 @@ type Provider struct {
 	cfg     Config
 	adapter Adapter
 	caps    boardsync.Capabilities
+	selfIDs []string
 }
 
-// New returns a bridge provider.
+// New returns a bridge provider. It requires an echo identity: a bridge that
+// can't name its own author IDs would import its own posts and loop.
 func New(cfg Config) (*Provider, error) {
 	if cfg.Adapter == nil {
 		return nil, fmt.Errorf("%w: chatsdk needs an adapter", boardsync.ErrBadRequest)
@@ -93,7 +102,27 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.Key != "" && !cfg.Key.Valid() {
 		return nil, fmt.Errorf("%w: %q isn't a sync key", boardsync.ErrBadRequest, cfg.Key)
 	}
-	return &Provider{cfg: cfg, adapter: cfg.Adapter, caps: cfg.Caps}, nil
+	selfIDs, err := cleanSelfIDs(cfg.SelfIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(selfIDs) == 0 {
+		if adapter, ok := cfg.Adapter.(boardsync.SelfIdentifier); ok {
+			if selfIDs, err = cleanSelfIDs(adapter.SelfIDs()); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(selfIDs) == 0 {
+		return nil, fmt.Errorf("%w: chatsdk needs self author IDs (SelfIDs) so its own posts are not imported", boardsync.ErrBadRequest)
+	}
+	return &Provider{cfg: cfg, adapter: cfg.Adapter, caps: cfg.Caps, selfIDs: selfIDs}, nil
+}
+
+// SelfIDs implements boardsync.SelfIdentifier. The registry drops a record
+// whose author one of these IDs names before it reaches the inbox.
+func (p *Provider) SelfIDs() []string {
+	return append([]string(nil), p.selfIDs...)
 }
 
 // Platform implements boardsync.Provider.
@@ -321,9 +350,40 @@ func (v HMACVerifier) Verify(_ context.Context, req *boardsync.WebhookRequest) e
 	return nil
 }
 
+// cleanSelfIDs normalizes the identity list an adapter or deployment supplies.
+// Empty entries are dropped; a NUL, control character, invalid UTF-8, or an
+// overlong ID is refused rather than stored in a comparison list.
+func cleanSelfIDs(ids []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, raw := range ids {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+		if len(id) > 300 || !utf8.ValidString(id) || strings.IndexByte(id, 0) >= 0 {
+			return nil, fmt.Errorf("%w: self author ID is empty, invalid, or longer than 300 bytes", boardsync.ErrBadRequest)
+		}
+		for _, r := range id {
+			if r < 0x20 || r == 0x7f {
+				return nil, fmt.Errorf("%w: self author ID has a control character", boardsync.ErrBadRequest)
+			}
+		}
+		if _, duplicate := seen[id]; duplicate {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 // FuncAdapter is an Adapter made of functions, for tests and small platforms.
 type FuncAdapter struct {
 	PlatformName string
+	// SelfIDsValue is the adapter's own author identity. New falls back to it
+	// when Config.SelfIDs is empty.
+	SelfIDsValue []string
 	VerifyFunc   func(ctx context.Context, req *boardsync.WebhookRequest) error
 	DecodeFunc   func(ctx context.Context, key boardsync.Key, req *boardsync.WebhookRequest) (DecodeResult, error)
 	SendFunc     func(ctx context.Context, key boardsync.Key, target boardsync.ResolvedTarget, msg boardsync.OutboundMessage) (boardsync.Posted, error)
@@ -339,6 +399,9 @@ type FuncAdapter struct {
 
 // Platform implements Adapter.
 func (a *FuncAdapter) Platform() string { return a.PlatformName }
+
+// SelfIDs implements boardsync.SelfIdentifier.
+func (a *FuncAdapter) SelfIDs() []string { return append([]string(nil), a.SelfIDsValue...) }
 
 // Verify implements Adapter.
 func (a *FuncAdapter) Verify(ctx context.Context, req *boardsync.WebhookRequest) error {
@@ -431,12 +494,13 @@ func (a *FuncAdapter) URL(thread, message string) (string, error) {
 
 // Interface checks.
 var (
-	_ boardsync.Provider    = (*Provider)(nil)
-	_ boardsync.Editor      = (*Provider)(nil)
-	_ boardsync.Deleter     = (*Provider)(nil)
-	_ boardsync.Reactor     = (*Provider)(nil)
-	_ boardsync.RootFetcher = (*Provider)(nil)
-	_ boardsync.Linker      = (*Provider)(nil)
-	_ boardsync.FileFetcher = (*Provider)(nil)
-	_ boardsync.Permalinker = (*Provider)(nil)
+	_ boardsync.Provider       = (*Provider)(nil)
+	_ boardsync.SelfIdentifier = (*Provider)(nil)
+	_ boardsync.Editor         = (*Provider)(nil)
+	_ boardsync.Deleter        = (*Provider)(nil)
+	_ boardsync.Reactor        = (*Provider)(nil)
+	_ boardsync.RootFetcher    = (*Provider)(nil)
+	_ boardsync.Linker         = (*Provider)(nil)
+	_ boardsync.FileFetcher    = (*Provider)(nil)
+	_ boardsync.Permalinker    = (*Provider)(nil)
 )

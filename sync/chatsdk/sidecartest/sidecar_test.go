@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,7 +32,7 @@ func (a *fullAdapter) Send(_ context.Context, key boardsync.Key, target boardsyn
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sends = append(a.sends, msg)
-	return boardsync.Posted{Thread: target.Thread, Message: "posted-1"}, nil
+	return boardsync.Posted{Thread: postedThread(target), Message: "posted-1"}, nil
 }
 
 func (a *fullAdapter) Edit(_ context.Context, _ boardsync.Key, _ boardsync.ThreadRef, message string, _ boardsync.OutboundMessage) error {
@@ -80,13 +81,22 @@ type sendOnlyAdapter struct{}
 func (sendOnlyAdapter) Platform() string { return "telegram" }
 
 func (sendOnlyAdapter) Send(_ context.Context, _ boardsync.Key, target boardsync.ResolvedTarget, _ boardsync.OutboundMessage) (boardsync.Posted, error) {
-	return boardsync.Posted{Thread: target.Thread, Message: "posted-1"}, nil
+	return boardsync.Posted{Thread: postedThread(target), Message: "posted-1"}, nil
+}
+
+// postedThread models a platform that creates a thread for a channel root.
+func postedThread(target boardsync.ResolvedTarget) string {
+	if target.Thread != "" {
+		return target.Thread
+	}
+	return target.Channel + ":created"
 }
 
 func newRemote(t *testing.T, sidecar *sidecartest.Sidecar, caps boardsync.Capabilities) *chatsdk.RemoteAdapter {
 	t.Helper()
 	client, err := chatsdk.NewClient(chatsdk.ClientConfig{
 		BaseURL: sidecar.URL(), Secret: "fixture-secret", Key: "telegram",
+		Platform: "telegram", SelfIDs: []string{"telegram:user:bot"},
 		Retry: boardsync.RetryPolicy{MaxAttempts: 1},
 	})
 	if err != nil {
@@ -142,6 +152,32 @@ func TestSidecarFullAdapterShape(t *testing.T) {
 	}
 }
 
+func TestSidecarChannelRootReturnsTheNewThread(t *testing.T) {
+	adapter := &fullAdapter{}
+	sidecar, err := sidecartest.New("telegram", "telegram", "fixture-secret", adapter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sidecar.Close)
+	remote := newRemote(t, sidecar, boardsync.Capabilities{StartThreads: true})
+	channel := boardsync.ResolvedTarget{Key: "telegram", Platform: "telegram", Channel: "-100", Kind: boardsync.TargetChannel}
+	posted, err := remote.Send(context.Background(), "telegram", channel, boardsync.OutboundMessage{Markdown: "root"})
+	if err != nil {
+		t.Fatalf("channel root: %v", err)
+	}
+	if posted.Thread != "-100:created" || posted.Message != "posted-1" {
+		t.Fatalf("posted = %+v", posted)
+	}
+	thread := boardsync.ResolvedTarget{
+		Key: "telegram", Platform: "telegram", Channel: "-100",
+		Thread: posted.Thread, Kind: boardsync.TargetThread,
+	}
+	reply, err := remote.Send(context.Background(), "telegram", thread, boardsync.OutboundMessage{Markdown: "reply"})
+	if err != nil || reply.Thread != "-100:created" {
+		t.Fatalf("reply = %+v, %v", reply, err)
+	}
+}
+
 func TestSidecarIdempotentDelivery(t *testing.T) {
 	adapter := &fullAdapter{}
 	sidecar, err := sidecartest.New("telegram", "telegram", "fixture-secret", adapter)
@@ -151,6 +187,7 @@ func TestSidecarIdempotentDelivery(t *testing.T) {
 	t.Cleanup(sidecar.Close)
 	client, err := chatsdk.NewClient(chatsdk.ClientConfig{
 		BaseURL: sidecar.URL(), Secret: "fixture-secret", Key: "telegram",
+		Platform: "telegram", SelfIDs: []string{"telegram:user:bot"},
 		Retry: boardsync.RetryPolicy{MaxAttempts: 1},
 	})
 	if err != nil {
@@ -244,6 +281,37 @@ func TestSidecarInboundPush(t *testing.T) {
 	}
 }
 
+func TestSidecarRejectsNonceReplay(t *testing.T) {
+	sidecar, err := sidecartest.New("telegram", "telegram", "fixture-secret", sendOnlyAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sidecar.Close)
+	body := []byte(`{"deliveryId":"d1","key":"telegram","target":{"key":"telegram","platform":"telegram","channel":"-100","thread":"-100:42","kind":"thread"},"kind":"message","body":{"markdown":"hi"}}`)
+	nonce := "fixture-nonce-1"
+	request := func() *http.Request {
+		request, err := http.NewRequest(http.MethodPost, sidecar.URL()+"/deliver", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		timestamp := time.Now().Unix()
+		request.Header.Set(chatsdk.HeaderTimestamp, fmt.Sprintf("%d", timestamp))
+		request.Header.Set(chatsdk.HeaderNonce, nonce)
+		request.Header.Set(chatsdk.HeaderSignature, chatsdk.SignV1("fixture-secret", timestamp, nonce, body))
+		return request
+	}
+	for i, want := range []int{http.StatusOK, http.StatusConflict} {
+		response, err := http.DefaultClient.Do(request())
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != want {
+			t.Fatalf("attempt %d status = %d, want %d", i, response.StatusCode, want)
+		}
+	}
+}
+
 func TestSidecarRefusesBadSignature(t *testing.T) {
 	sidecar, err := sidecartest.New("telegram", "telegram", "fixture-secret", sendOnlyAdapter{})
 	if err != nil {
@@ -265,5 +333,31 @@ func TestSidecarRefusesBadSignature(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
+func TestSidecarRejectsInvalidDelivery(t *testing.T) {
+	sidecar, err := sidecartest.New("telegram", "telegram", "fixture-secret", sendOnlyAdapter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sidecar.Close)
+	body := []byte(`{"deliveryId":"d1","key":"telegram","target":{"key":"telegram","platform":"telegram","channel":"-100","thread":"-100:42","kind":"thread"},"kind":"message","body":{}}`)
+	request, err := http.NewRequest(http.MethodPost, sidecar.URL()+"/deliver", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	timestamp := time.Now().Unix()
+	nonce := "fixture-invalid-1"
+	request.Header.Set(chatsdk.HeaderTimestamp, fmt.Sprintf("%d", timestamp))
+	request.Header.Set(chatsdk.HeaderNonce, nonce)
+	request.Header.Set(chatsdk.HeaderSignature, chatsdk.SignV1("fixture-secret", timestamp, nonce, body))
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusUnprocessableEntity {
+		t.Fatalf("invalid delivery = %d", response.StatusCode)
 	}
 }

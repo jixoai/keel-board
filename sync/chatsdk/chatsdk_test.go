@@ -86,7 +86,7 @@ func TestProviderReceiveAndSend(t *testing.T) {
 			return boardsync.ResolvedTarget{Key: key, Platform: "telegram", Channel: "-1001234567890", Thread: target, Kind: boardsync.TargetThread}, nil
 		},
 	}
-	p, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter, Caps: boardsync.Capabilities{StartThreads: false}})
+	p, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter, SelfIDs: []string{"telegram:user:bot"}, Caps: boardsync.Capabilities{StartThreads: false}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestProviderRefusesBadSignature(t *testing.T) {
 			return (chatsdk.HMACVerifier{Secret: testSecret}).Verify(context.Background(), req)
 		},
 	}
-	p, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter})
+	p, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter, SelfIDs: []string{"telegram:user:bot"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestProviderOptionalOps(t *testing.T) {
 			return nil
 		},
 	}
-	p, err := chatsdk.New(chatsdk.Config{Key: "discord", Adapter: adapter})
+	p, err := chatsdk.New(chatsdk.Config{Key: "discord", Adapter: adapter, SelfIDs: []string{"discord:user:bot"}})
 	if err != nil {
 		t.Fatal(err)
 	}

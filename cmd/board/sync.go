@@ -14,6 +14,7 @@ import (
 
 	"github.com/jixoai/keel-board/server"
 	boardsync "github.com/jixoai/keel-board/sync"
+	"github.com/jixoai/keel-board/sync/chatsdk"
 	"github.com/jixoai/keel-board/sync/github"
 	"github.com/jixoai/keel-board/sync/linear"
 	"github.com/jixoai/keel-board/sync/slack"
@@ -201,9 +202,56 @@ func buildProvider(config *keyConfig) (boardsync.Provider, error) {
 			BotUserID:     os.Getenv(envName(config.key, "BOT_USER_ID")),
 			TeamKeys:      splitList(os.Getenv(envName(config.key, "TEAMS"))),
 		})
+	case "chatsdk":
+		return buildChatSDKProvider(config)
 	default:
-		return nil, fmt.Errorf("sync key %q: platform %q has no built-in adapter (slack, github, linear)", config.key, config.platform)
+		return nil, fmt.Errorf("sync key %q: platform %q has no built-in adapter (slack, github, linear, chatsdk)", config.key, config.platform)
 	}
+}
+
+// buildChatSDKProvider builds a signed-HTTP bridge entry. The sidecar's
+// platform name, URL, shared secret, and own author IDs all come from the
+// environment; the entry is registered under the sidecar's real platform so
+// IDs, targets, and the bridge route agree.
+func buildChatSDKProvider(config *keyConfig) (boardsync.Provider, error) {
+	platform := boardsync.Platform(strings.TrimSpace(os.Getenv(envName(config.key, "PLATFORM"))))
+	if strings.TrimSpace(string(platform)) == "" {
+		return nil, fmt.Errorf("sync key %q: chatsdk needs %s (the sidecar's platform name)",
+			config.key, envName(config.key, "PLATFORM"))
+	}
+	selfIDs := splitList(os.Getenv(envName(config.key, "SELF_IDS")))
+	if len(selfIDs) == 0 {
+		return nil, fmt.Errorf("sync key %q: chatsdk needs %s so its own posts are not imported",
+			config.key, envName(config.key, "SELF_IDS"))
+	}
+	secret, err := secretFromEnv(config.key, "BRIDGE_SECRET")
+	if err != nil {
+		return nil, err
+	}
+	client, err := chatsdk.NewClient(chatsdk.ClientConfig{
+		BaseURL:  os.Getenv(envName(config.key, "BRIDGE_URL")),
+		Secret:   secret,
+		Key:      config.key,
+		Platform: platform,
+		SelfIDs:  selfIDs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("sync key %q: %w", config.key, err)
+	}
+	caps := boardsync.Capabilities{StartThreads: true, Edits: true, Deletes: true, Reactions: true}
+	remote, err := chatsdk.NewRemoteAdapter(client, platform, caps)
+	if err != nil {
+		return nil, fmt.Errorf("sync key %q: %w", config.key, err)
+	}
+	return chatsdk.New(chatsdk.Config{Key: config.key, Adapter: remote, SelfIDs: selfIDs, Caps: caps})
+}
+
+// bridgeSecretFor returns the per-entry HMAC secret for a chatsdk connection.
+func bridgeSecretFor(config *keyConfig) (boardsync.Secret, bool) {
+	if config.platform != "chatsdk" {
+		return "", false
+	}
+	return optionalSecretFromEnv(config.key, "BRIDGE_SECRET"), true
 }
 
 // requireIdentity refuses a connection that can't recognize its own posts.
@@ -281,6 +329,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 	}
 	registry := boardsync.NewRegistry()
 	startChannels := make(map[server.SyncKey][]string, len(configs))
+	bridgeSecrets := make(map[boardsync.Key]boardsync.Secret)
 	owned := make([]server.SyncKey, 0, len(configs))
 	for _, config := range configs {
 		provider, err := buildProvider(config)
@@ -288,23 +337,27 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 			closeStore()
 			return nil, err
 		}
+		platform := provider.Platform()
 		routes := make(map[string]boardsync.SyncFunc, len(config.mirrors))
 		for channel, board := range config.mirrors {
 			routes[channel] = boardsync.Mirror(board)
 		}
 		fn, route := boardsync.Channels(routes)
 		if err := registry.Add(boardsync.Entry{
-			Tenant: tenant, Key: config.key, Platform: boardsync.Platform(config.platform),
+			Tenant: tenant, Key: config.key, Platform: platform,
 			Provider: provider, Sync: fn, Routes: route,
 		}); err != nil {
 			closeStore()
 			return nil, err
 		}
 		if _, err := store.UpsertEntry(ctx, syncstore.Entry{
-			Tenant: tenant, Key: config.key, Platform: boardsync.Platform(config.platform), Enabled: true,
+			Tenant: tenant, Key: config.key, Platform: platform, Enabled: true,
 		}); err != nil {
 			closeStore()
 			return nil, err
+		}
+		if secret, ok := bridgeSecretFor(config); ok {
+			bridgeSecrets[config.key] = secret
 		}
 		startChannels[server.SyncKey{Tenant: tenant, Key: config.key}] = append([]string(nil), config.starts...)
 		owned = append(owned, server.SyncKey{Tenant: tenant, Key: config.key})
@@ -312,6 +365,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 	return &serverSyncRuntime{
 		store: store, closeStore: closeStore, registry: registry,
 		tenant: tenant, owned: owned, startChannels: startChannels,
+		bridgeSecrets: bridgeSecrets,
 	}, nil
 }
 
@@ -323,6 +377,7 @@ type serverSyncRuntime struct {
 	tenant        string
 	owned         []server.SyncKey
 	startChannels map[server.SyncKey][]string
+	bridgeSecrets map[boardsync.Key]boardsync.Secret
 }
 
 // startSyncWorkers runs one inbound and one outbound worker per owned key and

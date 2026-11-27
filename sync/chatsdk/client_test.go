@@ -24,10 +24,12 @@ func fastRetry(attempts int) boardsync.RetryPolicy {
 func newClient(t *testing.T, baseURL string, mutate func(*chatsdk.ClientConfig)) *chatsdk.Client {
 	t.Helper()
 	cfg := chatsdk.ClientConfig{
-		BaseURL: baseURL,
-		Secret:  bridgeSecret,
-		Key:     "telegram",
-		Retry:   fastRetry(3),
+		BaseURL:  baseURL,
+		Secret:   bridgeSecret,
+		Key:      "telegram",
+		Platform: "telegram",
+		SelfIDs:  []string{"telegram:user:bot"},
+		Retry:    fastRetry(3),
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -325,7 +327,7 @@ func TestRemoteAdapterResolveAndRawWebhookRefusal(t *testing.T) {
 			return http.StatusOK, chatsdk.ResolveResponse{Channel: "-100"}
 		}
 		return http.StatusOK, chatsdk.ResolveResponse{Target: &boardsync.ResolvedTarget{
-			Key: "telegram", Platform: "telegram", Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread,
+			Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread,
 		}}
 	})
 	t.Cleanup(server.Close)
@@ -391,5 +393,149 @@ func TestRemoteAdapterDeliveryIDIsStable(t *testing.T) {
 	}
 	if ids[2] == ids[0] || strings.TrimSpace(ids[2]) == "" {
 		t.Fatalf("changed content reused an ID: %v", ids)
+	}
+}
+
+func TestClientResolveFillsMinimalTarget(t *testing.T) {
+	server := signedSidecar(t, func(_ *http.Request, body []byte) (int, any) {
+		var request chatsdk.ResolveRequest
+		if err := json.Unmarshal(body, &request); err != nil {
+			t.Fatal(err)
+		}
+		return http.StatusOK, chatsdk.ResolveResponse{Target: &boardsync.ResolvedTarget{
+			Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread,
+		}}
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, nil)
+	response, err := client.Resolve(context.Background(), chatsdk.ResolveRequest{Target: "-100:42"})
+	if err != nil {
+		t.Fatalf("minimal target: %v", err)
+	}
+	if response.Target.Key != "telegram" || response.Target.Platform != "telegram" {
+		t.Fatalf("target wasn't completed: %+v", response.Target)
+	}
+	if err := response.Target.Validate(); err != nil {
+		t.Fatalf("target invalid: %v", err)
+	}
+}
+
+func TestClientClassifiesLargeErrorBeforeSize(t *testing.T) {
+	var attempts atomic.Int64
+	server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
+		attempts.Add(1)
+		return http.StatusServiceUnavailable, strings.Repeat("x", chatsdk.MaxResponseBytes+1)
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, func(c *chatsdk.ClientConfig) { c.Retry = fastRetry(2) })
+	_, err := client.Resolve(context.Background(), chatsdk.ResolveRequest{Name: "#support"})
+	if err == nil {
+		t.Fatal("large 503 was accepted")
+	}
+	if boardsync.IsPermanent(err) {
+		t.Fatalf("a large 503 became permanent: %v", err)
+	}
+	var failure *chatsdk.BridgeError
+	if !errors.As(err, &failure) || failure.Code != chatsdk.ErrorTransient {
+		t.Fatalf("error = %v", err)
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+}
+
+func TestClientOversizedSuccessIsPermanent(t *testing.T) {
+	var attempts atomic.Int64
+	server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
+		attempts.Add(1)
+		return http.StatusOK, strings.Repeat("x", chatsdk.MaxResponseBytes+1)
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, nil)
+	_, err := client.Resolve(context.Background(), chatsdk.ResolveRequest{Name: "#support"})
+	if err == nil || !boardsync.IsPermanent(err) {
+		t.Fatalf("oversized success = %v, want permanent", err)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts.Load())
+	}
+}
+
+func TestClientCustomHTTPClientStillRefusesRedirect(t *testing.T) {
+	var leaked atomic.Bool
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		leaked.Store(true)
+	}))
+	t.Cleanup(other.Close)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/deliver", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, func(c *chatsdk.ClientConfig) {
+		c.HTTPClient = &http.Client{} // a caller that would otherwise follow
+	})
+	_, err := client.Resolve(context.Background(), chatsdk.ResolveRequest{Name: "#support"})
+	if err == nil {
+		t.Fatal("redirect was accepted")
+	}
+	if leaked.Load() {
+		t.Fatal("redirect left the configured origin through a custom client")
+	}
+}
+
+func TestRemoteAdapterDeliveryIsSingleAttempt(t *testing.T) {
+	var attempts atomic.Int64
+	server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
+		attempts.Add(1)
+		return http.StatusServiceUnavailable, chatsdk.BridgeError{Code: chatsdk.ErrorTransient}
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, func(c *chatsdk.ClientConfig) { c.Retry = fastRetry(5) })
+	adapter, err := chatsdk.NewRemoteAdapter(client, "telegram", boardsync.Capabilities{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := boardsync.ResolvedTarget{Key: "telegram", Platform: "telegram", Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread}
+	if _, err := adapter.Send(context.Background(), "telegram", target, boardsync.OutboundMessage{Markdown: "hi"}); err == nil {
+		t.Fatal("503 was accepted")
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("outbound short-circuit made %d attempts, want one", attempts.Load())
+	}
+}
+
+func TestClientRejectsCrossKeyOversizedRequestAndInvalidPosted(t *testing.T) {
+	var attempts atomic.Int64
+	server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
+		attempts.Add(1)
+		return http.StatusOK, boardsync.Posted{}
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, nil)
+	target := boardsync.ResolvedTarget{Key: "telegram", Platform: "telegram", Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread}
+	if _, err := client.Deliver(context.Background(), chatsdk.DeliverRequest{
+		DeliveryID: "d1", Key: "other", Target: boardsync.ResolvedTarget{
+			Key: "other", Platform: "telegram", Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread,
+		}, Kind: chatsdk.DeliverMessage, Body: chatsdk.OutboundBody{Markdown: "hi"},
+	}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("cross-key = %v", err)
+	}
+	if _, err := client.Deliver(context.Background(), chatsdk.DeliverRequest{
+		DeliveryID: "d1", Key: "telegram", Target: target, Kind: chatsdk.DeliverMessage,
+		Body: chatsdk.OutboundBody{Markdown: strings.Repeat("x", boardsync.MaxTextBytes+1)},
+	}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("oversized request = %v", err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatalf("refused requests reached the sidecar: %d", attempts.Load())
+	}
+	if _, err := client.Deliver(context.Background(), chatsdk.DeliverRequest{
+		DeliveryID: "d1", Key: "telegram", Target: target, Kind: chatsdk.DeliverMessage,
+		Body: chatsdk.OutboundBody{Markdown: "hi"},
+	}); err == nil || !boardsync.IsPermanent(err) {
+		t.Fatalf("invalid posted = %v, want permanent", err)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("invalid posted attempts = %d", attempts.Load())
 	}
 }

@@ -620,9 +620,9 @@ message and removes those copy rows as it goes.
 Each connection must also recognize its own platform posts. Slack and Linear
 without a bot identity are refused at `board serve` startup; adapters expose
 `SelfIDs` and the registry drops a matching author before the inbox, beside
-each adapter's own check. The generic Chat SDK bridge still relies on the
-marker, so a platform that strips HTML comments should not mirror through it
-without an identity hook.
+each adapter's own check. The generic Chat SDK bridge follows the same rule:
+`chatsdk.New` and `chatsdk.NewRemoteAdapter` require self author IDs and fail
+closed without them. There is no marker fallback in bridge v1.
 
 The subscription is supervised per key: a board/store error is logged with
 `tenant` and `key` and the consumer restarts with exponential backoff
@@ -1028,9 +1028,11 @@ Recorded in `docs/PORTING.md` as well:
 * Platform root recovery: a reply on a thread the board hasn't mapped is a
   new root built from the reply when an import channel is given, rather than a
   `RootFetcher` read of the platform's real root. `FetchRoot` is not called.
-* Chat SDK identity: the bridge defines no bot identity, so echo suppression
-  there relies on the marker. A platform that strips HTML comments should not
-  mirror a channel through the generic bridge without an identity hook.
+* Chat SDK identity: the bridge has no implicit bot identity. A sidecar must
+  name its own author IDs (`SelfIDs`/`KEEL_SYNC_<KEY>_SELF_IDS`), and provider
+  construction fails closed without them. There is no marker fallback in v1; a
+  platform that strips HTML comments still works because identity, not a
+  marker, is the echo guard.
 * Full lifecycle reconciliation: labels and a reply are imported, and a root
   can be created, but `Owns` prefixes, review conversations, and issue moves
   are not reconciled.

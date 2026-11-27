@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +27,7 @@ const bridgeTestSecret = boardsync.Secret("telegram-bridge-secret")
 type bridgeHarness struct {
 	t        *testing.T
 	http     *httptest.Server
-	store    *syncstore.Memory
+	store    syncstore.Store
 	registry *boardsync.Registry
 	server   *server.Server
 	logs     *bytes.Buffer
@@ -33,13 +35,18 @@ type bridgeHarness struct {
 
 func newBridgeHarness(t *testing.T) *bridgeHarness {
 	t.Helper()
-	board := log.New(log.Options{})
 	store, err := syncstore.NewMemory(syncstore.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return newBridgeHarnessWithStore(t, store)
+}
+
+func newBridgeHarnessWithStore(t *testing.T, store syncstore.Store) *bridgeHarness {
+	t.Helper()
+	board := log.New(log.Options{})
 	adapter := &chatsdk.FuncAdapter{PlatformName: "telegram"}
-	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter})
+	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: adapter, SelfIDs: []string{"telegram:user:bot"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,6 +157,21 @@ func TestBridgeEventsStoresNormalizedEvent(t *testing.T) {
 	event := items[0].Event
 	if event.Key != "telegram" || event.Platform != "telegram" || event.ID != "m1" || event.Text != "hello" {
 		t.Fatalf("stored event = %+v", event)
+	}
+}
+
+func TestBridgeEventsDropsSelfAuthoredEvent(t *testing.T) {
+	h := newBridgeHarness(t)
+	batch := bridgeEvent("bot-1", "-100", "our own post")
+	batch.Events[0].Event.Author = boardsync.Author{ID: "telegram:user:bot", Handle: "bridge", Name: "bridge", Bot: true}
+	now := time.Now().Unix()
+	status, body := doBridge(t, signedBridgeRequest(t, h.url("telegram"), batch, bridgeTestSecret, now, "nonce-0123456789"))
+	if status != http.StatusOK || body["stored"] != 0 {
+		t.Fatalf("status/body = %d %+v", status, body)
+	}
+	depth, err := h.store.InboxDepth(t.Context(), "t1", "telegram")
+	if err != nil || depth.Pending != 0 {
+		t.Fatalf("self-authored event reached the inbox: %+v, %v", depth, err)
 	}
 }
 
@@ -289,7 +311,7 @@ func TestBridgeEventsMissingSecretFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: &chatsdk.FuncAdapter{PlatformName: "telegram"}})
+	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: &chatsdk.FuncAdapter{PlatformName: "telegram"}, SelfIDs: []string{"telegram:user:bot"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +347,7 @@ func TestBridgeTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: &chatsdk.FuncAdapter{PlatformName: "telegram"}})
+	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: &chatsdk.FuncAdapter{PlatformName: "telegram"}, SelfIDs: []string{"telegram:user:bot"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +368,9 @@ func TestBridgeTenantIsolation(t *testing.T) {
 		Board: board,
 		Sync: &server.SyncOptions{
 			Store: store, Registry: registry,
-			Tenant:       func(*http.Request) (string, error) { return "a", nil },
+			Tenant: func(r *http.Request) (string, error) {
+				return strings.TrimSpace(r.Header.Get("X-Board-Tenant")), nil
+			},
 			BridgeSecret: func(tenant string, key boardsync.Key) (boardsync.Secret, bool) { return secrets[tenant], true },
 		},
 	})
@@ -354,17 +378,107 @@ func TestBridgeTenantIsolation(t *testing.T) {
 	t.Cleanup(httpServer.Close)
 	url := httpServer.URL + server.APIPrefix + "/sync/bridge/telegram/events"
 	now := time.Now().Unix()
-	// Tenant B's secret must not authenticate into tenant A.
-	if status, _ := doBridge(t, signedBridgeRequest(t, url, bridgeEvent("m1", "-100", "hi"), secrets["b"], now, "nonce-0123456789")); status != http.StatusUnauthorized {
-		t.Fatalf("cross-tenant secret = %d", status)
+	request := func(tenant string, secret boardsync.Secret, nonce string) *http.Request {
+		r := signedBridgeRequest(t, url, bridgeEvent("m1", "-100", "hi"), secret, now, nonce)
+		r.Header.Set("X-Board-Tenant", tenant)
+		return r
 	}
-	if status, _ := doBridge(t, signedBridgeRequest(t, url, bridgeEvent("m1", "-100", "hi"), secrets["a"], now, "nonce-0123456780")); status != http.StatusOK {
-		t.Fatalf("own secret = %d", status)
+	// Each tenant's secret only authenticates its own tenant header.
+	if status, _ := doBridge(t, request("a", secrets["b"], "nonce-0123456789")); status != http.StatusUnauthorized {
+		t.Fatalf("tenant A with B's secret = %d", status)
 	}
-	if depth, _ := store.InboxDepth(t.Context(), "b", "telegram"); depth.Pending != 0 {
-		t.Fatalf("tenant B got a row: %+v", depth)
+	if status, _ := doBridge(t, request("b", secrets["a"], "nonce-0123456788")); status != http.StatusUnauthorized {
+		t.Fatalf("tenant B with A's secret = %d", status)
+	}
+	if status, _ := doBridge(t, request("a", secrets["a"], "nonce-0123456780")); status != http.StatusOK {
+		t.Fatalf("tenant A with its secret = %d", status)
+	}
+	if status, _ := doBridge(t, request("b", secrets["b"], "nonce-0123456781")); status != http.StatusOK {
+		t.Fatalf("tenant B with its secret = %d", status)
 	}
 	if depth, _ := store.InboxDepth(t.Context(), "a", "telegram"); depth.Pending != 1 {
 		t.Fatalf("tenant A row = %+v", depth)
+	}
+	if depth, _ := store.InboxDepth(t.Context(), "b", "telegram"); depth.Pending != 1 {
+		t.Fatalf("tenant B row = %+v", depth)
+	}
+}
+
+type bridgeFailStore struct {
+	syncstore.Store
+	pushErr    error
+	nonceErr   error
+	pushCalls  atomic.Int64
+	nonceCalls atomic.Int64
+}
+
+func (s *bridgeFailStore) PushInbox(ctx context.Context, tenant string, key boardsync.Key, records []boardsync.Record) (syncstore.InboxPush, error) {
+	s.pushCalls.Add(1)
+	if s.pushErr != nil {
+		return syncstore.InboxPush{}, s.pushErr
+	}
+	return s.Store.PushInbox(ctx, tenant, key, records)
+}
+
+func (s *bridgeFailStore) ClaimNonce(ctx context.Context, tenant string, key boardsync.Key, nonce string, ttl time.Duration) (bool, error) {
+	s.nonceCalls.Add(1)
+	if s.nonceErr != nil {
+		return false, s.nonceErr
+	}
+	return s.Store.ClaimNonce(ctx, tenant, key, nonce, ttl)
+}
+
+func TestBridgeEventsStoreFailureIs500(t *testing.T) {
+	memory, err := syncstore.NewMemory(syncstore.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &bridgeFailStore{Store: memory, pushErr: errors.New("inbox is down")}
+	h := newBridgeHarnessWithStore(t, store)
+	now := time.Now().Unix()
+	status, _ := doBridge(t, signedBridgeRequest(t, h.url("telegram"), bridgeEvent("m1", "-100", "hi"), bridgeTestSecret, now, "nonce-0123456789"))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("store failure = %d, want 500", status)
+	}
+	if store.pushCalls.Load() != 1 {
+		t.Fatalf("push calls = %d", store.pushCalls.Load())
+	}
+	depth, err := memory.InboxDepth(t.Context(), "t1", "telegram")
+	if err != nil || depth.Pending != 0 || depth.Done != 0 {
+		t.Fatalf("failed store wrote a row: %+v, %v", depth, err)
+	}
+}
+
+func TestBridgeEventsNonceFailureIs500AndSkipsInbox(t *testing.T) {
+	memory, err := syncstore.NewMemory(syncstore.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &bridgeFailStore{Store: memory, nonceErr: errors.New("nonce table is down")}
+	h := newBridgeHarnessWithStore(t, store)
+	now := time.Now().Unix()
+	status, _ := doBridge(t, signedBridgeRequest(t, h.url("telegram"), bridgeEvent("m1", "-100", "hi"), bridgeTestSecret, now, "nonce-0123456789"))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("nonce failure = %d, want 500", status)
+	}
+	if store.nonceCalls.Load() != 1 {
+		t.Fatalf("nonce calls = %d", store.nonceCalls.Load())
+	}
+	if store.pushCalls.Load() != 0 {
+		t.Fatalf("inbox was pushed after a nonce failure: %d", store.pushCalls.Load())
+	}
+}
+
+func TestBridgeEventsPlatformMismatchIs500(t *testing.T) {
+	h := newBridgeHarness(t)
+	if _, err := h.store.UpsertEntry(t.Context(), syncstore.Entry{
+		Tenant: "t1", Key: "telegram", Platform: "discord", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Unix()
+	status, _ := doBridge(t, signedBridgeRequest(t, h.url("telegram"), bridgeEvent("m1", "-100", "hi"), bridgeTestSecret, now, "nonce-0123456789"))
+	if status != http.StatusInternalServerError {
+		t.Fatalf("platform mismatch = %d, want 500", status)
 	}
 }

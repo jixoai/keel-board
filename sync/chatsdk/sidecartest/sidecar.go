@@ -63,6 +63,7 @@ type Sidecar struct {
 	delivered  []chatsdk.DeliverRequest
 	resolved   []chatsdk.ResolveRequest
 	byDelivery map[string]boardsync.Posted
+	nonces     map[string]time.Time
 	now        func() time.Time
 }
 
@@ -83,6 +84,7 @@ func New(key boardsync.Key, platform boardsync.Platform, secret boardsync.Secret
 	sidecar := &Sidecar{
 		Key: key, Platform: platform, Secret: secret, Adapter: adapter,
 		byDelivery: make(map[string]boardsync.Posted),
+		nonces:     make(map[string]time.Time),
 		now:        time.Now,
 	}
 	sidecar.Server = httptest.NewServer(http.HandlerFunc(sidecar.handle))
@@ -163,6 +165,10 @@ func (s *Sidecar) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	if !s.claimNonce(r.Header.Get(chatsdk.HeaderNonce)) {
+		http.Error(w, "nonce replayed", http.StatusConflict)
+		return
+	}
 	switch r.URL.Path {
 	case "/deliver":
 		s.deliver(w, body)
@@ -171,6 +177,24 @@ func (s *Sidecar) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// claimNonce enforces the sidecar's half of the replay window. A fixture only
+// needs one entry, so the nonce is scoped to this server.
+func (s *Sidecar) claimNonce(nonce string) bool {
+	now := s.now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for value, expires := range s.nonces {
+		if !expires.After(now) {
+			delete(s.nonces, value)
+		}
+	}
+	if expires, seen := s.nonces[nonce]; seen && expires.After(now) {
+		return false
+	}
+	s.nonces[nonce] = now.Add(chatsdk.DefaultWindow)
+	return true
 }
 
 func (s *Sidecar) deliver(w http.ResponseWriter, body []byte) {

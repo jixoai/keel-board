@@ -38,8 +38,11 @@ type InboundWorkerConfig struct {
 	PollInterval time.Duration
 	// Defer is how long a job is released when its entry isn't ready. Zero
 	// means one second.
-	Defer  time.Duration
-	Logger *slog.Logger
+	Defer time.Duration
+	// PruneInterval is how often Run prunes expired bridge nonces for this
+	// tenant. Zero means ten minutes; a negative value disables the janitor.
+	PruneInterval time.Duration
+	Logger        *slog.Logger
 }
 
 // InboundWorker leases and imports inbox items. The import is idempotent by
@@ -55,6 +58,7 @@ type InboundWorker struct {
 	limit    int
 	poll     time.Duration
 	deferFor time.Duration
+	prune    time.Duration
 	logger   *slog.Logger
 }
 
@@ -78,6 +82,9 @@ func NewInboundWorker(cfg InboundWorkerConfig) (*InboundWorker, error) {
 	if cfg.Defer <= 0 {
 		cfg.Defer = time.Second
 	}
+	if cfg.PruneInterval == 0 {
+		cfg.PruneInterval = 10 * time.Minute
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -85,7 +92,7 @@ func NewInboundWorker(cfg InboundWorkerConfig) (*InboundWorker, error) {
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner,
 		tenant: cfg.Tenant, key: cfg.Key, owner: leaseOwner(cfg.Owner),
 		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer,
-		logger: cfg.Logger,
+		prune: cfg.PruneInterval, logger: cfg.Logger,
 	}, nil
 }
 
@@ -165,9 +172,19 @@ func (w *InboundWorker) Process(ctx context.Context) (WorkResult, error) {
 func (w *InboundWorker) Run(ctx context.Context) error {
 	ticker := time.NewTicker(w.poll)
 	defer ticker.Stop()
+	nextPrune := time.Now().Add(w.prune)
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if w.prune > 0 && !time.Now().Before(nextPrune) {
+			// The bridge nonce table is read by the event route; this ticker
+			// keeps it from growing forever. Pruning is tenant-scoped and a
+			// failure doesn't stop imports.
+			if _, err := w.store.PruneNonces(context.WithoutCancel(ctx), w.tenant, time.Now()); err != nil {
+				w.logger.Warn("sync bridge nonce prune failed", "tenant", w.tenant, "error", ErrorCode(err))
+			}
+			nextPrune = time.Now().Add(w.prune)
 		}
 		result, err := w.Process(ctx)
 		if err != nil && ctx.Err() == nil {

@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	boardsync "github.com/jixoai/keel-board/sync"
+)
 
 func TestParseSyncFlags(t *testing.T) {
 	flags := &syncFlags{
@@ -65,5 +70,58 @@ func TestBuildProviderRequiresBotIdentity(t *testing.T) {
 	t.Setenv("KEEL_SYNC_LINEAR_BOT_USER_ID", "app-1")
 	if _, err := buildProvider(linearConfig); err != nil {
 		t.Fatalf("linear with an identity: %v", err)
+	}
+}
+
+func TestBuildProviderChatSDK(t *testing.T) {
+	t.Setenv("KEEL_SYNC_TELEGRAM_PLATFORM", "telegram")
+	t.Setenv("KEEL_SYNC_TELEGRAM_BRIDGE_URL", "http://127.0.0.1:9")
+	t.Setenv("KEEL_SYNC_TELEGRAM_BRIDGE_SECRET", "bridge-secret")
+	config := &keyConfig{key: "telegram", platform: "chatsdk", mirrors: map[string]string{"-100": "support"}}
+	if _, err := buildProvider(config); err == nil {
+		t.Fatal("chatsdk without self IDs should be refused")
+	}
+	t.Setenv("KEEL_SYNC_TELEGRAM_SELF_IDS", "telegram:user:bot")
+	provider, err := buildProvider(config)
+	if err != nil {
+		t.Fatalf("chatsdk provider: %v", err)
+	}
+	if provider.Platform() != "telegram" {
+		t.Fatalf("platform = %q", provider.Platform())
+	}
+	self, ok := provider.(boardsync.SelfIdentifier)
+	if !ok || len(self.SelfIDs()) != 1 || self.SelfIDs()[0] != "telegram:user:bot" {
+		t.Fatalf("self IDs = %+v", self)
+	}
+	t.Setenv("KEEL_SYNC_TELEGRAM_BRIDGE_URL", "")
+	if _, err := buildProvider(config); err == nil {
+		t.Fatal("chatsdk without a bridge URL should be refused")
+	}
+}
+
+func TestBuildSyncOptionsChatSDK(t *testing.T) {
+	t.Setenv("KEEL_SYNC_TELEGRAM_PLATFORM", "telegram")
+	t.Setenv("KEEL_SYNC_TELEGRAM_BRIDGE_URL", "http://127.0.0.1:9")
+	t.Setenv("KEEL_SYNC_TELEGRAM_BRIDGE_SECRET", "bridge-secret")
+	t.Setenv("KEEL_SYNC_TELEGRAM_SELF_IDS", "telegram:user:bot")
+	runtime, err := buildSyncOptions(context.Background(), &syncFlags{
+		tenant:  "t1",
+		keys:    []string{"telegram=chatsdk"},
+		mirrors: []string{"telegram=-100:support"},
+	}, "t1")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	t.Cleanup(runtime.closeStore)
+	entry, ok := runtime.registry.Get("t1", "telegram")
+	if !ok || entry.Platform != "telegram" {
+		t.Fatalf("entry = %+v, %v", entry, ok)
+	}
+	stored, found, err := runtime.store.Entry(context.Background(), "t1", "telegram")
+	if err != nil || !found || stored.Platform != "telegram" {
+		t.Fatalf("stored entry = %+v, %v, %v", stored, found, err)
+	}
+	if secret := runtime.bridgeSecrets["telegram"]; secret != "bridge-secret" {
+		t.Fatalf("bridge secret = %q", secret)
 	}
 }

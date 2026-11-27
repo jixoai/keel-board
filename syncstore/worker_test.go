@@ -3,6 +3,7 @@ package syncstore_test
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,5 +313,46 @@ func TestInboundCrashAfterImportBeforeAck(t *testing.T) {
 	depth, err := memory.InboxDepth(ctx, "t1", "slack")
 	if err != nil || depth.Done != 1 {
 		t.Fatalf("depth after recovery = %+v, %v", depth, err)
+	}
+}
+
+type pruneCounter struct {
+	syncstore.Store
+	count atomic.Int64
+}
+
+func (p *pruneCounter) PruneNonces(ctx context.Context, tenant string, before time.Time) (int64, error) {
+	p.count.Add(1)
+	return p.Store.PruneNonces(ctx, tenant, before)
+}
+
+func TestInboundWorkerPrunesBridgeNonces(t *testing.T) {
+	memory, err := syncstore.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &pruneCounter{Store: memory}
+	registry := boardsync.NewRegistry()
+	provider := fake.New("telegram", boardsync.Capabilities{})
+	if err := registry.Add(boardsync.Entry{
+		Tenant: "t1", Key: "telegram", Platform: "telegram", Provider: provider, Sync: boardsync.Noop,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	worker, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
+		Store: store, Registry: registry, Runner: boardsync.NewRunner(fake.NewHost()),
+		Tenant: "t1", Key: "telegram", PollInterval: time.Millisecond,
+		PruneInterval: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Millisecond)
+	defer cancel()
+	if err := worker.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("run = %v", err)
+	}
+	if store.count.Load() == 0 {
+		t.Fatal("the inbound worker never pruned bridge nonces")
 	}
 }

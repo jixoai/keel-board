@@ -33,6 +33,7 @@ import (
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
+	boardsync "github.com/jixoai/keel-board/sync"
 )
 
 func main() {
@@ -73,7 +74,9 @@ without it they live in memory and are gone when the process ends.
 Sync is disabled unless at least one --sync-key is given. Each key's
 credentials come from KEEL_SYNC_<KEY>_* environment variables (SIGNING_SECRET or
 WEBHOOK_SECRET, BOT_TOKEN/TOKEN, BOT_USER_ID, and the platform's allowlists);
-secrets never come from flags or the board log. One process must own each key.
+for a chatsdk key (--sync-key key=chatsdk) use BRIDGE_URL, BRIDGE_SECRET,
+PLATFORM, and SELF_IDS. Secrets never come from flags or the board log. One
+process must own each key.
 `)
 }
 
@@ -165,7 +168,14 @@ func serve(args []string) error {
 			Tenant:        func(*http.Request) (string, error) { return syncRuntime.tenant, nil },
 			Owned:         syncRuntime.owned,
 			StartChannels: syncRuntime.startChannels,
-			Logger:        logger,
+			BridgeSecret: func(tenant string, key boardsync.Key) (boardsync.Secret, bool) {
+				if tenant != syncRuntime.tenant {
+					return "", false
+				}
+				secret, ok := syncRuntime.bridgeSecrets[key]
+				return secret, ok
+			},
+			Logger: logger,
 		}
 	}
 	api := devServer(logger, board, blobs, syncOptions)

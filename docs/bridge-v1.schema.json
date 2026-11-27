@@ -7,54 +7,114 @@
     "author": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id"],
+      "required": [
+        "id"
+      ],
       "properties": {
-        "id": { "type": "string", "minLength": 1, "maxLength": 300 },
-        "handle": { "type": "string", "maxLength": 300 },
-        "name": { "type": "string", "maxLength": 300 },
-        "avatar": { "type": "string" },
-        "bot": { "type": "boolean" }
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "handle": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "avatar": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "bot": {
+          "type": "boolean"
+        }
       }
     },
     "file": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "type": { "type": "string" },
-        "name": { "type": "string" },
-        "mimeType": { "type": "string" },
-        "size": { "type": "integer", "minimum": 0 },
-        "url": { "type": "string" },
-        "fetchMetadata": { "type": "object", "additionalProperties": { "type": "string" } }
+        "type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "mimeType": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "url": {
+          "type": "string"
+        },
+        "fetchMetadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
       }
     },
     "link": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["url"],
+      "required": [
+        "url"
+      ],
       "properties": {
-        "url": { "type": "string" },
-        "thread": { "type": "string" },
-        "message": { "type": "string" },
-        "available": { "type": "boolean" },
-        "why": { "type": "string" },
+        "url": {
+          "type": "string"
+        },
+        "thread": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "why": {
+          "type": "string"
+        },
         "snapshot": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["author", "text"],
+          "required": [
+            "author",
+            "text"
+          ],
           "properties": {
-            "author": { "type": "string" },
-            "text": { "type": "string" },
-            "createdAt": { "type": "string" },
+            "author": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "createdAt": {
+              "type": "string"
+            },
             "files": {
               "type": "array",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["name"],
+                "required": [
+                  "name"
+                ],
                 "properties": {
-                  "name": { "type": "string" },
-                  "url": { "type": "string" }
+                  "name": {
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
                 }
               }
             }
@@ -65,180 +125,515 @@
     "lifecycle": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "title"],
+      "required": [
+        "type"
+      ],
       "properties": {
-        "type": { "type": "string", "minLength": 1 },
-        "title": { "type": "string" },
-        "url": { "type": "string" },
-        "body": { "type": "string" },
-        "labels": { "type": "object", "additionalProperties": { "type": "string" } },
-        "unset": { "type": "array", "items": { "type": "string" } },
-        "owns": { "type": "array", "items": { "type": "string" } },
-        "reply": { "type": "string" },
-        "createRoot": { "type": "boolean" },
-        "retitled": { "type": "boolean" }
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "body": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "labels": {
+          "type": "object",
+          "propertyNames": {
+            "maxLength": 200
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 1000
+          }
+        },
+        "unset": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "owns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "reply": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "createRoot": {
+          "type": "boolean"
+        },
+        "retitled": {
+          "type": "boolean"
+        }
       }
     },
     "event": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["kind", "type", "channel", "thread", "author"],
+      "required": [
+        "kind",
+        "type",
+        "channel",
+        "thread",
+        "author"
+      ],
       "properties": {
-        "id": { "type": "string", "maxLength": 300 },
-        "key": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
-        "platform": { "type": "string", "minLength": 1 },
-        "kind": { "enum": ["message", "edited", "deleted", "reaction", "lifecycle"] },
-        "type": { "type": "string", "minLength": 1 },
-        "channel": { "type": "string", "minLength": 1 },
-        "thread": { "type": "string", "minLength": 1 },
-        "subthread": { "type": "string" },
-        "message": { "type": "string" },
-        "isRoot": { "type": "boolean" },
-        "text": { "type": "string" },
-        "author": { "$ref": "#/$defs/author" },
-        "context": { "type": "string" },
-        "emoji": { "type": "string" },
-        "added": { "type": "boolean" },
-        "files": { "type": "array", "items": { "$ref": "#/$defs/file" } },
-        "links": { "type": "array", "items": { "$ref": "#/$defs/link" } },
-        "mentioned": { "type": "array", "items": { "$ref": "#/$defs/author" } },
-        "lifecycle": { "$ref": "#/$defs/lifecycle" },
+        "id": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^(|[a-z0-9][a-z0-9_-]{0,63})$"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "message",
+            "edited",
+            "deleted",
+            "reaction",
+            "lifecycle"
+          ]
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "channel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thread": {
+          "type": "string",
+          "minLength": 1
+        },
+        "subthread": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "isRoot": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": "string"
+        },
+        "author": {
+          "$ref": "#/$defs/author"
+        },
+        "context": {
+          "type": "string"
+        },
+        "emoji": {
+          "type": "string"
+        },
+        "added": {
+          "type": "boolean"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/link"
+          }
+        },
+        "mentioned": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/author"
+          }
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycle"
+        },
         "raw": {}
       }
     },
     "inboundEvent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["dedupe", "event"],
+      "required": [
+        "dedupe",
+        "event"
+      ],
       "properties": {
-        "dedupe": { "type": "string", "minLength": 1, "maxLength": 300 },
-        "event": { "$ref": "#/$defs/event" }
+        "dedupe": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "event": {
+          "$ref": "#/$defs/event"
+        }
       }
     },
     "inboundBatch": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["events"],
+      "required": [
+        "events"
+      ],
       "properties": {
-        "version": { "const": "1" },
+        "version": {
+          "const": "1"
+        },
         "events": {
           "type": "array",
           "maxItems": 100,
-          "items": { "$ref": "#/$defs/inboundEvent" }
+          "items": {
+            "$ref": "#/$defs/inboundEvent"
+          }
         }
       }
     },
     "resolvedTarget": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["key", "platform", "channel", "kind"],
+      "required": [
+        "key",
+        "platform",
+        "channel",
+        "kind"
+      ],
       "properties": {
-        "key": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
-        "platform": { "type": "string", "minLength": 1 },
-        "channel": { "type": "string", "minLength": 1 },
-        "thread": { "type": "string" },
-        "subthread": { "type": "string" },
-        "kind": { "enum": ["channel", "thread"] }
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "channel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thread": {
+          "type": "string"
+        },
+        "subthread": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "channel",
+            "thread"
+          ]
+        }
       }
     },
     "outboundBody": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "markdown": { "type": "string", "maxLength": 262144 },
+        "markdown": {
+          "type": "string",
+          "maxLength": 262144
+        },
         "sender": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["name"],
+          "required": [
+            "name"
+          ],
           "properties": {
-            "name": { "type": "string" },
-            "avatar": { "type": "string" },
-            "attribution": { "type": "string" }
+            "name": {
+              "type": "string",
+              "maxLength": 300
+            },
+            "avatar": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "attribution": {
+              "type": "string",
+              "maxLength": 300
+            }
           }
         },
-        "external": { "type": "boolean" },
-        "boardMessage": { "type": "integer", "minimum": 0 },
-        "boardThread": { "type": "integer", "minimum": 0 }
+        "external": {
+          "type": "boolean"
+        },
+        "boardMessage": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boardThread": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "deliverRequest": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["deliveryId", "key", "target", "kind", "body"],
+      "required": [
+        "deliveryId",
+        "key",
+        "target",
+        "kind",
+        "body"
+      ],
       "properties": {
-        "deliveryId": { "type": "string", "minLength": 1, "maxLength": 300 },
-        "key": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
-        "target": { "$ref": "#/$defs/resolvedTarget" },
-        "kind": { "enum": ["message", "edit", "delete", "reaction"] },
-        "body": { "$ref": "#/$defs/outboundBody" },
-        "message": { "type": "string" },
-        "emoji": { "type": "string" },
-        "added": { "type": "boolean" }
+        "deliveryId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "key": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$"
+        },
+        "target": {
+          "$ref": "#/$defs/resolvedTarget"
+        },
+        "kind": {
+          "enum": [
+            "message",
+            "edit",
+            "delete",
+            "reaction"
+          ]
+        },
+        "body": {
+          "$ref": "#/$defs/outboundBody"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "emoji": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "added": {
+          "type": "boolean"
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "kind": { "const": "message" } } },
-          "then": { "properties": { "body": { "required": ["markdown"] } } }
-        },
-        {
-          "if": { "properties": { "kind": { "const": "edit" } } },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "message"
+              }
+            }
+          },
           "then": {
-            "required": ["message"],
-            "properties": { "body": { "required": ["markdown"] } }
+            "properties": {
+              "body": {
+                "required": [
+                  "markdown"
+                ]
+              }
+            }
           }
         },
         {
-          "if": { "properties": { "kind": { "const": "delete" } } },
-          "then": { "required": ["message"] }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "edit"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "message"
+            ],
+            "properties": {
+              "body": {
+                "required": [
+                  "markdown"
+                ]
+              }
+            }
+          }
         },
         {
-          "if": { "properties": { "kind": { "const": "reaction" } } },
-          "then": { "required": ["message", "emoji"] }
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "delete"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "message"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "reaction"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "message",
+              "emoji"
+            ]
+          }
         }
       ]
     },
     "deliverResponse": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["thread", "message"],
+      "required": [
+        "thread",
+        "message"
+      ],
       "properties": {
-        "thread": { "type": "string", "minLength": 1 },
-        "message": { "type": "string", "minLength": 1 },
-        "files": { "type": "array", "items": { "type": "string" } }
+        "thread": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
     "resolveRequest": {
       "type": "object",
       "additionalProperties": false,
       "oneOf": [
-        { "required": ["name"] },
-        { "required": ["target"] }
+        {
+          "required": [
+            "name"
+          ]
+        },
+        {
+          "required": [
+            "target"
+          ]
+        }
       ],
       "properties": {
-        "name": { "type": "string", "maxLength": 500 },
-        "target": { "type": "string", "maxLength": 500 }
+        "name": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "target": {
+          "type": "string",
+          "maxLength": 500
+        }
       }
     },
     "resolveResponse": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "channel": { "type": "string" },
-        "target": { "$ref": "#/$defs/resolvedTarget" }
+        "channel": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/resolveTarget"
+        }
       },
       "oneOf": [
-        { "required": ["channel"] },
-        { "required": ["target"] }
+        {
+          "required": [
+            "channel"
+          ]
+        },
+        {
+          "required": [
+            "target"
+          ]
+        }
       ]
     },
     "error": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code"],
+      "required": [
+        "code"
+      ],
       "properties": {
-        "code": { "enum": ["unsupported", "auth", "permanent", "rate_limited", "transient"] },
-        "message": { "type": "string" },
-        "retryAfter": { "type": "integer", "minimum": 0 }
+        "code": {
+          "enum": [
+            "unsupported",
+            "auth",
+            "permanent",
+            "rate_limited",
+            "transient"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "retryAfter": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "resolveTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "channel",
+        "kind"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "pattern": "^(|[a-z0-9][a-z0-9_-]{0,63})$"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "channel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "thread": {
+          "type": "string"
+        },
+        "subthread": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "channel",
+            "thread"
+          ]
+        }
       }
     }
   },

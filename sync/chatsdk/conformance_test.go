@@ -40,6 +40,7 @@ func TestProviderConformance(t *testing.T) {
 	t.Cleanup(sidecar.Close)
 	client, err := chatsdk.NewClient(chatsdk.ClientConfig{
 		BaseURL: sidecar.URL(), Secret: bridgeSecret, Key: "telegram",
+		Platform: "telegram", SelfIDs: []string{"telegram:user:bot"},
 		Retry: boardsync.RetryPolicy{MaxAttempts: 1},
 	})
 	if err != nil {
@@ -68,7 +69,7 @@ func TestProviderConformance(t *testing.T) {
 		ChannelFunc: remote.ResolveChannel,
 		TargetFunc:  remote.ResolveTarget,
 	}
-	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: bridge, Caps: caps})
+	provider, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: bridge, SelfIDs: []string{"telegram:user:bot"}, Caps: caps})
 	if err != nil {
 		t.Fatal(err)
 	}

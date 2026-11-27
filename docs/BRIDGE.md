@@ -48,6 +48,25 @@ HMAC-SHA256(secret, timestamp_decimal + nonce + body)
 - `docs/bridge-v1.schema.json` is version 1. A future contract version uses a
   different signature prefix and is refused by this implementation.
 
+## Identity and echo suppression
+
+The sidecar must name the platform author IDs that belong to the connection:
+its bot, app, or service user. The board needs them before it can mirror a
+channel, because an inbound event authored by the bridge itself must be dropped
+before it reaches the inbox.
+
+- `chatsdk.Config.SelfIDs` (board-side provider) and
+  `chatsdk.ClientConfig.SelfIDs` (sidecar adapter) are required.
+  `chatsdk.New`/`chatsdk.NewRemoteAdapter` return an error without them.
+- The registry compares an inbound event's `author.id` exactly. Configure the
+  IDs as the sidecar emits them, including any platform prefix
+  (`telegram:user:77`); both that form and the unprefixed form can be listed.
+- There is no marker fallback in v1. A sidecar whose platform strips HTML
+  comments is fine as long as it supplies these IDs; a sidecar that cannot
+  name its own posts must not be mirrored.
+- `board serve` reads them from `KEEL_SYNC_<KEY>_SELF_IDS` for a
+  `--sync-key key=chatsdk` connection and refuses the connection when empty.
+
 ## Limits
 
 Both directions enforce the same bounds before parsing:
@@ -154,8 +173,10 @@ reaction. A successful answer is:
 ```
 
 The sidecar answers with `thread` and `message` (and optional `files`) as
-`sync.Posted`. Errors use the body below; the HTTP status is derived from the
-code:
+`sync.Posted`. A delivery to a channel target is a new root: the sidecar must
+return the platform thread it created, not an empty thread. A later reply uses
+that returned thread as its thread target. Errors use the body below; the HTTP
+status is derived from the code:
 
 | Code | Status | Retry |
 | --- | --- | --- |
@@ -170,12 +191,14 @@ code:
 ```
 
 The board retries `transient`, `rate_limited`, network errors and 5xx with the
-standard sync policy (five tries, 1s doubling to 30s, jitter), re-signing each
+durable outbox policy (five tries, 1s doubling to 30s, jitter), re-signing each
 attempt with a fresh nonce and timestamp but the same `deliveryId`.
-`retryAfter` is carried for an operator or a caller that wants the platform's
-hint; the retry decision itself uses the code. `auth`, `unsupported` and
-`permanent` are not retried; they surface as a permanent delivery failure and
-the board's outbox moves on.
+A `RemoteAdapter` delivery itself is one attempt: the outbox owns the retry
+budget, so a failure is never multiplied (five client tries inside five outbox
+tries). `retryAfter` is carried for an operator or a caller that wants the
+platform's hint; the retry decision itself uses the code. `auth`,
+`unsupported` and `permanent` are not retried; they surface as a permanent
+delivery failure and the board's outbox moves on.
 
 ## Resolve
 
@@ -192,9 +215,11 @@ or
 ```
 
 The answer is `{"channel":"-1001234567890"}` for a name or
-`{"target":{...ResolvedTarget...}}` for a target. A target must include
-`channel` and `kind`; a thread target also includes `thread`. The sidecar does
-not return credentials, another entry's IDs, or a URL the board should call.
+`{"target":{"channel":"-1001234567890","thread":"-1001234567890:42","kind":"thread"}}`
+for a target. The minimal target is enough: the board fills `key` and
+`platform` from the entry before validating it. A target must include `channel`
+and `kind`; a thread target also includes `thread`. The sidecar does not return
+credentials, another entry's IDs, or a URL the board should call.
 
 ## Board-side implementation
 

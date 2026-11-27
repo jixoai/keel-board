@@ -29,13 +29,22 @@ type ClientConfig struct {
 	// Key is the entry this client serves; a delivery for another key is
 	// refused before it leaves the process.
 	Key boardsync.Key
-	// HTTPClient overrides the default client. The default refuses redirects,
-	// so a signed body never leaves the configured origin.
+	// Platform is the entry's platform. It lets a minimal resolve answer
+	// ({channel,thread,kind}) be completed and validated; RemoteAdapter also
+	// supplies it.
+	Platform boardsync.Platform
+	// SelfIDs are the sidecar's own author IDs, required by RemoteAdapter so
+	// the board can drop the bridge's own posts. A bare Client may omit them.
+	SelfIDs []string
+	// HTTPClient overrides the default client. Redirects are always refused
+	// on a copy, so a signed body never leaves the configured origin.
 	HTTPClient *http.Client
 	// Timeout bounds one attempt. Zero means 15 seconds; it is ignored when
 	// HTTPClient supplies its own timeout.
 	Timeout time.Duration
-	// Retry is the delivery retry policy. Zero means sync.DefaultRetry.
+	// Retry is the delivery retry policy for a direct Client.Deliver. Zero
+	// means sync.DefaultRetry. RemoteAdapter deliveries are single-attempt:
+	// the durable outbox owns their retry budget.
 	Retry boardsync.RetryPolicy
 	// Now and Nonce are test seams. Nonce must return a new value per call.
 	Now   func() time.Time
@@ -44,13 +53,15 @@ type ClientConfig struct {
 
 // Client speaks the board-to-sidecar half of bridge v1.
 type Client struct {
-	baseURL string
-	secret  boardsync.Secret
-	key     boardsync.Key
-	http    *http.Client
-	retry   boardsync.RetryPolicy
-	now     func() time.Time
-	nonce   func() (string, error)
+	baseURL  string
+	secret   boardsync.Secret
+	key      boardsync.Key
+	platform boardsync.Platform
+	selfIDs  []string
+	http     *http.Client
+	retry    boardsync.RetryPolicy
+	now      func() time.Time
+	nonce    func() (string, error)
 }
 
 // NewClient validates cfg and returns a client. It performs no I/O.
@@ -64,6 +75,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	if !cfg.Key.Valid() {
 		return nil, fmt.Errorf("%w: %q isn't a sync key", boardsync.ErrBadRequest, cfg.Key)
+	}
+	selfIDs, err := cleanSelfIDs(cfg.SelfIDs)
+	if err != nil {
+		return nil, err
 	}
 	retry, err := cfg.Retry.Validate()
 	if err != nil {
@@ -81,18 +96,20 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		if timeout <= 0 {
 			timeout = 15 * time.Second
 		}
-		client = &http.Client{
-			Timeout: timeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				// A redirect would send a signed body somewhere the operator
-				// didn't configure. Treat it as a contract failure.
-				return http.ErrUseLastResponse
-			},
-		}
+		client = &http.Client{Timeout: timeout}
+	} else {
+		// Never mutate the caller's client. Even a caller-supplied redirect
+		// policy is overridden: a redirect would take a signed body somewhere
+		// the operator didn't configure.
+		clone := *client
+		client = &clone
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 	return &Client{
-		baseURL: base, secret: cfg.Secret, key: cfg.Key, http: client,
-		retry: retry, now: cfg.Now, nonce: cfg.Nonce,
+		baseURL: base, secret: cfg.Secret, key: cfg.Key, platform: cfg.Platform,
+		selfIDs: selfIDs, http: client, retry: retry, now: cfg.Now, nonce: cfg.Nonce,
 	}, nil
 }
 
@@ -144,6 +161,16 @@ func randomNonce() (string, error) {
 // transient and rate-limited failures with the configured policy, signing
 // every attempt fresh but keeping the delivery ID.
 func (c *Client) Deliver(ctx context.Context, req DeliverRequest) (boardsync.Posted, error) {
+	return c.deliver(ctx, req, c.retry)
+}
+
+// deliverOnce is the outbound-provider path: the durable outbox owns the retry
+// budget, so one provider call is one attempt, never five times five.
+func (c *Client) deliverOnce(ctx context.Context, req DeliverRequest) (boardsync.Posted, error) {
+	return c.deliver(ctx, req, boardsync.RetryPolicy{MaxAttempts: 1})
+}
+
+func (c *Client) deliver(ctx context.Context, req DeliverRequest, policy boardsync.RetryPolicy) (boardsync.Posted, error) {
 	if req.Key == "" {
 		req.Key = c.key
 	}
@@ -154,7 +181,7 @@ func (c *Client) Deliver(ctx context.Context, req DeliverRequest) (boardsync.Pos
 		return boardsync.Posted{}, err
 	}
 	var posted boardsync.Posted
-	if err := c.post(ctx, "/deliver", req, &posted); err != nil {
+	if err := c.post(ctx, "/deliver", req, &posted, policy); err != nil {
 		return boardsync.Posted{}, err
 	}
 	if err := posted.Validate(); err != nil {
@@ -170,7 +197,7 @@ func (c *Client) Resolve(ctx context.Context, req ResolveRequest) (ResolveRespon
 		return ResolveResponse{}, err
 	}
 	var response ResolveResponse
-	if err := c.post(ctx, "/resolve", req, &response); err != nil {
+	if err := c.post(ctx, "/resolve", req, &response, c.retry); err != nil {
 		return ResolveResponse{}, err
 	}
 	if req.Name != "" {
@@ -182,15 +209,23 @@ func (c *Client) Resolve(ctx context.Context, req ResolveRequest) (ResolveRespon
 	if response.Target == nil {
 		return ResolveResponse{}, boardsync.Permanent(fmt.Errorf("chatsdk: sidecar answered no target for %q", req.Target))
 	}
+	// A sidecar may answer the minimal {channel,thread,kind}; the client owns
+	// the entry identity and fills it before validation.
+	if response.Target.Key == "" {
+		response.Target.Key = c.key
+	}
+	if response.Target.Platform == "" && c.platform != "" {
+		response.Target.Platform = c.platform
+	}
 	if err := response.Target.Validate(); err != nil {
 		return ResolveResponse{}, boardsync.Permanent(fmt.Errorf("chatsdk: sidecar target: %w", err))
 	}
 	return response, nil
 }
 
-// post signs and sends one payload, retrying per c.retry.
-func (c *Client) post(ctx context.Context, path string, payload, out any) error {
-	_, err := boardsync.DoCount(ctx, c.retry, func(ctx context.Context) error {
+// post signs and sends one payload, retrying with policy.
+func (c *Client) post(ctx context.Context, path string, payload, out any, policy boardsync.RetryPolicy) error {
+	_, err := boardsync.DoCount(ctx, policy, func(ctx context.Context) error {
 		return c.attempt(ctx, path, payload, out)
 	})
 	return err
@@ -228,11 +263,13 @@ func (c *Client) attempt(ctx context.Context, path string, payload, out any) err
 	if readErr != nil {
 		return fmt.Errorf("chatsdk: read %s response: %w", path, readErr)
 	}
-	if len(data) > MaxResponseBytes {
-		return boardsync.Permanent(fmt.Errorf("chatsdk: %s response is larger than %d bytes", path, MaxResponseBytes))
-	}
+	// Status first: a 5xx is retryable even when its body is oversized. Only
+	// a successful answer has to fit the response contract.
 	if response.StatusCode < 200 || response.StatusCode > 299 {
 		return bridgeResponseError(response.StatusCode, response.Header, data)
+	}
+	if len(data) > MaxResponseBytes {
+		return boardsync.Permanent(fmt.Errorf("chatsdk: %s response is larger than %d bytes", path, MaxResponseBytes))
 	}
 	if out == nil {
 		return nil
@@ -290,7 +327,8 @@ type RemoteAdapter struct {
 	Caps         boardsync.Capabilities
 }
 
-// NewRemoteAdapter validates a sidecar adapter.
+// NewRemoteAdapter validates a sidecar adapter. It requires the sidecar's own
+// author IDs: without them the board would import the bridge's own posts.
 func NewRemoteAdapter(client *Client, platform boardsync.Platform, caps boardsync.Capabilities) (*RemoteAdapter, error) {
 	if client == nil {
 		return nil, fmt.Errorf("%w: a remote adapter needs a bridge client", boardsync.ErrBadRequest)
@@ -298,11 +336,21 @@ func NewRemoteAdapter(client *Client, platform boardsync.Platform, caps boardsyn
 	if strings.TrimSpace(string(platform)) == "" {
 		return nil, fmt.Errorf("%w: a remote adapter needs a platform", boardsync.ErrBadRequest)
 	}
+	if len(client.selfIDs) == 0 {
+		return nil, fmt.Errorf("%w: a remote adapter needs client SelfIDs so its own posts are not imported", boardsync.ErrBadRequest)
+	}
+	if client.platform != "" && client.platform != platform {
+		return nil, fmt.Errorf("%w: bridge client serves %q, not %q", boardsync.ErrBadRequest, client.platform, platform)
+	}
+	client.platform = platform
 	return &RemoteAdapter{Client: client, PlatformName: platform, Caps: caps}, nil
 }
 
 // Platform implements chatsdk.Adapter.
 func (a *RemoteAdapter) Platform() string { return string(a.PlatformName) }
+
+// SelfIDs implements boardsync.SelfIdentifier through the sidecar's identity.
+func (a *RemoteAdapter) SelfIDs() []string { return append([]string(nil), a.Client.selfIDs...) }
 
 // Verify refuses a raw platform webhook. A sidecar verifies the platform and
 // pushes normalized events to the bridge route.
@@ -320,7 +368,7 @@ func (a *RemoteAdapter) Send(ctx context.Context, key boardsync.Key, target boar
 	if len(msg.Files) > 0 {
 		return boardsync.Posted{}, fmt.Errorf("%w: bridge v1 carries no file bytes", boardsync.ErrUnsupported)
 	}
-	return a.Client.Deliver(ctx, DeliverRequest{
+	return a.Client.deliverOnce(ctx, DeliverRequest{
 		DeliveryID: a.deliveryID(DeliverMessage, target, "", msg, "", false),
 		Key:        key,
 		Target:     target,
@@ -341,7 +389,7 @@ func (a *RemoteAdapter) Edit(ctx context.Context, key boardsync.Key, thread boar
 	if err != nil {
 		return err
 	}
-	_, err = a.Client.Deliver(ctx, DeliverRequest{
+	_, err = a.Client.deliverOnce(ctx, DeliverRequest{
 		DeliveryID: a.deliveryID(DeliverEdit, target, message, msg, "", false),
 		Key:        key,
 		Target:     target,
@@ -361,7 +409,7 @@ func (a *RemoteAdapter) Delete(ctx context.Context, key boardsync.Key, thread bo
 	if err != nil {
 		return err
 	}
-	_, err = a.Client.Deliver(ctx, DeliverRequest{
+	_, err = a.Client.deliverOnce(ctx, DeliverRequest{
 		DeliveryID: a.deliveryID(DeliverDelete, target, message, boardsync.OutboundMessage{}, "", false),
 		Key:        key,
 		Target:     target,
@@ -380,7 +428,7 @@ func (a *RemoteAdapter) React(ctx context.Context, key boardsync.Key, thread boa
 	if err != nil {
 		return err
 	}
-	_, err = a.Client.Deliver(ctx, DeliverRequest{
+	_, err = a.Client.deliverOnce(ctx, DeliverRequest{
 		DeliveryID: a.deliveryID(DeliverReaction, target, message, boardsync.OutboundMessage{}, emoji, added),
 		Key:        key,
 		Target:     target,
@@ -466,3 +514,14 @@ func (a *RemoteAdapter) deliveryID(kind DeliverKind, target boardsync.ResolvedTa
 	}, "\x00")))
 	return fmt.Sprintf("delivery:%s:%s:%x", kind, a.Client.key, sum[:12])
 }
+
+// Interface checks.
+var (
+	_ Adapter                  = (*RemoteAdapter)(nil)
+	_ boardsync.SelfIdentifier = (*RemoteAdapter)(nil)
+	_ Editor                   = (*RemoteAdapter)(nil)
+	_ Deleter                  = (*RemoteAdapter)(nil)
+	_ Reactor                  = (*RemoteAdapter)(nil)
+	_ ChannelResolver          = (*RemoteAdapter)(nil)
+	_ TargetResolver           = (*RemoteAdapter)(nil)
+)

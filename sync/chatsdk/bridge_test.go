@@ -3,7 +3,9 @@ package chatsdk_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -192,6 +194,57 @@ func TestDecodeInboundRefusals(t *testing.T) {
 	}
 }
 
+func TestDecodeInboundRejectsUnstorableIDs(t *testing.T) {
+	base := func() boardsync.Event {
+		return boardsync.Event{
+			Kind: boardsync.KindMessage, Type: boardsync.TypeMessage,
+			Channel: "C0123", Thread: "C0123:42", Message: "42", Text: "hello",
+			Author: boardsync.Author{ID: "telegram:user:7", Name: "Ada"},
+		}
+	}
+	cases := []struct {
+		name   string
+		mutate func(*boardsync.Event)
+		dedupe string
+	}{
+		{name: "nul channel", mutate: func(e *boardsync.Event) { e.Channel = "C0\x00123" }},
+		{name: "newline thread", mutate: func(e *boardsync.Event) { e.Thread = "C0123:\n42" }},
+		{name: "nul message", mutate: func(e *boardsync.Event) { e.Message = "4\x002" }},
+		{name: "nul author", mutate: func(e *boardsync.Event) { e.Author.ID = "telegram:\x00bot" }},
+		{name: "nul emoji", mutate: func(e *boardsync.Event) {
+			e.Kind = boardsync.KindReaction
+			e.Type = boardsync.TypeReactionAdded
+			e.Emoji = "x\x00y"
+			e.Added = true
+		}},
+		{name: "overlong channel", mutate: func(e *boardsync.Event) { e.Channel = strings.Repeat("c", 301) }},
+		{name: "overlong author", mutate: func(e *boardsync.Event) { e.Author.ID = strings.Repeat("a", 301) }},
+		{name: "nul dedupe", dedupe: "m\x001"},
+		{name: "nul raw", mutate: func(e *boardsync.Event) { e.Raw = json.RawMessage(`{"x":"\u0000"}`) }},
+		{name: "nul file name", mutate: func(e *boardsync.Event) { e.Files = []boardsync.File{{Name: "a\x00b"}} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			event := base()
+			if tc.mutate != nil {
+				tc.mutate(&event)
+			}
+			dedupe := "m1"
+			if tc.dedupe != "" {
+				dedupe = tc.dedupe
+			}
+			batch := chatsdk.InboundBatch{Version: "1", Events: []chatsdk.InboundEvent{{Dedupe: dedupe, Event: event}}}
+			body, err := json.Marshal(batch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := chatsdk.DecodeInbound(body, "telegram", "telegram"); !errors.Is(err, boardsync.ErrBadRequest) {
+				t.Fatalf("err = %v, want ErrBadRequest", err)
+			}
+		})
+	}
+}
+
 func TestBridgeErrorMappings(t *testing.T) {
 	cases := map[chatsdk.ErrorCode]int{
 		chatsdk.ErrorAuth:        http.StatusUnauthorized,
@@ -215,5 +268,109 @@ func TestBridgeErrorMappings(t *testing.T) {
 	}
 	if chatsdk.ErrorCodeOf(&chatsdk.BridgeError{Code: chatsdk.ErrorAuth}) != chatsdk.ErrorAuth {
 		t.Fatal("ErrorCodeOf lost auth")
+	}
+}
+
+func TestVerifyV1WindowAndNonceBoundaries(t *testing.T) {
+	body := []byte(`{}`)
+	now := time.Unix(1727000400, 0)
+	window := 5 * time.Minute
+	check := func(timestamp int64, nonce string, want error) {
+		t.Helper()
+		signature := chatsdk.SignV1(bridgeSecret, timestamp, nonce, body)
+		err := chatsdk.VerifyV1(bridgeSecret, strconv.FormatInt(timestamp, 10), nonce, signature, body, now, window)
+		if want != nil {
+			if !errors.Is(err, want) {
+				t.Fatalf("timestamp %d nonce %d: err = %v", timestamp, len(nonce), err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("timestamp %d nonce %d: %v", timestamp, len(nonce), err)
+		}
+	}
+	check(now.Unix()-int64(window/time.Second), strings.Repeat("a", 8), nil)
+	check(now.Unix()+int64(window/time.Second), strings.Repeat("a", 128), nil)
+	check(now.Unix()-int64(window/time.Second)-1, "nonce-0123456789", boardsync.ErrUnauthorized)
+	check(now.Unix()+int64(window/time.Second)+1, "nonce-0123456789", boardsync.ErrUnauthorized)
+	check(now.Unix(), strings.Repeat("a", 7), boardsync.ErrUnauthorized)
+	check(now.Unix(), strings.Repeat("a", 129), boardsync.ErrUnauthorized)
+}
+
+func TestDecodeInboundBoundaryLimits(t *testing.T) {
+	event := func(dedupe string) boardsync.Event {
+		return boardsync.Event{
+			Kind: boardsync.KindMessage, Type: boardsync.TypeMessage,
+			Channel: "C0123", Thread: "C0123:42", Message: "42", Text: "hello",
+			Author: boardsync.Author{ID: "telegram:user:7", Name: "Ada"},
+		}
+	}
+	makeBatch := func(count int, dedupeLen int) []byte {
+		events := make([]chatsdk.InboundEvent, count)
+		for i := range events {
+			dedupe := fmt.Sprintf("m%d", i)
+			if dedupeLen > 0 {
+				dedupe = strings.Repeat("d", dedupeLen)
+			}
+			events[i] = chatsdk.InboundEvent{Dedupe: dedupe, Event: event(dedupe)}
+		}
+		body, err := json.Marshal(chatsdk.InboundBatch{Version: "1", Events: events})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	if _, err := chatsdk.DecodeInbound(makeBatch(chatsdk.MaxEvents, 0), "telegram", "telegram"); err != nil {
+		t.Fatalf("%d events: %v", chatsdk.MaxEvents, err)
+	}
+	if _, err := chatsdk.DecodeInbound(makeBatch(chatsdk.MaxEvents+1, 0), "telegram", "telegram"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("%d events = %v", chatsdk.MaxEvents+1, err)
+	}
+	if _, err := chatsdk.DecodeInbound(makeBatch(1, 300), "telegram", "telegram"); err != nil {
+		t.Fatalf("300-byte dedupe: %v", err)
+	}
+	if _, err := chatsdk.DecodeInbound(makeBatch(1, 301), "telegram", "telegram"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("301-byte dedupe = %v", err)
+	}
+	// Exactly the body cap is accepted; one byte more is refused.
+	body := makeBatch(1, 0)
+	body = append(body, []byte(strings.Repeat(" ", chatsdk.MaxBodyBytes-len(body)))...)
+	if len(body) != chatsdk.MaxBodyBytes {
+		t.Fatalf("body = %d", len(body))
+	}
+	if _, err := chatsdk.DecodeInbound(body, "telegram", "telegram"); err != nil {
+		t.Fatalf("exact body cap: %v", err)
+	}
+	if _, err := chatsdk.DecodeInbound(append(body, ' '), "telegram", "telegram"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("body cap + 1 = %v", err)
+	}
+	// Text at the cap is kept; one rune over is clamped, not refused.
+	batch := chatsdk.InboundBatch{Version: "1", Events: []chatsdk.InboundEvent{{Dedupe: "text", Event: event("text")}}}
+	batch.Events[0].Event.Text = strings.Repeat("x", boardsync.MaxTextBytes)
+	encoded, _ := json.Marshal(batch)
+	records, err := chatsdk.DecodeInbound(encoded, "telegram", "telegram")
+	if err != nil || len(records[0].Event.Text) != boardsync.MaxTextBytes {
+		t.Fatalf("text cap = %d, %v", len(records[0].Event.Text), err)
+	}
+	batch.Events[0].Event.Text += "x"
+	encoded, _ = json.Marshal(batch)
+	records, err = chatsdk.DecodeInbound(encoded, "telegram", "telegram")
+	if err != nil || len(records[0].Event.Text) > boardsync.MaxTextBytes {
+		t.Fatalf("text cap + 1 = %d, %v", len(records[0].Event.Text), err)
+	}
+}
+
+func TestNewRequiresSelfIDs(t *testing.T) {
+	if _, err := chatsdk.New(chatsdk.Config{Key: "telegram", Adapter: &chatsdk.FuncAdapter{PlatformName: "telegram"}}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("no self IDs = %v", err)
+	}
+	client, err := chatsdk.NewClient(chatsdk.ClientConfig{
+		BaseURL: "http://127.0.0.1:9", Secret: bridgeSecret, Key: "telegram",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chatsdk.NewRemoteAdapter(client, "telegram", boardsync.Capabilities{}); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("remote without self IDs = %v", err)
 	}
 }

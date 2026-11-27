@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -110,17 +111,49 @@ func (r DeliverRequest) Validate() error {
 	if strings.TrimSpace(r.DeliveryID) == "" || len(r.DeliveryID) > 300 {
 		return fmt.Errorf("%w: delivery needs an ID of at most 300 bytes", boardsync.ErrBadRequest)
 	}
+	if err := checkWireString("deliveryId", r.DeliveryID, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
 	if !r.Key.Valid() {
 		return fmt.Errorf("%w: delivery key %q isn't a sync key", boardsync.ErrBadRequest, r.Key)
 	}
 	if err := r.Target.Validate(); err != nil {
 		return err
 	}
+	if err := checkWireString("target.channel", r.Target.Channel, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
+	if err := checkWireString("target.thread", r.Target.Thread, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
+	if err := checkWireString("target.subthread", r.Target.Subthread, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
+	if err := checkWireString("message", r.Message, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
+	if err := checkWireString("emoji", r.Emoji, 300); err != nil {
+		return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+	}
+	if r.Body.Sender != nil {
+		if err := checkWireString("sender.name", r.Body.Sender.Name, 300); err != nil {
+			return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+		}
+		if err := checkWireString("sender.avatar", r.Body.Sender.Avatar, 2000); err != nil {
+			return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+		}
+		if err := checkWireString("sender.attribution", r.Body.Sender.Attribution, 300); err != nil {
+			return fmt.Errorf("%w: %v", boardsync.ErrBadRequest, err)
+		}
+	}
 	if r.Target.Key != r.Key {
 		return fmt.Errorf("%w: delivery target belongs to %q, not %q", boardsync.ErrBadRequest, r.Target.Key, r.Key)
 	}
 	if !r.Kind.Valid() {
 		return fmt.Errorf("%w: %q isn't a delivery kind", boardsync.ErrBadRequest, r.Kind)
+	}
+	if len(r.Body.Markdown) > boardsync.MaxTextBytes {
+		return fmt.Errorf("%w: delivery markdown is longer than %d bytes", boardsync.ErrBadRequest, boardsync.MaxTextBytes)
 	}
 	switch r.Kind {
 	case DeliverMessage:
@@ -278,6 +311,9 @@ func DecodeInbound(body []byte, key boardsync.Key, platform boardsync.Platform) 
 		if inbound.Dedupe == "" || len(inbound.Dedupe) > 300 {
 			return nil, fmt.Errorf("%w: event %d needs a dedupe ID of at most 300 bytes", boardsync.ErrBadRequest, i)
 		}
+		if err := checkWireString("dedupe", inbound.Dedupe, 300); err != nil {
+			return nil, fmt.Errorf("%w: event %d: %v", boardsync.ErrBadRequest, i, err)
+		}
 		if _, duplicate := seen[inbound.Dedupe]; duplicate {
 			return nil, fmt.Errorf("%w: event %d repeats dedupe %q in one batch", boardsync.ErrBadRequest, i, inbound.Dedupe)
 		}
@@ -295,7 +331,16 @@ func DecodeInbound(body []byte, key boardsync.Key, platform boardsync.Platform) 
 			return nil, fmt.Errorf("%w: event %d belongs to platform %q, not this entry's %q", boardsync.ErrBadRequest, i, event.Platform, platform)
 		}
 		event.Platform = platform
+		if strings.TrimSpace(event.Type) == "" {
+			return nil, fmt.Errorf("%w: event %d has no type", boardsync.ErrBadRequest, i)
+		}
+		if err := checkEventStrings(&event); err != nil {
+			return nil, fmt.Errorf("%w: event %d: %v", boardsync.ErrBadRequest, i, err)
+		}
 		cleanEvent(&event)
+		if err := rejectStoredNUL(event); err != nil {
+			return nil, fmt.Errorf("%w: event %d: %v", boardsync.ErrBadRequest, i, err)
+		}
 		record := boardsync.Record{Dedupe: inbound.Dedupe, Event: event}
 		if err := record.Validate(); err != nil {
 			return nil, fmt.Errorf("%w: event %d: %v", boardsync.ErrBadRequest, i, err)
@@ -303,6 +348,136 @@ func DecodeInbound(body []byte, key boardsync.Key, platform boardsync.Platform) 
 		records = append(records, record)
 	}
 	return records, nil
+}
+
+// rejectStoredNUL walks the event's JSON form and refuses a NUL anywhere. The
+// inbox's event column is jsonb, and PostgreSQL rejects a \u0000 escape even
+// though Go can carry it in a string; refusing it here keeps a bad sidecar
+// event a 400 instead of a 500 from the store.
+func rejectStoredNUL(event boardsync.Event) error {
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("event isn't JSON: %v", err)
+	}
+	var value any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		return fmt.Errorf("event isn't JSON: %v", err)
+	}
+	if containsNUL(value) {
+		return fmt.Errorf("event contains a NUL that jsonb can't store")
+	}
+	return nil
+}
+
+func containsNUL(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.IndexByte(typed, 0) >= 0
+	case []any:
+		for _, item := range typed {
+			if containsNUL(item) {
+				return true
+			}
+		}
+	case map[string]any:
+		for key, item := range typed {
+			if strings.IndexByte(key, 0) >= 0 || containsNUL(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkEventStrings refuses an ID that can't be stored or indexed safely. A
+// NUL, a control character, invalid UTF-8, or an overlong ID would otherwise
+// reach PostgreSQL and turn a bad event into a 500 instead of a 400.
+func checkEventStrings(event *boardsync.Event) error {
+	checks := []struct {
+		name  string
+		value string
+		max   int
+	}{
+		{"type", event.Type, 200},
+		{"channel", event.Channel, 300},
+		{"thread", event.Thread, 300},
+		{"subthread", event.Subthread, 300},
+		{"message", event.Message, 300},
+		{"author.id", event.Author.ID, 300},
+		{"author.avatar", event.Author.Avatar, 2000},
+		{"emoji", event.Emoji, 300},
+		{"context", event.Context, 1000},
+	}
+	for _, check := range checks {
+		if err := checkWireString(check.name, check.value, check.max); err != nil {
+			return err
+		}
+	}
+	if event.Lifecycle != nil {
+		if err := checkWireString("lifecycle.type", event.Lifecycle.Type, 200); err != nil {
+			return err
+		}
+		if err := checkWireString("lifecycle.url", event.Lifecycle.URL, 2000); err != nil {
+			return err
+		}
+		for key, value := range event.Lifecycle.Labels {
+			if err := checkWireString("lifecycle.labels key", key, 200); err != nil {
+				return err
+			}
+			if err := checkWireString("lifecycle.labels value", value, 1000); err != nil {
+				return err
+			}
+		}
+		for _, value := range event.Lifecycle.Unset {
+			if err := checkWireString("lifecycle.unset", value, 200); err != nil {
+				return err
+			}
+		}
+		for _, value := range event.Lifecycle.Owns {
+			if err := checkWireString("lifecycle.owns", value, 200); err != nil {
+				return err
+			}
+		}
+	}
+	for _, mention := range event.Mentioned {
+		if err := checkWireString("mentioned.id", mention.ID, 300); err != nil {
+			return err
+		}
+	}
+	for _, file := range event.Files {
+		if err := checkWireString("file.name", file.Name, 300); err != nil {
+			return err
+		}
+		if err := checkWireString("file.url", file.URL, 2000); err != nil {
+			return err
+		}
+	}
+	for _, link := range event.Links {
+		if err := checkWireString("link.url", link.URL, 2000); err != nil {
+			return err
+		}
+		if err := checkWireString("link.thread", link.Thread, 300); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkWireString accepts an empty optional string and enforces the bounds for
+// a value the board stores outside a JSON document.
+func checkWireString(name, value string, max int) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > max || !utf8.ValidString(value) || strings.IndexByte(value, 0) >= 0 {
+		return fmt.Errorf("%s is invalid or longer than %d bytes", name, max)
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%s has a control character", name)
+		}
+	}
+	return nil
 }
 
 // cleanEvent applies the same bounding every native adapter applies: no NULs,
