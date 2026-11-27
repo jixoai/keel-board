@@ -203,6 +203,9 @@ func (p *Postgres) readRecords(ctx context.Context, tenant string, after uint64,
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if err := setTenant(ctx, tx, tenant); err != nil {
+		return nil, err
+	}
 
 	query := `SELECT ` + recordColumns + recordFrom + ` WHERE e.tenant_id = $1 AND e.seq > $2 ORDER BY e.seq`
 	arguments := []any{tenant, after}
@@ -264,6 +267,9 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 		return AppendResult{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := setTenant(ctx, tx, tenant); err != nil {
+		return AppendResult{}, err
+	}
 
 	// A retry is answered before the batch or the head is checked: it may name
 	// a fresh seq and a stale head, and it must still get the first result.
@@ -452,21 +458,42 @@ func ensureEmptyLog(ctx context.Context, tx pgx.Tx, tenant string) error {
 // Integrity implements IntegrityStore in one statement, so the head row and
 // the log end are read at one snapshot.
 func (p *Postgres) Integrity(ctx context.Context, tenant string) (Integrity, error) {
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Integrity{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setTenant(ctx, tx, tenant); err != nil {
+		return Integrity{}, err
+	}
 	var integrity Integrity
-	if err := p.pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		SELECT
 			COALESCE((SELECT seq FROM board_heads WHERE tenant_id = $1), 0),
 			COALESCE((SELECT MAX(seq) FROM board_events WHERE tenant_id = $1), 0)`,
 		tenant).Scan(&integrity.Head, &integrity.MaxSeq); err != nil {
 		return Integrity{}, err
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return Integrity{}, err
+	}
 	return integrity, nil
 }
 
 // Tenants implements TenantStore over both the head rows and the log, so a
-// tenant whose head row is missing is still offered to a rebuild.
+// tenant whose head row is missing is still offered to a rebuild. It is an
+// operator read: it is the one caller that sets the RLS bypass, because
+// listing every tenant is exactly what tenant isolation forbids a request.
 func (p *Postgres) Tenants(ctx context.Context) ([]string, error) {
-	rows, err := p.pool.Query(ctx, `
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT set_config('keel.bypass_rls', 'on', true)`); err != nil {
+		return nil, fmt.Errorf("store: setting the tenant-list scope: %w", err)
+	}
+	rows, err := tx.Query(ctx, `
 		SELECT tenant_id FROM board_heads
 		UNION
 		SELECT tenant_id FROM board_events
@@ -486,17 +513,31 @@ func (p *Postgres) Tenants(ctx context.Context) ([]string, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 	return tenants, nil
 }
 
 // Request implements RequestStore.
 func (p *Postgres) Request(ctx context.Context, tenant, key string) (Request, bool, error) {
-	stored, found, err := requestInTx(ctx, p.pool, tenant, key)
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Request{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setTenant(ctx, tx, tenant); err != nil {
+		return Request{}, false, err
+	}
+	stored, found, err := requestInTx(ctx, tx, tenant, key)
 	if err != nil {
 		return Request{}, false, err
 	}
 	if !found {
 		return Request{}, false, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Request{}, false, err
 	}
 	return Request{Digest: stored.digest, Result: stored.result}, true, nil
 }
@@ -534,15 +575,37 @@ func requestInTx(ctx context.Context, q queryer, tenant, key string) (storedRequ
 
 // Head implements HeadStore with one indexed lookup on the tenant's head row.
 func (p *Postgres) Head(ctx context.Context, tenant string) (uint64, error) {
+	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	if err := setTenant(ctx, tx, tenant); err != nil {
+		return 0, err
+	}
 	var head uint64
-	err := p.pool.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1`, tenant).Scan(&head)
+	err = tx.QueryRow(ctx, `SELECT seq FROM board_heads WHERE tenant_id = $1`, tenant).Scan(&head)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
 	return head, nil
+}
+
+// setTenant scopes the current transaction to tenant. Every board_* table has
+// a FORCE RLS policy that reads keel.tenant_id, so a transaction that loses its
+// tenant predicate sees no rows instead of another tenant's. SET LOCAL keeps
+// the setting from following the connection back into the pool.
+func setTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
+	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', $1, true)`, tenant); err != nil {
+		return fmt.Errorf("store: setting tenant scope: %w", err)
+	}
+	return nil
 }
 
 // Wait implements Waiter by polling the tenant's head. It holds no lock, so

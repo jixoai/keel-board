@@ -640,7 +640,10 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
 	cfg := testConfig()
-	cfg.LeaseTTL = 150 * time.Millisecond
+	// Seconds, not milliseconds: the post-reopen lease must survive the
+	// assertions below while `go test -count=10` runs packages in parallel.
+	// A 150ms lease made the recovered ack itself flaky.
+	cfg.LeaseTTL = 2 * time.Second
 	first, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,
 	})
@@ -663,7 +666,7 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 		t.Fatalf("lease before restart = %+v, %v", leased, err)
 	}
 	first.Close()
-	time.Sleep(250 * time.Millisecond)
+	time.Sleep(2500 * time.Millisecond)
 
 	second, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,

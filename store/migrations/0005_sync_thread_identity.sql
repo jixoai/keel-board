@@ -13,6 +13,13 @@ ALTER TABLE board_sync_threads
 
 -- Resolve the pre-constraint bug deterministically before the index: keep the
 -- lowest board_thread for each external thread and drop the later duplicates.
+-- board_sync_threads has FORCE RLS (0003), which would hide every duplicate
+-- from this migration's own DELETE under a non-superuser owner. The cleanup
+-- is an owner-only migration step: NO FORCE for the duration of this file's
+-- transaction (readers still see the policy, and the ALTER locks the table),
+-- then FORCE again. A failure rolls both back, so the table is never left
+-- unfenced.
+ALTER TABLE board_sync_threads NO FORCE ROW LEVEL SECURITY;
 DELETE FROM board_sync_threads a
 USING board_sync_threads b
 WHERE a.tenant_id = b.tenant_id
@@ -24,6 +31,7 @@ WHERE a.tenant_id = b.tenant_id
   AND a.kind = 'thread'
   AND b.kind = 'thread'
   AND a.board_thread > b.board_thread;
+ALTER TABLE board_sync_threads FORCE ROW LEVEL SECURITY;
 
 CREATE UNIQUE INDEX IF NOT EXISTS board_sync_threads_unique_thread
     ON board_sync_threads (tenant_id, sync_key, platform, channel, thread, subthread)
