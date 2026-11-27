@@ -78,7 +78,7 @@ jobs:
           command -v pg_isready >/dev/null 2>&1 || export PATH="/opt/homebrew/bin:$PATH"
           pg_isready -h 127.0.0.1 -p 5432
       - name: stress (-count=10)
-        run: go test -count=10 ./store ./log ./syncstore ./automation ./conformance
+        run: go test -count=10 -timeout=30m ./store ./log ./syncstore ./automation ./conformance
       - name: cleanup go cache
         if: always()
         run: go clean -cache || true

@@ -389,7 +389,9 @@ func TestWatcherConcurrentPlanningAndLeasing(t *testing.T) {
 
 func TestLeaseExpiryAndLostAck(t *testing.T) {
 	cfg := testConfig()
-	cfg.LeaseTTL = 150 * time.Millisecond
+	// Seconds, not milliseconds: under -count=10 the second lease itself must
+	// stay live across the assertions. A 150ms lease expired mid-ack.
+	cfg.LeaseTTL = 2 * time.Second
 	withStores(t, cfg, func(t *testing.T, store automation.Store) {
 		ctx := t.Context()
 		if _, err := store.CreateWatcher(ctx, testWatcher("alerts")); err != nil {
@@ -402,7 +404,7 @@ func TestLeaseExpiryAndLostAck(t *testing.T) {
 		if err != nil || len(first) != 1 {
 			t.Fatalf("first lease = %+v, %v", first, err)
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 		second, err := store.LeaseDeliveries(ctx, "t1", 1, "worker-b")
 		if err != nil || len(second) != 1 || second[0].EventSeq != first[0].EventSeq {
 			t.Fatalf("second lease = %+v, %v", second, err)
@@ -609,7 +611,7 @@ func TestScheduleRunAckAndDeadLetter(t *testing.T) {
 
 func TestScheduleLeaseExpiry(t *testing.T) {
 	cfg := testConfig()
-	cfg.LeaseTTL = 150 * time.Millisecond
+	cfg.LeaseTTL = 2 * time.Second
 	withStores(t, cfg, func(t *testing.T, store automation.Store) {
 		ctx := t.Context()
 		id, _ := automation.NewScheduleID()
@@ -620,7 +622,7 @@ func TestScheduleLeaseExpiry(t *testing.T) {
 		if err != nil || len(first) != 1 {
 			t.Fatalf("first lease = %+v, %v", first, err)
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(2500 * time.Millisecond)
 		second, err := store.LeaseSchedules(ctx, "t1", 1, "worker-b")
 		if err != nil || len(second) != 1 || second[0].ID != id {
 			t.Fatalf("second lease = %+v, %v", second, err)
@@ -693,7 +695,7 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 
 func TestRenewDeliveryContract(t *testing.T) {
 	cfg := testConfig()
-	cfg.LeaseTTL = 150 * time.Millisecond
+	cfg.LeaseTTL = 2 * time.Second
 	withStores(t, cfg, func(t *testing.T, store automation.Store) {
 		ctx := t.Context()
 		if _, err := store.CreateWatcher(ctx, testWatcher("renew")); err != nil {
@@ -709,7 +711,7 @@ func TestRenewDeliveryContract(t *testing.T) {
 		if err := store.RenewDelivery(ctx, "t1", "renew", 1, "wrong", time.Second); !errors.Is(err, automation.ErrLeaseLost) {
 			t.Fatalf("wrong-token renew = %v", err)
 		}
-		if err := store.RenewDelivery(ctx, "t1", "renew", 1, leased[0].Lease, 400*time.Millisecond); err != nil {
+		if err := store.RenewDelivery(ctx, "t1", "renew", 1, leased[0].Lease, 5*time.Second); err != nil {
 			t.Fatalf("renew: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)
