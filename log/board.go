@@ -766,8 +766,11 @@ func (b *Board) refreshStaleLocked(ctx context.Context, tenant string, current *
 	if b.freshness < 0 {
 		return nil
 	}
-	if _, ok := b.store.(store.HeadStore); !ok {
-		return nil
+	_, hasHead := b.store.(store.HeadStore)
+	if !hasHead {
+		if _, ok := b.store.(store.IntegrityStore); !ok {
+			return nil
+		}
 	}
 	if time.Since(current.checked) < b.freshness {
 		return nil
@@ -778,12 +781,25 @@ func (b *Board) refreshStaleLocked(ctx context.Context, tenant string, current *
 // refreshNowLocked checks the store's head and folds anything past the cache.
 // The caller holds b.mu.
 func (b *Board) refreshNowLocked(ctx context.Context, tenant string, current *tenant) error {
+	head, hasHead := uint64(0), false
 	if header, ok := b.store.(store.HeadStore); ok {
-		head, err := header.Head(ctx, tenant)
+		value, err := header.Head(ctx, tenant)
 		if err != nil {
 			return err
 		}
-		if head <= current.state.Head {
+		head, hasHead = value, true
+	} else if checker, ok := b.store.(store.IntegrityStore); ok {
+		integrity, err := checker.Integrity(ctx, tenant)
+		if err != nil {
+			return err
+		}
+		head, hasHead = integrity.Head, true
+	}
+	if hasHead {
+		if head < current.state.Head {
+			return fmt.Errorf("%w: projection at #%d, the log's head row at #%d", ErrProjectionAhead, current.state.Head, head)
+		}
+		if head == current.state.Head {
 			current.checked = time.Now()
 			return nil
 		}
