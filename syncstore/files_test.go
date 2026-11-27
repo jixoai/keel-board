@@ -2,6 +2,7 @@ package syncstore_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -70,6 +71,72 @@ func TestOutboundWorkerLoadsAttachmentBytesAndPersistsTheReceipt(t *testing.T) {
 		}
 		if len(provider.Posts()) != 1 {
 			t.Fatalf("duplicate posts = %+v", provider.Posts())
+		}
+	})
+}
+
+func TestOutboundReceiptRetryPreservesFiles(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		provider := fake.New("slack", boardsync.Capabilities{UploadsFiles: true})
+		provider.PostFunc = func(_ context.Context, _ boardsync.Key, target boardsync.ResolvedTarget, _ boardsync.OutboundMessage) (boardsync.Posted, error) {
+			return boardsync.Posted{Thread: target.Thread, Message: "m1", Files: []string{"F1"}}, nil
+		}
+		registry := boardsync.NewRegistry()
+		if err := registry.Add(boardsync.Entry{Tenant: "t1", Key: "slack", Platform: "slack", Provider: provider, Sync: boardsync.Mirror("support")}); err != nil {
+			t.Fatal(err)
+		}
+		host := fake.NewHost()
+		receipts := 0
+		host.RecordFunc = func(_ context.Context, event boardsync.BoardEvent) error {
+			if event.Type == boardsync.BoardMessageSynced {
+				receipts++
+				if receipts == 1 {
+					return errors.New("receipt store is down")
+				}
+			}
+			return nil
+		}
+		worker, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
+			Store: store, Registry: registry, Runner: boardsync.NewRunner(host), Host: host,
+			Tenant: "t1", Keys: []boardsync.Key{"slack"}, Owner: "worker", Limit: 10,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := threadTarget("C0123", "C0123:T1")
+		message := boardMessage(101, 100, "with a file")
+		message.Attachments = []boardsync.AttachmentRef{{ID: "0123456789abcdefghijkl", Name: "a.txt", Size: 5}}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack", postedEvent(10, 100, 101), message, []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatal(err)
+		}
+		first, err := worker.Process(ctx)
+		if err != nil || first.Retried != 1 {
+			t.Fatalf("first pass = %+v, %v", first, err)
+		}
+		if len(provider.Posts()) != 1 {
+			t.Fatalf("post count after a failed receipt = %d", len(provider.Posts()))
+		}
+		second, err := worker.Process(ctx)
+		if err != nil || second.Acked != 1 {
+			t.Fatalf("second pass = %+v, %v", second, err)
+		}
+		if len(provider.Posts()) != 1 {
+			t.Fatalf("receipt retry posted again: %+v", provider.Posts())
+		}
+		records := host.Records()
+		var synced []boardsync.BoardEvent
+		for _, record := range records {
+			if record.Type == boardsync.BoardMessageSynced {
+				synced = append(synced, record)
+			}
+		}
+		if len(synced) != 2 {
+			t.Fatalf("synced receipts = %+v", synced)
+		}
+		last := synced[len(synced)-1]
+		if !last.FilesSet || len(last.Files) != 1 || last.Files[0] != "F1" {
+			t.Fatalf("retried receipt lost files: %+v", last)
 		}
 	})
 }

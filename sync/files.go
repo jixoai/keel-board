@@ -22,9 +22,9 @@ type FileLoadResult struct {
 
 // FileLoader reads a board message's attachment bytes for delivery. A loader
 // bounds what it reads: a provider's Post receives at most the files the
-// loader returns. Returning an error means the board couldn't read its own
-// store; the delivery fails and the outbox retries, because nothing has been
-// posted yet.
+// loader returns. An error is a board read failure and is degraded to notes on
+// the delivered message; the runner does not retry the post for it, because a
+// retry after a post already landed would duplicate the text.
 type FileLoader func(ctx context.Context, tenant string, message Message) (FileLoadResult, error)
 
 // FileFetchTimeout is the most an import waits for one file. A slow platform

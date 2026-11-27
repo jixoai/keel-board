@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,12 +28,18 @@ func (f fileFetcherFunc) FetchFile(ctx context.Context, key boardsync.Key, file 
 
 func newFetchHost(t *testing.T, mutate func(*server.SyncHostOptions)) (*log.Board, *blob.Memory, *server.SyncHost) {
 	t.Helper()
+	blobs := blob.NewMemory()
+	board, host := newFetchHostOn(t, blobs, mutate)
+	return board, blobs, host
+}
+
+func newFetchHostOn(t *testing.T, blobs blob.Store, mutate func(*server.SyncHostOptions)) (*log.Board, *server.SyncHost) {
+	t.Helper()
 	board := log.New(log.Options{})
 	store, err := syncstore.NewMemory(syncstore.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	blobs := blob.NewMemory()
 	opts := server.SyncHostOptions{
 		Blobs: blobs, FileHosts: []string{"files.example.test"}, MaxFileBytes: 1 << 20,
 		FileFetchTimeout: time.Second,
@@ -39,7 +47,28 @@ func newFetchHost(t *testing.T, mutate func(*server.SyncHostOptions)) (*log.Boar
 	if mutate != nil {
 		mutate(&opts)
 	}
-	return board, blobs, server.NewSyncHost(board, store, opts)
+	return board, server.NewSyncHost(board, store, opts)
+}
+
+// countingBlob counts Put calls so a retry can prove it didn't write bytes or
+// metadata twice.
+type countingBlob struct {
+	blob.Store
+	mu   sync.Mutex
+	puts int
+}
+
+func (c *countingBlob) Put(ctx context.Context, key string, data []byte, contentType string) error {
+	c.mu.Lock()
+	c.puts++
+	c.mu.Unlock()
+	return c.Store.Put(ctx, key, data, contentType)
+}
+
+func (c *countingBlob) PutCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.puts
 }
 
 func fileEvent(id string, files ...boardsync.File) boardsync.Event {
@@ -300,6 +329,7 @@ func TestSyncHostRefusesUnsafeFileURLWithoutFetching(t *testing.T) {
 		boardsync.File{Name: "meta.txt", Size: 1, URL: "http://169.254.169.254/latest/meta-data/"},
 		boardsync.File{Name: "foreign.txt", Size: 1, URL: "https://evil.test/a"},
 		boardsync.File{Name: "loopback.txt", Size: 1, URL: "https://127.0.0.1/a"},
+		boardsync.File{Name: "missing.txt", Size: 1},
 	)
 	result, err := host.Import(t.Context(), boardsync.ImportRequest{
 		Tenant: "t1", Key: "slack", EventID: "f5", Channel: "support", Event: event, Fetcher: fetcher,
@@ -312,10 +342,12 @@ func TestSyncHostRefusesUnsafeFileURLWithoutFetching(t *testing.T) {
 	}
 	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
 		message := snapshot.Message(result.Message)
-		if !strings.Contains(message.Text, "file hosts") || !strings.Contains(message.Text, "loopback.txt") {
-			t.Fatalf("unsafe note missing: %q", message.Text)
+		for _, want := range []string{"file hosts", "loopback.txt", "missing.txt", "download URL isn't available"} {
+			if !strings.Contains(message.Text, want) {
+				t.Fatalf("unsafe note missing %q: %q", want, message.Text)
+			}
 		}
-		if len(message.Attachments) != 3 {
+		if len(message.Attachments) != 4 {
 			t.Fatalf("metadata placeholders = %+v", message.Attachments)
 		}
 		return nil
@@ -475,6 +507,148 @@ func TestSyncHostFetchesFilesIntoFSBlob(t *testing.T) {
 	}
 	if len(loaded.Files) != 1 || string(loaded.Files[0].Data) != "fs bytes" {
 		t.Fatalf("loaded = %+v", loaded)
+	}
+}
+
+func TestSyncHostCapsFilesAtProtocolMax(t *testing.T) {
+	board, _, host := newFetchHost(t, func(opts *server.SyncHostOptions) { opts.MaxFiles = 32 })
+	files := make([]boardsync.File, 0, 12)
+	for index := 0; index < 12; index++ {
+		files = append(files, boardsync.File{
+			Name: fmt.Sprintf("f%02d.bin", index), Size: 1,
+			URL: fmt.Sprintf("https://files.example.test/%d", index),
+		})
+	}
+	event := fileEvent("max1", files...)
+	fetcher := fileFetcherFunc(func(context.Context, boardsync.Key, boardsync.File) ([]byte, error) {
+		return []byte("x"), nil
+	})
+	result, err := host.Import(t.Context(), boardsync.ImportRequest{
+		Tenant: "t1", Key: "slack", EventID: "max1", Channel: "support", Event: event, Fetcher: fetcher,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		message := snapshot.Message(result.Message)
+		if len(message.Attachments) != protocol.AttachmentsPerMessageMax {
+			t.Fatalf("attachments = %d, want %d", len(message.Attachments), protocol.AttachmentsPerMessageMax)
+		}
+		if !strings.Contains(message.Text, "at most 10 files") {
+			t.Fatalf("cap note missing: %q", message.Text)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncHostAttachmentIDsAreDeterministicAndDistinct(t *testing.T) {
+	counting := &countingBlob{Store: blob.NewMemory()}
+	board, host := newFetchHostOn(t, counting, nil)
+	event := fileEvent("ids1",
+		boardsync.File{Name: "same.bin", Size: 1, URL: "https://files.example.test/same"},
+		boardsync.File{Name: "same.bin", Size: 1, URL: "https://files.example.test/same"},
+	)
+	fetcher := fileFetcherFunc(func(context.Context, boardsync.Key, boardsync.File) ([]byte, error) {
+		return []byte("x"), nil
+	})
+	req := boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "ids1", Channel: "support", Event: event, Fetcher: fetcher}
+	result, err := host.Import(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		for _, attachment := range snapshot.Message(result.Message).Attachments {
+			ids = append(ids, attachment.ID)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("ids = %v, want two distinct deterministic IDs", ids)
+	}
+	if _, err := host.Import(t.Context(), req); err != nil {
+		t.Fatal(err)
+	}
+	if got := counting.PutCount(); got != 4 {
+		// Two files, each one data object and one record; the retry added none.
+		t.Fatalf("blob puts = %d, want 4", got)
+	}
+}
+
+func TestSyncHostReplyRetryDoesNotDuplicateBlob(t *testing.T) {
+	counting := &countingBlob{Store: blob.NewMemory()}
+	board, host := newFetchHostOn(t, counting, nil)
+	ctx := t.Context()
+	rootEvent := syncEvent("root", "C0123:T9")
+	if _, err := host.Import(ctx, boardsync.ImportRequest{
+		Tenant: "t1", Key: "slack", EventID: "root", Channel: "support", Event: rootEvent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reply := syncEvent("reply", "C0123:T9")
+	reply.IsRoot, reply.Message, reply.Text = false, "reply", "with a file"
+	reply.Files = []boardsync.File{{Name: "a.bin", Size: 1, URL: "https://files.example.test/a"}}
+	fetcher := fileFetcherFunc(func(context.Context, boardsync.Key, boardsync.File) ([]byte, error) {
+		return []byte("x"), nil
+	})
+	req := boardsync.ImportRequest{Tenant: "t1", Key: "slack", EventID: "reply", Event: reply, Fetcher: fetcher}
+	if _, err := host.Import(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := host.Import(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if got := counting.PutCount(); got != 2 {
+		// One data object + one record; the retry found both.
+		t.Fatalf("blob puts = %d, want 2", got)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		messages := snapshot.MessagesInChannel("support")
+		if len(messages) != 2 {
+			t.Fatalf("messages = %d, want root + one reply", len(messages))
+		}
+		for _, message := range messages {
+			if strings.Contains(message.Text, "with a file") {
+				if len(message.Attachments) != 1 {
+					t.Fatalf("reply attachments = %+v", message.Attachments)
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncHostLinkSnapshotIsBounded(t *testing.T) {
+	board, _, host := newFetchHost(t, nil)
+	event := fileEvent("link-big")
+	event.Text = "big link"
+	event.Links = []boardsync.Link{{
+		URL:      "https://files.example.test/archives/C1/p1",
+		Snapshot: &boardsync.LinkSnapshot{Author: "Ada", Text: strings.Repeat("x", 40<<10)},
+	}}
+	result, err := host.Import(t.Context(), boardsync.ImportRequest{
+		Tenant: "t1", Key: "slack", EventID: "link-big", Channel: "support", Event: event,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := board.Read("t1", func(snapshot *log.Snapshot) error {
+		link := linkAt(t, snapshot.Message(result.Message).Links, 0)
+		if link.URL == "" {
+			t.Fatalf("safe URL was dropped with the snapshot: %+v", link)
+		}
+		if link.Snapshot != nil {
+			t.Fatalf("oversized snapshot stored (%d bytes)", len(*link.Snapshot))
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

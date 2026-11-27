@@ -43,6 +43,29 @@ func TestPostRendersOwnMentionsAndKeepsForeignOnesLiteral(t *testing.T) {
 	}
 }
 
+func TestReceiveLeavesURLPathsAndMalformedLoginsAlone(t *testing.T) {
+	p := newProvider(t, false)
+	raw := string(fixture(t, "issue_comment.json"))
+	raw = strings.Replace(raw, `"body": "confirmed on staging"`,
+		`"body": "see https://github.com/@ada and github.com/@bob and @ada- and @@carol; ask @dave."`, 1)
+	intake, err := receiveRequest(t, p, "issue_comment", "mention-2", []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := intake.Records[0].Event.Text
+	for _, forbidden := range []string{"@[github:user:ada]", "@[github:user:bob]", "@[github:user:carol]"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("URL or malformed login became a mention: %q", text)
+		}
+	}
+	if !strings.Contains(text, "@[github:user:dave]") {
+		t.Fatalf("trailing sentence period blocked a real mention: %q", text)
+	}
+	if !strings.Contains(text, "https://github.com/@ada") || !strings.Contains(text, "@@carol") {
+		t.Fatalf("literal text changed: %q", text)
+	}
+}
+
 func TestReceiveTurnsLoginsIntoExactMentions(t *testing.T) {
 	p := newProvider(t, false)
 	raw := string(fixture(t, "issue_comment.json"))

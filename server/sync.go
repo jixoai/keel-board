@@ -45,9 +45,11 @@ type SyncOptions struct {
 	// FileHosts is the allowlist of hosts an inbound file or link URL may
 	// name. Empty refuses every URL.
 	FileHosts []string
-	// MaxFileBytes bounds one inbound file's declared size.
+	// MaxFileBytes bounds one inbound file's declared and actual size. Zero
+	// means 50 MiB.
 	MaxFileBytes int64
-	// MaxFiles and MaxLinks bound one inbound message.
+	// MaxFiles and MaxLinks bound one inbound message. MaxFiles is clamped to
+	// the protocol's AttachmentsPerMessageMax.
 	MaxFiles, MaxLinks int
 	// FileFetchTimeout bounds one inbound file download. Zero uses the sync
 	// package's default.

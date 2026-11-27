@@ -159,7 +159,10 @@ func TestCursorContract(t *testing.T) {
 func TestNonceContract(t *testing.T) {
 	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
 		ctx := t.Context()
-		claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-1", 40*time.Millisecond)
+		// A long window is the replay contract; the short one is only about
+		// expiry. Keeping the replay checks off the short TTL removes the
+		// wall-clock race a loaded CI runner used to hit.
+		claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-1", time.Minute)
 		if err != nil || !claimed {
 			t.Fatalf("first claim = %v, %v", claimed, err)
 		}
@@ -169,12 +172,15 @@ func TestNonceContract(t *testing.T) {
 		if claimed, err := store.ClaimNonce(ctx, "t2", "telegram", "nonce-1", time.Minute); err != nil || !claimed {
 			t.Fatalf("another tenant's nonce = %v, %v", claimed, err)
 		}
-		time.Sleep(60 * time.Millisecond)
-		if claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-1", time.Minute); err != nil || !claimed {
+		if claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-2", 50*time.Millisecond); err != nil || !claimed {
+			t.Fatalf("short claim = %v, %v", claimed, err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if claimed, err := store.ClaimNonce(ctx, "t1", "telegram", "nonce-2", time.Minute); err != nil || !claimed {
 			t.Fatalf("claim after the window = %v, %v", claimed, err)
 		}
 		removed, err := store.PruneNonces(ctx, "t1", time.Now().Add(2*time.Minute))
-		if err != nil || removed != 1 {
+		if err != nil || removed != 2 {
 			t.Fatalf("tenant prune = %d, %v", removed, err)
 		}
 		if claimed, err := store.ClaimNonce(ctx, "t2", "telegram", "nonce-1", time.Minute); err != nil || claimed {

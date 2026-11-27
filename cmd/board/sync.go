@@ -54,7 +54,7 @@ func registerSyncFlags(flags *flag.FlagSet) *syncFlags {
 		cfg.starts = append(cfg.starts, value)
 		return nil
 	})
-	flags.Func("sync-file-host", "a host an inbound file or link URL may name (repeatable; empty refuses every URL)", func(value string) error {
+	flags.Func("sync-file-host", "a host an inbound file or link URL may name, for example files.slack.com (repeatable; empty refuses every URL)", func(value string) error {
 		cfg.fileHosts = append(cfg.fileHosts, value)
 		return nil
 	})

@@ -33,7 +33,8 @@ type SyncHostOptions struct {
 	// MaxFileBytes bounds one file's declared and actual size. Zero means
 	// 50 MiB.
 	MaxFileBytes int64
-	// MaxFiles bounds one message's files. Zero means 32.
+	// MaxFiles bounds one message's files. Zero (or more than the protocol's
+	// AttachmentsPerMessageMax) means that protocol limit, currently 10.
 	MaxFiles int
 	// MaxLinks bounds one message's links. Zero means 32.
 	MaxLinks int
@@ -72,8 +73,10 @@ func NewSyncHost(board *log.Board, store syncstore.Store, opts SyncHostOptions) 
 	if opts.MaxFileBytes <= 0 {
 		opts.MaxFileBytes = 50 << 20
 	}
-	if opts.MaxFiles <= 0 {
-		opts.MaxFiles = 32
+	if opts.MaxFiles <= 0 || opts.MaxFiles > protocol.AttachmentsPerMessageMax {
+		// A board message carries at most the protocol's limit; an import
+		// must not create a view clients can't write.
+		opts.MaxFiles = protocol.AttachmentsPerMessageMax
 	}
 	if opts.MaxLinks <= 0 {
 		opts.MaxLinks = 32
@@ -188,9 +191,13 @@ func (h *SyncHost) safeFiles(files []boardsync.File) ([]boardsync.File, []string
 		if file.Size < 0 {
 			file.Size = 0
 		}
-		originalURL := file.URL
+		originalURL := strings.TrimSpace(file.URL)
 		file.URL = safeURL(originalURL, h.fileHosts)
-		if strings.TrimSpace(originalURL) != "" && file.URL == "" {
+		switch {
+		case originalURL == "":
+			notes = append(notes, boardsync.FileNote(file.Name, file.Size,
+				"its download URL isn't available"))
+		case file.URL == "":
 			notes = append(notes, boardsync.FileNote(file.Name, file.Size,
 				"its download URL isn't on this board's file hosts"))
 		}
@@ -1075,8 +1082,9 @@ func placeholderAttachment(id string, file boardsync.File) protocol.Attachment {
 
 // LoadFiles implements boardsync.FileLoader: it reads a board message's
 // attachment bytes for delivery. A missing or oversized file becomes a note,
-// so the message still goes out; a store failure is returned because nothing
-// has been posted yet.
+// so the message still goes out. A blob-store failure is returned; the runner
+// degrades it to notes too, because retrying after a post landed would
+// duplicate the text.
 func (h *SyncHost) LoadFiles(ctx context.Context, tenant string, message boardsync.Message) (boardsync.FileLoadResult, error) {
 	var result boardsync.FileLoadResult
 	if len(message.Attachments) == 0 {

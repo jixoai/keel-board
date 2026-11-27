@@ -192,7 +192,8 @@ Four side channels need explicit rules; none of them may lose a message.
 and never bytes. `Call.Import` passes the entry's `FileFetcher` to the host.
 The host keeps a file only when its URL is https, on one of
 `SyncHostOptions.FileHosts`, without credentials or a literal IP, within
-`MaxFiles`, and within `MaxFileBytes`. It gives each file a deterministic
+`MaxFiles` (clamped to the protocol's ten attachments per message), and within
+`MaxFileBytes`. It gives each file a deterministic
 22-character attachment ID derived from the inbox event, so a retry reuses the
 bytes and record instead of writing a second copy. The adapter fetches its own
 platform's URL (Slack's is Slack-domain only, with per-hop redirect checks and
@@ -200,9 +201,11 @@ a client timeout); the host adds its own `FileFetchTimeout` and a final bound
 on the returned bytes. A successful fetch is written to the blob store and
 bound to the board message's `Attachments`. A refused, timed-out, oversized, or
 empty file keeps its metadata as a placeholder attachment and adds a note
-(`📎 name (size): reason`) to the message text. A file the adapter can't fetch
-at all keeps the placeholder without a note. The message is always imported;
-no fetch failure is an import failure.
+(`📎 name (size): reason`) to the message text. A file whose URL is missing or
+was stripped as unsafe keeps the placeholder and a note that its download URL
+isn't available; a board with no fetcher keeps the metadata placeholder and
+adds no fetch note. The message is always imported; no fetch failure is an
+import failure.
 
 **Outbound files.** `OutboundOptions.Files` is a `FileLoader`; the outbox
 worker supplies the host's loader, which reads each attachment's bytes from the
@@ -210,8 +213,10 @@ blob store just before a post. A provider whose `Capabilities.UploadsFiles` is
 false gets a note per attachment and no bytes: GitHub and Linear comments can't
 carry files. A provider that can upload either takes the files in `Post`
 (Slack posts text first, then the files into the same thread) or gets a second
-`FileUploader.UploadFiles` call. An upload failure is added to the already
-posted text with a best-effort edit and the receipt records `Files: []`,
+`FileUploader.UploadFiles` call. A loader error is a board read failure and
+degrades to a note on the message; it is never retried as a post, because the
+text may already have landed. An upload failure is added to the already posted
+text with a best-effort edit and the receipt records `Files: []`,
 `FilesSet: true`; it never causes a retry that would duplicate the message.
 The receipt's file IDs are stored on the copy before the `message.synced`
 receipt, so a receipt retry preserves `Files`/`FilesSet`.
@@ -227,9 +232,11 @@ text; no adapter resolves or unfurls them.
 `@[<key>:user:<id>]`: Slack's `<@U…>`, GitHub's `@login`. Outbound, an adapter
 converts only tokens under its own key to its native mention; another
 connection's token is left literally as written, which notifies no one.
-GitHub's `@org/team` stays text because it names a team, not a user. Linear's
-API renders a mention from a profile URL and this adapter has no workspace
-slug, so Linear posts tokens as text rather than fabricating an `@name`.
+GitHub's `@org/team` stays text because it names a team, not a user; a login
+inside a URL path, with a trailing hyphen, or in an email local part is not a
+mention. Linear's API renders a mention from a profile URL and this adapter has
+no workspace slug, so Linear posts tokens as text rather than fabricating an
+`@name`.
 Outbound conversions and GitHub's inbound conversion leave code spans and
 fenced blocks as literal text; Slack's inbound mrkdwn converter is the older
 whole-text path.
