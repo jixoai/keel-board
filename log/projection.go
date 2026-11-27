@@ -36,7 +36,8 @@ type ProjectionReport struct {
 	// ProjectionHead is the cached projection's watermark.
 	ProjectionHead uint64 `json:"projectionHead"`
 	// Digest hashes the cached projection; ReplayDigest hashes a replay of the
-	// log up to ProjectionHead; StoreDigest hashes the whole log.
+	// log up to ProjectionHead; StoreDigest hashes the projection of the whole
+	// log.
 	Digest       string `json:"digest"`
 	ReplayDigest string `json:"replayDigest"`
 	StoreDigest  string `json:"storeDigest"`
