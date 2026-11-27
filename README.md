@@ -37,6 +37,25 @@ Several processes may share one PostgreSQL log. A board rechecks the store's
 head at most once a second, a write that loses a race catches up and decides
 again once, and an SSE cursor ahead of the log is refused rather than clamped.
 
+## Projection checks and rebuilds
+
+The board's projection is an in-process fold of the durable log. Two
+operations routes need `manage` on `*`:
+
+- `POST /v1/board/admin/projection/check` reports the tenant's log head, the
+  projection's watermark, and a SHA-256 digest of the projection against a full
+  replay. `consistent` is true only when both the watermark and the digest
+  match.
+- `POST /v1/board/admin/projection/rebuild` replaces the projection with a
+  replay of the log. It is idempotent, never writes or deletes an event, and
+  keeps the old projection serving if the load is interrupted.
+
+`board rebuild --dsn <dsn> [--tenant <tenant>]...` does the same offline for
+every tenant in the log and exits non-zero on an inconsistent report. A
+PostgreSQL log whose `board_heads` row and newest event disagree refuses
+writes with 503 `unavailable`; a rebuild cannot repair the log itself, so
+restore the event or the head row first.
+
 ## Files
 
 Attachments are bytes under a `blob.Store`: memory by default, or a directory

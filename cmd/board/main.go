@@ -47,6 +47,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, "board:", err)
 			os.Exit(1)
 		}
+	case "rebuild":
+		if err := rebuild(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "board:", err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Println(server.Version)
 	case "help", "-h", "--help":
@@ -66,7 +71,13 @@ Usage:
               [--sync-tenant <tenant>] [--sync-dsn <dsn>] [--sync-schema <schema>]
               [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
               [--sync-start key=platformChannel]
+  board rebuild --dsn postgres://... [--tenant <tenant>]...
   board version
+
+board rebuild replays each tenant's durable log into a cold projection and
+prints its digest; a running server rebuilds through
+POST /v1/board/admin/projection/rebuild. A rebuild never writes or deletes an
+event.
 
 With --blobs, attachment bytes and their records live under that directory;
 without it they live in memory and are gone when the process ends.
