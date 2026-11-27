@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jixoai/keel-board/protocol"
@@ -20,6 +21,33 @@ var ErrHeadMoved = store.ErrHeadMoved
 // Clock returns the board's notion of now. Tests substitute one to advance
 // leases.
 type Clock func() time.Time
+
+// Observer receives bounded facts about committed board work: the kinds of
+// events a write landed, how many task claims are live afterwards, and how
+// long a write or rebuild took.
+//
+// It exists for metrics, so its inputs are deliberately bounded: event kinds
+// come from this package's vocabulary, and the claim count is a number. The
+// tenant is passed for per-tenant accounting only and must never become a
+// metric label: tenants are deployment data, not a bounded dimension.
+//
+// An Observer must be fast and must not call back into the Board. A nil
+// Observer is the default and changes nothing.
+type Observer interface {
+	// Appended reports one committed append. kinds is a copy the observer may
+	// retain; took covers cache catch-up, the read-decide-append, and commit.
+	Appended(tenant string, kinds []EventType, liveClaims int, took time.Duration)
+	// Rebuilt reports one completed projection rebuild attempt.
+	Rebuilt(took time.Duration)
+}
+
+// appendObservation is what an update hands to the observer after the board
+// lock is released.
+type appendObservation struct {
+	tenant     string
+	kinds      []EventType
+	liveClaims int
+}
 
 // defaultFreshness bounds how long a shared store's cached head is trusted
 // before a read asks the store. It is the staleness a multi-process board
@@ -41,6 +69,9 @@ type Options struct {
 	// store.HeadStore may be. Default: time.Second. A negative value disables
 	// the check (a board that owns its tenant's writes).
 	Freshness time.Duration
+	// Observer receives bounded facts about committed writes and rebuilds.
+	// Nil observes nothing.
+	Observer Observer
 }
 
 // Board is one process's view of many tenants' logs. Reads are served from the
@@ -53,6 +84,7 @@ type Board struct {
 	now       Clock
 	freshness time.Duration
 	tenants   map[string]*tenant
+	observer  atomic.Pointer[Observer]
 }
 
 type tenant struct {
@@ -87,12 +119,26 @@ func New(opts Options) *Board {
 	if opts.Freshness == 0 {
 		opts.Freshness = defaultFreshness
 	}
-	return &Board{
+	board := &Board{
 		store:     opts.Store,
 		now:       opts.Now,
 		freshness: opts.Freshness,
 		tenants:   make(map[string]*tenant),
 	}
+	if opts.Observer != nil {
+		board.observer.Store(&opts.Observer)
+	}
+	return board
+}
+
+// SetObserver replaces the board's observer. It is for the board's own
+// start-up wiring, never for a request. A nil observer observes nothing.
+func (b *Board) SetObserver(observer Observer) {
+	if observer == nil {
+		b.observer.Store(nil)
+		return
+	}
+	b.observer.Store(&observer)
 }
 
 // SetNow replaces the board's clock. It is for tests and the board's own
@@ -254,10 +300,12 @@ func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOption
 	if err != nil {
 		return err
 	}
+	started := time.Now()
 	replayed, moved := false, false
+	var observed *appendObservation
 	for attempt := 0; attempt < 3; attempt++ {
 		b.mu.Lock()
-		err := b.update(ctx, tenantName, current, opts, fn)
+		err := b.update(ctx, tenantName, current, opts, fn, &observed)
 		b.mu.Unlock()
 		switch {
 		case errors.Is(err, errRequestReplayed):
@@ -271,16 +319,31 @@ func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOption
 			}
 			moved = true
 		default:
+			b.notifyAppended(observed, time.Since(started))
 			return err
 		}
 	}
 	return fmt.Errorf("log: the store kept changing under the write")
 }
 
+// notifyAppended hands one committed observation to the observer, outside the
+// board lock. It is silent when nothing landed or no observer is set.
+func (b *Board) notifyAppended(observed *appendObservation, took time.Duration) {
+	if observed == nil {
+		return
+	}
+	pointer := b.observer.Load()
+	if pointer == nil {
+		return
+	}
+	(*pointer).Appended(observed.tenant, observed.kinds, observed.liveClaims, took)
+}
+
 // update is one read-decide-append. The caller holds b.mu and passes the
 // tenant ensure returned. Update may call it again after a store-level race,
-// so fn can run more than once.
-func (b *Board) update(ctx context.Context, tenantName string, current *tenant, opts UpdateOptions, fn func(*Tx) error) error {
+// so fn can run more than once. On a committed append it fills observed for
+// the caller to report after the lock is released.
+func (b *Board) update(ctx context.Context, tenantName string, current *tenant, opts UpdateOptions, fn func(*Tx) error, observed **appendObservation) error {
 	tenant := normalizeTenant(tenantName)
 	if err := b.refreshStaleLocked(ctx, tenant, current); err != nil {
 		return err
@@ -421,7 +484,35 @@ func (b *Board) update(ctx context.Context, tenantName string, current *tenant, 
 	}
 	current.checked = time.Now()
 	current.wake()
+	if observed != nil {
+		kinds := make([]EventType, len(tx.events))
+		for index, event := range tx.events {
+			kinds[index] = event.Type
+		}
+		*observed = &appendObservation{
+			tenant:     tenant,
+			kinds:      kinds,
+			liveClaims: liveClaims(current.state, b.now()),
+		}
+	}
 	return nil
+}
+
+// liveClaims counts the tasks whose claim is still live at now. A claimed task
+// whose lease has run out is not counted: its expiry is a write a request will
+// fold in (or the optional sweeper will), not a live claim.
+func liveClaims(state *State, now time.Time) int {
+	count := 0
+	for _, message := range state.Messages {
+		task := message.Task
+		if task == nil || task.State != "claimed" || task.Claim == nil {
+			continue
+		}
+		if task.Claim.Until.After(now) {
+			count++
+		}
+	}
+	return count
 }
 
 // mergeBatch fills a cache entry's missing answer from a batch result.

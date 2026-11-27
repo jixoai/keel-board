@@ -29,8 +29,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/metrics"
 	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -68,6 +70,7 @@ func usage() {
 
 Usage:
   board serve [--addr 127.0.0.1:8790] [--dsn postgres://...] [--freshness 1s] [--blobs <dir>] [--verbose]
+              [--audit-dsn postgres://...]
               [--sync-tenant <tenant>] [--sync-dsn <dsn>] [--sync-schema <schema>]
               [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
               [--sync-start key=platformChannel]
@@ -84,6 +87,11 @@ event.
 
 With --blobs, attachment bytes and their records live under that directory;
 without it they live in memory and are gone when the process ends.
+
+Metrics are always served at GET /metrics (Prometheus text, no board token,
+no tenant or message content). The operational audit is written to
+--audit-dsn, else --dsn, else memory (development only) and read through
+GET /v1/board/admin/audit with board.manage.
 
 Watchers and schedules are always served. Their state uses --automation-dsn,
 else KEEL_AUTOMATION_DSN, else --dsn, else memory (development only). The
@@ -127,7 +135,8 @@ func openBlobs(dir string) (blob.Store, error) {
 
 // devHandler is the development server's handler over the board and blob store
 // the serve process opened. It is what `board serve` runs, and what the smoke
-// test drives.
+// test drives. Metrics and the operational audit are on, over a process-local
+// registry and an in-memory audit store.
 func devHandler(logger *slog.Logger, board *log.Board, blobs blob.Store) http.Handler {
 	return devServer(logger, board, blobs, nil)
 }
@@ -139,10 +148,31 @@ func devServer(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOpti
 }
 
 func devServerWithAutomation(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOptions *server.SyncOptions, automationOptions *server.AutomationOptions) *server.Server {
+	return devServerWithObservability(logger, board, blobs, syncOptions, automationOptions,
+		metrics.NewRegistry(), audit.NewMemory())
+}
+
+// devServerWithObservability is the serve process's server: metrics and the
+// durable audit are shared with the workers and the /metrics route.
+func devServerWithObservability(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOptions *server.SyncOptions, automationOptions *server.AutomationOptions, registry *metrics.Registry, auditLog audit.Store) *server.Server {
 	return server.New(server.Options{
 		Board: board, Logger: logger, Blobs: blobs,
 		Sync: syncOptions, Automation: automationOptions,
+		Metrics: registry, Audit: auditLog,
 	})
+}
+
+// openAudit opens the operational audit store: PostgreSQL when a DSN is given
+// (the board's own DSN by default), memory otherwise.
+func openAudit(ctx context.Context, dsn string) (audit.Store, func(), string, error) {
+	if strings.TrimSpace(dsn) == "" {
+		return audit.NewMemory(), func() {}, "memory", nil
+	}
+	postgres, err := audit.OpenPostgres(ctx, audit.PostgresOptions{DSN: dsn})
+	if err != nil {
+		return nil, nil, "", err
+	}
+	return postgres, postgres.Close, "postgres", nil
 }
 
 // serve runs the HTTP server until it's interrupted.
@@ -152,6 +182,7 @@ func serve(args []string) error {
 	dsn := flags.String("dsn", "", "PostgreSQL DSN for the board's log; empty keeps it in memory")
 	freshness := flags.Duration("freshness", time.Second, "how stale a shared PostgreSQL cache may be; negative disables the check")
 	blobsDir := flags.String("blobs", "", "directory for attachment files (default: memory)")
+	auditDSN := flags.String("audit-dsn", "", "PostgreSQL DSN for the operational audit; empty uses --dsn, or memory when that is empty")
 	verbose := flags.Bool("verbose", false, "log every request")
 	syncCfg := registerSyncFlags(flags)
 	automationCfg := registerAutomationFlags(flags)
@@ -178,6 +209,17 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	auditTarget := *auditDSN
+	if strings.TrimSpace(auditTarget) == "" {
+		auditTarget = *dsn
+	}
+	auditLog, closeAudit, auditName, err := openAudit(ctx, auditTarget)
+	if err != nil {
+		return err
+	}
+	defer closeAudit()
+	registry := metrics.NewRegistry()
 
 	board := log.New(log.Options{Store: events, Freshness: *freshness})
 	var syncOptions *server.SyncOptions
@@ -213,7 +255,7 @@ func serve(args []string) error {
 		}
 		return err
 	}
-	api := devServerWithAutomation(logger, board, blobs, syncOptions, automationRuntime.options(logger))
+	api := devServerWithObservability(logger, board, blobs, syncOptions, automationRuntime.options(logger), registry, auditLog)
 	handler := http.Handler(api)
 	stopSync, err := startSyncWorkers(ctx, logger, syncRuntime, api)
 	if err != nil {
@@ -239,8 +281,9 @@ func serve(args []string) error {
 
 	serverErr := make(chan error, 1)
 	go func() {
-		logger.Info("board serving", "addr", "http://"+*addr+server.APIPrefix, "store", storeName)
-		fmt.Printf("board listening on http://%s%s (store: %s)\n", *addr, server.APIPrefix, storeName)
+		logger.Info("board serving", "addr", "http://"+*addr+server.APIPrefix, "store", storeName, "audit", auditName, "metrics", "http://"+*addr+"/metrics")
+		fmt.Printf("board listening on http://%s%s (store: %s, audit: %s, metrics: http://%s/metrics)\n",
+			*addr, server.APIPrefix, storeName, auditName, *addr)
 		err := httpServer.ListenAndServe()
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err

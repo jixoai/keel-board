@@ -405,6 +405,9 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 		return nil, errors.New("board: sync is configured but the server has no runner")
 	}
 	host := srv.SyncHost()
+	// Live worker observations (dead letters, failed deliveries) feed the same
+	// metrics registry and audit store the server serves.
+	hooks := srv.SyncWorkerHooks()
 	workerCtx, cancel := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	cleanup := func() {
@@ -425,7 +428,7 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 		inbound, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
 			Store: runtime.store, Registry: runtime.registry, Runner: runner,
 			Tenant: owned.Tenant, Key: owned.Key, Owner: "board-inbound-" + string(owned.Key),
-			Logger: logger,
+			Hooks: hooks, Logger: logger,
 		})
 		if err != nil {
 			cleanup()
@@ -434,7 +437,8 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 		outbound, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
 			Store: runtime.store, Registry: runtime.registry, Runner: runner, Host: host,
 			Tenant: owned.Tenant, Keys: []boardsync.Key{owned.Key},
-			Files: boardsync.FileLoader(host.LoadFiles), Owner: "board-outbound-" + string(owned.Key), Logger: logger,
+			Files: boardsync.FileLoader(host.LoadFiles), Owner: "board-outbound-" + string(owned.Key),
+			Hooks: hooks, Logger: logger,
 		})
 		if err != nil {
 			cleanup()

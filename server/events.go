@@ -276,6 +276,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("connection", "keep-alive")
 	w.Header().Set("x-accel-buffering", "no")
 	w.WriteHeader(http.StatusOK)
+	// The stream is open: count it until this handler returns.
+	releaseStream := s.observeSSEOpen()
+	defer releaseStream()
+	s.observeSSELag(head, cursor)
 	// A comment says the stream is open, so a client needn't post and hope
 	// the subscription was ready.
 	if _, err := fmt.Fprint(w, ": connected\n\n"); err != nil {
@@ -298,6 +302,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		cursor = head
+		s.observeSSELag(head, cursor)
 	}
 
 	// A live feed folds each event as it lands, so an event's message is as
@@ -327,6 +332,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if len(events) > 0 {
 				cursor = events[len(events)-1].Seq
 			}
+			s.observeSSELag(currentHead, cursor)
 			for _, event := range events {
 				before := (*log.Message)(nil)
 				if id := log.ConcernedMessageID(event); id != 0 {

@@ -18,8 +18,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/metrics"
 	"github.com/jixoai/keel-board/protocol"
 )
 
@@ -42,6 +44,10 @@ type Server struct {
 	now        func() time.Time
 	sync       *syncService
 	automation *automationService
+	registry   *metrics.Registry
+	counters   *metrics.BoardMetrics
+	telemetry  *syncTelemetry
+	audit      audit.Store
 }
 
 // Options configure a Server.
@@ -73,6 +79,13 @@ type Options struct {
 	// no automation routes; the workers that consume the durable rows are a
 	// deployment's to run (cmd/board does).
 	Automation *AutomationOptions
+	// Metrics registers the board's instrumentation and serves GET /metrics.
+	// Nil serves no metrics and installs no board observer.
+	Metrics *metrics.Registry
+	// Audit persists the bounded operational audit (webhook acceptance and
+	// refusal, dead letters, retries, bridge failures). Nil answers the admin
+	// audit route with 501 and records nothing.
+	Audit audit.Store
 }
 
 // New returns a server. It panics if no board is given: a server without a
@@ -109,12 +122,21 @@ func New(opts Options) *Server {
 		logger:    opts.Logger,
 		blobs:     opts.Blobs,
 		now:       opts.Now,
+		registry:  opts.Metrics,
+		audit:     opts.Audit,
 	}
+	if opts.Metrics != nil {
+		server.counters = metrics.NewBoardMetrics(opts.Metrics)
+		// The board may be built outside the server; installing the observer
+		// here is the one wiring point a deployment needs.
+		opts.Board.SetObserver(newBoardObserver(server.counters))
+	}
+	server.telemetry = &syncTelemetry{metrics: server.counters, audit: opts.Audit, logger: opts.Logger}
 	if opts.Sync != nil {
 		if opts.Sync.Logger == nil {
 			opts.Sync.Logger = opts.Logger
 		}
-		service, err := newSyncService(opts.Board, opts.Blobs, *opts.Sync)
+		service, err := newSyncService(opts.Board, opts.Blobs, *opts.Sync, server.telemetry)
 		if err != nil {
 			panic("server: " + err.Error())
 		}
@@ -174,6 +196,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+base+"/events", s.handleEvents)
 	s.mux.HandleFunc("POST "+base+"/admin/projection/check", s.handleProjectionCheck)
 	s.mux.HandleFunc("POST "+base+"/admin/projection/rebuild", s.handleProjectionRebuild)
+	s.mux.HandleFunc("GET "+base+"/admin/audit", s.handleAudit)
+	if s.registry != nil {
+		// Metrics live at the root, outside /v1/board: a scrape must not need a
+		// board token or the board's permission model.
+		s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	}
 	if s.sync != nil {
 		s.mux.Handle("POST /webhooks/{key}", s.sync.webhook)
 		s.mux.HandleFunc("POST "+base+"/sync/bridge/{key}/events", s.sync.bridgeEvents)

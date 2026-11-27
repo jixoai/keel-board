@@ -192,6 +192,14 @@ func (b *Board) Rebuild(ctx context.Context, tenantName string) (ProjectionRepor
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Report every completed attempt (successful or not) after the board lock
+	// the function may hold is released: the deferred unlock runs first.
+	started := time.Now()
+	defer func() {
+		if pointer := b.observer.Load(); pointer != nil {
+			(*pointer).Rebuilt(time.Since(started))
+		}
+	}()
 	ctx, cancel := context.WithTimeout(ctx, projectionRebuildTimeout)
 	defer cancel()
 	tenant := normalizeTenant(tenantName)

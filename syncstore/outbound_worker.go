@@ -49,7 +49,10 @@ type OutboundWorkerConfig struct {
 	PollInterval time.Duration
 	// Defer is how long an unready entry's job is released for. Zero means one
 	// second.
-	Defer  time.Duration
+	Defer time.Duration
+	// Hooks receives bounded facts about failed and dead deliveries. Nil
+	// observes nothing.
+	Hooks  WorkerHooks
 	Logger *slog.Logger
 }
 
@@ -70,6 +73,7 @@ type OutboundWorker struct {
 	limit    int
 	poll     time.Duration
 	deferFor time.Duration
+	hooks    WorkerHooks
 	logger   *slog.Logger
 
 	typingMu  sync.Mutex
@@ -111,7 +115,8 @@ func NewOutboundWorker(cfg OutboundWorkerConfig) (*OutboundWorker, error) {
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner, host: cfg.Host,
 		tenant: cfg.Tenant, keys: keys, renderer: cfg.Renderer, files: cfg.Files,
 		owner: leaseOwner(cfg.Owner),
-		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer, logger: cfg.Logger,
+		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer,
+		hooks: cfg.Hooks, logger: cfg.Logger,
 		typingOff: make(map[boardsync.Key]bool),
 	}, nil
 }
@@ -175,6 +180,13 @@ func (w *OutboundWorker) Process(ctx context.Context) (WorkResult, error) {
 		}
 		if ack.Dead && recordsFailure(job.Event.Type) {
 			w.recordFailure(ctx, job, jobErr)
+		}
+		if ack.Dead && w.hooks.OutboxDead != nil {
+			w.hooks.OutboxDead(w.tenant, job.Key, job.Target.Platform, job.ID,
+				job.Target.External(), ack.Attempts, ErrorCode(jobErr))
+		}
+		if jobErr != nil && w.hooks.DeliveryFailed != nil {
+			w.hooks.DeliveryFailed(w.tenant, job.Key, job.Target.Platform, ErrorCode(jobErr))
 		}
 		if jobErr != nil {
 			w.logger.Warn("sync delivery failed",

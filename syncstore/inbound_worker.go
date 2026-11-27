@@ -42,7 +42,9 @@ type InboundWorkerConfig struct {
 	// PruneInterval is how often Run prunes expired bridge nonces for this
 	// tenant. Zero means ten minutes; a negative value disables the janitor.
 	PruneInterval time.Duration
-	Logger        *slog.Logger
+	// Hooks receives bounded facts about dead letters. Nil observes nothing.
+	Hooks  WorkerHooks
+	Logger *slog.Logger
 }
 
 // InboundWorker leases and imports inbox items. The import is idempotent by
@@ -59,6 +61,7 @@ type InboundWorker struct {
 	poll     time.Duration
 	deferFor time.Duration
 	prune    time.Duration
+	hooks    WorkerHooks
 	logger   *slog.Logger
 }
 
@@ -92,7 +95,7 @@ func NewInboundWorker(cfg InboundWorkerConfig) (*InboundWorker, error) {
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner,
 		tenant: cfg.Tenant, key: cfg.Key, owner: leaseOwner(cfg.Owner),
 		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer,
-		prune: cfg.PruneInterval, logger: cfg.Logger,
+		prune: cfg.PruneInterval, hooks: cfg.Hooks, logger: cfg.Logger,
 	}, nil
 }
 
@@ -162,6 +165,9 @@ func (w *InboundWorker) Process(ctx context.Context) (WorkResult, error) {
 				"tenant", w.tenant, "key", w.key, "event", item.ID,
 				"thread", item.Thread, "attempts", ack.Attempts,
 				"state", ack.State, "error", ErrorCode(jobErr))
+		}
+		if ack.Dead && w.hooks.InboxDead != nil {
+			w.hooks.InboxDead(w.tenant, w.key, entry.Platform, item.ID, ack.Attempts, ErrorCode(jobErr))
 		}
 	}
 	return result, firstErr

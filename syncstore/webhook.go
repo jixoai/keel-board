@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -34,6 +35,9 @@ type WebhookConfig struct {
 	// MaxBodyBytes caps the request body before a provider parses it. Zero
 	// means one MiB.
 	MaxBodyBytes int64
+	// Observer receives one bounded observation per request. Nil observes
+	// nothing.
+	Observer WebhookObserver
 	// Logger receives failures. Zero uses slog.Default.
 	Logger *slog.Logger
 }
@@ -56,6 +60,7 @@ type WebhookHandler struct {
 	tenant      TenantFunc
 	gateFactory GateFactory
 	maxBody     int64
+	observer    WebhookObserver
 	logger      *slog.Logger
 }
 
@@ -82,12 +87,27 @@ func NewWebhookHandler(cfg WebhookConfig) (*WebhookHandler, error) {
 		tenant:      cfg.Tenant,
 		gateFactory: cfg.GateFactory,
 		maxBody:     cfg.MaxBodyBytes,
+		observer:    cfg.Observer,
 		logger:      cfg.Logger,
 	}, nil
 }
 
+// webhookState is what ServeHTTP accumulates for its one observation.
+type webhookState struct {
+	tenant   string
+	key      boardsync.Key
+	platform boardsync.Platform
+	outcome  WebhookOutcome
+	status   int
+	added    int
+	skipped  int
+}
+
 // ServeHTTP implements http.Handler.
 func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	state := webhookState{}
+	defer func() { h.observe(state, started) }()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeStatus(w, http.StatusMethodNotAllowed)
@@ -95,31 +115,44 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant, err := h.tenant(r)
 	if err != nil {
+		state.outcome, state.status = WebhookTenantRefused, http.StatusUnauthorized
 		h.logger.Warn("sync webhook tenant refused", "error", ErrorCode(err))
 		writeStatus(w, http.StatusUnauthorized)
 		return
 	}
 	if err := validTenant(tenant); err != nil {
+		state.outcome, state.status = WebhookFailed, http.StatusInternalServerError
 		h.logger.Warn("sync webhook tenant is not usable", "error", ErrorCode(err))
 		writeStatus(w, http.StatusInternalServerError)
 		return
 	}
+	state.tenant = tenant
 	key, ok := webhookKey(r)
 	if !ok {
+		state.outcome, state.status = WebhookUnknownKey, http.StatusNotFound
 		writeStatus(w, http.StatusNotFound)
 		return
 	}
+	state.key = key
 	entry, found, err := h.store.Entry(r.Context(), tenant, key)
 	if err != nil {
+		state.outcome, state.status = WebhookFailed, http.StatusInternalServerError
 		h.logger.Error("sync webhook entry lookup failed", "tenant", tenant, "key", key, "error", ErrorCode(err))
 		writeStatus(w, http.StatusInternalServerError)
 		return
+	}
+	if found {
+		state.platform = entry.Platform
 	}
 	if !found || !entry.Enabled {
 		// A key this tenant doesn't own, and one it deliberately disabled, are
 		// both accepted without reading the body or storing anything. The
 		// platform stops retrying, and a caller can't probe which connections
 		// exist.
+		state.outcome, state.status = WebhookUnknownKey, http.StatusOK
+		if found {
+			state.outcome = WebhookDisabled
+		}
 		writeStatus(w, http.StatusOK)
 		return
 	}
@@ -128,11 +161,13 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// The tenant owns this enabled connection but this process hasn't
 		// registered it (still starting). Answer 5xx so the platform retries;
 		// 404 would drop the event.
+		state.outcome, state.status = WebhookUnregistered, http.StatusServiceUnavailable
 		h.logger.Warn("sync webhook entry is not registered", "tenant", tenant, "key", key)
 		writeStatus(w, http.StatusServiceUnavailable)
 		return
 	}
 	if registered.Platform != entry.Platform || registered.Provider.Platform() != entry.Platform {
+		state.outcome, state.status = WebhookPlatformMismatch, http.StatusInternalServerError
 		h.logger.Error("sync webhook platform mismatch", "tenant", tenant, "key", key,
 			"entryPlatform", entry.Platform, "providerPlatform", registered.Provider.Platform())
 		writeStatus(w, http.StatusInternalServerError)
@@ -142,6 +177,7 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.gateFactory != nil {
 		gate, err = h.gateFactory(tenant, key)
 		if err != nil {
+			state.outcome, state.status = WebhookFailed, http.StatusInternalServerError
 			h.logger.Error("sync webhook gate failed", "tenant", tenant, "key", key, "error", ErrorCode(err))
 			writeStatus(w, http.StatusInternalServerError)
 			return
@@ -149,11 +185,19 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	request, err := boardsync.NewWebhookRequest(r, h.maxBody)
 	if err != nil {
+		state.outcome, state.status = WebhookTooLarge, http.StatusRequestEntityTooLarge
 		writeStatus(w, http.StatusRequestEntityTooLarge)
 		return
 	}
-	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, gate,
-		NewTenantInbox(h.store, tenant, "webhook"))
+	inbox := NewTenantInbox(h.store, tenant, "webhook")
+	inbox.OnPush(func(push InboxPush) {
+		state.added += push.Added
+		state.skipped += push.Skipped
+		if h.observer != nil && push.Skipped > 0 {
+			h.observer.WebhookDeduped(tenant, key, push.Skipped)
+		}
+	})
+	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, gate, inbox)
 	if err != nil {
 		status := response.Status
 		if status == 0 {
@@ -162,6 +206,12 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if status < 400 {
 			status = http.StatusInternalServerError
 		}
+		state.status = status
+		if status >= 400 && status < 500 {
+			state.outcome = WebhookRejected
+		} else {
+			state.outcome = WebhookFailed
+		}
 		// The body is a generic status: a provider or store error may carry a
 		// platform payload, and none of it belongs in a response.
 		h.logger.Warn("sync webhook failed",
@@ -169,8 +219,23 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeStatus(w, status)
 		return
 	}
+	state.outcome, state.status = WebhookAccepted, response.Status
 	w.Header().Set("Cache-Control", "no-store")
 	response.WriteTo(w)
+}
+
+// observe hands one finished request to the observer. An unclassified request
+// (a wrong method) is not a webhook result and is not observed.
+func (h *WebhookHandler) observe(state webhookState, started time.Time) {
+	if h.observer == nil || state.outcome == "" {
+		return
+	}
+	h.observer.WebhookHandled(WebhookObservation{
+		Tenant: state.tenant, Key: state.key, Platform: state.platform,
+		Outcome: state.outcome, Status: state.status,
+		Added: state.added, Skipped: state.skipped,
+		Took: time.Since(started),
+	})
 }
 
 // webhookKey reads the {key} path segment. PathValue is used when the handler

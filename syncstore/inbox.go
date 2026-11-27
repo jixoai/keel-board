@@ -14,6 +14,7 @@ type TenantInbox struct {
 	store  Store
 	tenant string
 	owner  string
+	onPush func(InboxPush)
 }
 
 // NewTenantInbox returns a sync.Inbox scoped to one tenant.
@@ -21,9 +22,21 @@ func NewTenantInbox(store Store, tenant, owner string) *TenantInbox {
 	return &TenantInbox{store: store, tenant: tenant, owner: leaseOwner(owner)}
 }
 
+// OnPush registers a callback with each successful push's counts. It is how a
+// webhook or bridge path counts dedupe hits without changing the sync.Inbox
+// interface. The callback runs beside the push and must not block; a nil
+// callback is the default.
+func (i *TenantInbox) OnPush(fn func(InboxPush)) *TenantInbox {
+	i.onPush = fn
+	return i
+}
+
 // Push implements sync.Inbox.
 func (i *TenantInbox) Push(ctx context.Context, key boardsync.Key, records []boardsync.Record) (int, error) {
 	pushed, err := i.store.PushInbox(ctx, i.tenant, key, records)
+	if err == nil && i.onPush != nil {
+		i.onPush(pushed)
+	}
 	return pushed.Added, err
 }
 

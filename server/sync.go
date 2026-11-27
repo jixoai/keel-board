@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
@@ -77,11 +78,12 @@ type syncService struct {
 	bridgeSecret  func(tenant string, key boardsync.Key) (boardsync.Secret, bool)
 	startChannels map[SyncKey][]string
 	owned         []SyncKey
+	telemetry     *syncTelemetry
 	logger        *slog.Logger
 }
 
 // newSyncService validates opts and builds the sync seams.
-func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions) (*syncService, error) {
+func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions, telemetry *syncTelemetry) (*syncService, error) {
 	if board == nil {
 		return nil, errors.New("server: sync needs a board")
 	}
@@ -110,6 +112,10 @@ func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions) (*sync
 		MaxFiles: opts.MaxFiles, MaxLinks: opts.MaxLinks, FileFetchTimeout: opts.FileFetchTimeout,
 		Logger: opts.Logger,
 	})
+	var observer syncstore.WebhookObserver
+	if telemetry != nil {
+		observer = telemetry
+	}
 	handler, err := syncstore.NewWebhookHandler(syncstore.WebhookConfig{
 		Registry: opts.Registry,
 		Store:    opts.Store,
@@ -121,6 +127,7 @@ func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions) (*sync
 			return syncstore.StoreGate{Store: opts.Store}, nil
 		},
 		MaxBodyBytes: opts.MaxWebhookBody,
+		Observer:     observer,
 		Logger:       opts.Logger,
 	})
 	if err != nil {
@@ -131,7 +138,7 @@ func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions) (*sync
 		host: host, runner: boardsync.NewRunner(host), webhook: handler,
 		tenant: opts.Tenant, bridgeSecret: opts.BridgeSecret,
 		startChannels: opts.StartChannels, owned: append([]SyncKey(nil), opts.Owned...),
-		logger: opts.Logger,
+		telemetry: telemetry, logger: opts.Logger,
 	}, nil
 }
 
@@ -655,12 +662,27 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 			},
 			Inbox: depth,
 		})
+		s.observeInboxDepth(entry.Key, depth)
 	}
 	sort.Slice(status.Keys, func(i, j int) bool { return status.Keys[i].Key < status.Keys[j].Key })
 	status.Outbox, err = s.sync.store.OutboxDepth(req.ctx, req.tenant)
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	// The outbox is tenant-wide in the store's contract; a store that can
+	// break it down by key exports the per-key series. A store that can't
+	// leaves the outbox series unset rather than repeating one total under
+	// every key.
+	if byKey, ok := s.sync.store.(syncstore.KeyOutboxDepth); ok {
+		depths, err := byKey.OutboxDepthByKey(req.ctx, req.tenant)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		for key, depth := range depths {
+			s.observeOutboxDepth(key, depth)
+		}
 	}
 	writeJSON(w, http.StatusOK, status)
 }
@@ -769,6 +791,10 @@ func (s *Server) handleSyncRetryInbox(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.recordAudit(req.ctx, audit.Event{
+		Tenant: req.tenant, Kind: audit.KindInboxRetry, Key: string(key),
+		Status: audit.StatusRetried, Detail: map[string]any{"event": id},
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"retried": true})
 }
 
@@ -795,6 +821,10 @@ func (s *Server) handleSyncRetryOutbox(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	s.recordAudit(req.ctx, audit.Event{
+		Tenant: req.tenant, Kind: audit.KindOutboxRetry,
+		DeliveryID: id, Status: audit.StatusRetried,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"retried": true})
 }
 

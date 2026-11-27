@@ -249,6 +249,13 @@ type OutboxDepth struct {
 	Dead    int `json:"dead"`
 }
 
+// KeyOutboxDepth is a Store that can report outbound depth per connection key.
+// The status API uses it for board_sync_outbox_depth{key,status}; a store
+// without it simply exports no per-key outbox series instead of guessing one.
+type KeyOutboxDepth interface {
+	OutboxDepthByKey(ctx context.Context, tenant string) (map[boardsync.Key]OutboxDepth, error)
+}
+
 // Store is the durable sync state. Memory and PostgreSQL implement it with
 // the same semantics; a caller may run either behind the workers and handler.
 //

@@ -16,8 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/metrics"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -119,8 +121,10 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 			}
 			return "t1", nil
 		},
-		Logger: logger,
-		Blobs:  blobs,
+		Logger:  logger,
+		Blobs:   blobs,
+		Metrics: opts.metrics,
+		Audit:   opts.audit,
 		Sync: &server.SyncOptions{
 			Store: serverStore, Registry: registry, Tenant: tenant,
 			Owned:         []server.SyncKey{{Tenant: "t1", Key: "slack"}},
@@ -169,7 +173,9 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 		Store: h.serverStore(), Registry: h.registry, Runner: runner, Host: h.server.SyncHost(),
 		Files:  boardsync.FileLoader(h.server.SyncHost().LoadFiles),
 		Tenant: "t1", Keys: []boardsync.Key{"slack"},
-		PollInterval: 10 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		PollInterval: 10 * time.Millisecond,
+		Hooks:        h.server.SyncWorkerHooks(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("new outbound worker: %v", err)
@@ -178,7 +184,9 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 	go func() { defer h.workers.Done(); _ = worker.Run(ctx) }()
 	inbound, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
 		Store: h.serverStore(), Registry: h.registry, Runner: runner, Tenant: "t1", Key: "slack",
-		PollInterval: 10 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		PollInterval: 10 * time.Millisecond,
+		Hooks:        h.server.SyncWorkerHooks(),
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatalf("new inbound worker: %v", err)
@@ -212,6 +220,9 @@ type syncHarnessOptions struct {
 	blobs blob.Store
 	// logger receives the server's and sync's logs; nil discards them.
 	logger *slog.Logger
+	// metrics and audit are the server's observability seams.
+	metrics *metrics.Registry
+	audit   audit.Store
 }
 
 func (h *syncHarness) request(method, path string, body any, extra map[string]string) (int, []byte) {
