@@ -901,8 +901,8 @@ func (h *harness) openStream(headers map[string]string) (*http.Response, *bufio.
 	return response, reader, cancel
 }
 
-// readEvent reads one SSE event, skipping comments, with a timeout so a
-// broken feed fails instead of hanging.
+// readEvent reads one SSE event, skipping comments and id-only cursor frames,
+// with a timeout so a broken feed fails instead of hanging.
 func readEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
 	t.Helper()
 	type result struct {
@@ -911,38 +911,41 @@ func readEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
 	}
 	done := make(chan result, 1)
 	go func() {
-		var id, data string
 		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
+			var id, data string
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					done <- result{err: err}
+					return
+				}
+				line = strings.TrimRight(line, "\r\n")
+				if line == "" {
+					break
+				}
+				switch {
+				case strings.HasPrefix(line, "id: "):
+					id = strings.TrimPrefix(line, "id: ")
+				case strings.HasPrefix(line, "data: "):
+					data = strings.TrimPrefix(line, "data: ")
+				}
+			}
+			if data == "" {
+				// An invisible event only advances the cursor.
+				continue
+			}
+			var view protocol.EventView
+			if err := json.Unmarshal([]byte(data), &view); err != nil {
 				done <- result{err: err}
 				return
 			}
-			line = strings.TrimRight(line, "\r\n")
-			if line == "" {
-				break
+			if id != "" && view.Cursor != id {
+				done <- result{err: fmt.Errorf("event id %q doesn't match cursor %q", id, view.Cursor)}
+				return
 			}
-			switch {
-			case strings.HasPrefix(line, "id: "):
-				id = strings.TrimPrefix(line, "id: ")
-			case strings.HasPrefix(line, "data: "):
-				data = strings.TrimPrefix(line, "data: ")
-			}
-		}
-		if data == "" {
-			done <- result{err: fmt.Errorf("event had no data (id %q)", id)}
+			done <- result{view: view}
 			return
 		}
-		var view protocol.EventView
-		if err := json.Unmarshal([]byte(data), &view); err != nil {
-			done <- result{err: err}
-			return
-		}
-		if id != "" && view.Cursor != id {
-			done <- result{err: fmt.Errorf("event id %q doesn't match cursor %q", id, view.Cursor)}
-			return
-		}
-		done <- result{view: view}
 	}()
 	select {
 	case got := <-done:

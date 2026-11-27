@@ -137,9 +137,9 @@ func (f eventFilter) visible(s *Server, req *request, snapshot *log.Snapshot, ev
 	return after != nil || before != nil
 }
 
-// handleEvents answers GET /events with Server-Sent Events. It starts at
-// `after`, at the Last-Event-ID header, or at the head; `last` replays the
-// feed's newest matching events first.
+// handleEvents answers GET /events with Server-Sent Events. It starts after
+// Last-Event-ID (which wins over `after`), after `after`, or at the head;
+// `last` replays the feed's newest matching events first.
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	req, ok := s.resolve(w, r)
 	if !ok {
@@ -216,24 +216,23 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("`last` reads the newest events at once: it takes no `after` or `wait`"))
 		return
 	}
+	// Reconnection is authoritative: a Last-Event-ID header wins over the
+	// `after` query, so a stale query cannot drag a resumed stream backward.
 	var after *uint64
-	if value, has := queryString(r, "after"); has {
+	if value := strings.TrimSpace(r.Header.Get("Last-Event-ID")); value != "" {
+		id, valid := protocol.ParseRef(value)
+		if !valid {
+			writeError(w, protocol.NewError(protocol.CodeInvalidCursor, fmt.Sprintf("Last-Event-ID %s isn't a cursor on this board", value)))
+			return
+		}
+		after = &id
+	} else if value, has := queryString(r, "after"); has {
 		id, valid := protocol.ParseRef(value)
 		if !valid || id == 0 {
 			writeError(w, protocol.NewError(protocol.CodeInvalidCursor, fmt.Sprintf("%s isn't a cursor or a message ID on this board", value)))
 			return
 		}
 		after = &id
-	}
-	if after == nil {
-		if value := strings.TrimSpace(r.Header.Get("Last-Event-ID")); value != "" {
-			id, valid := protocol.ParseRef(value)
-			if !valid {
-				writeError(w, protocol.NewError(protocol.CodeInvalidCursor, fmt.Sprintf("Last-Event-ID %s isn't a cursor on this board", value)))
-				return
-			}
-			after = &id
-		}
 	}
 
 	flusher, canFlush := w.(http.Flusher)
@@ -349,6 +348,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				feed.Apply(event)
 				snapshot := log.SnapshotOf(feed, time.Now().UTC())
 				if !filter.visible(s, req, snapshot, event, before) {
+					// The event stays out of view, but its cursor must move:
+					// otherwise a hidden event repeats on every reconnect.
+					if !writeSSEID(w, flusher, event.Seq) {
+						return
+					}
 					continue
 				}
 				if !writeSSE(w, flusher, eventView(snapshot, event, nil)) {
@@ -387,6 +391,16 @@ func (s *Server) visibleViews(req *request, filter eventFilter, events []log.Eve
 		return nil, err
 	}
 	return views, nil
+}
+
+// writeSSEID advances a subscriber's cursor without carrying an event's
+// content: an id-only frame for an event the subscriber may not see.
+func writeSSEID(w http.ResponseWriter, flusher http.Flusher, seq uint64) bool {
+	if _, err := fmt.Fprintf(w, "id: %s\n\n", protocol.FormatRef(seq)); err != nil {
+		return false
+	}
+	flusher.Flush()
+	return true
 }
 
 // writeSSE writes one event and flushes it.

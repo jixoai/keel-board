@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -689,16 +688,22 @@ func (h *harness) openStream(t *testing.T, query string, headers map[string]stri
 	return response, reader, cancel
 }
 
-// readEvent reads one SSE event, or fails after a timeout.
-func readEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
+// sseFrame is one complete SSE frame, with or without data.
+type sseFrame struct {
+	id   string
+	data string
+}
+
+// readFrame reads one SSE frame, or fails after a timeout.
+func readFrame(t *testing.T, reader *bufio.Reader) sseFrame {
 	t.Helper()
 	type result struct {
-		view protocol.EventView
-		err  error
+		frame sseFrame
+		err   error
 	}
 	done := make(chan result, 1)
 	go func() {
-		var id, data string
+		var frame sseFrame
 		for {
 			line, err := reader.ReadString('\n')
 			if err != nil {
@@ -711,35 +716,45 @@ func readEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
 			}
 			switch {
 			case strings.HasPrefix(line, "id: "):
-				id = strings.TrimPrefix(line, "id: ")
+				frame.id = strings.TrimPrefix(line, "id: ")
 			case strings.HasPrefix(line, "data: "):
-				data = strings.TrimPrefix(line, "data: ")
+				frame.data = strings.TrimPrefix(line, "data: ")
 			}
 		}
-		var view protocol.EventView
-		if data == "" {
-			done <- result{err: fmt.Errorf("event had no data (id %q)", id)}
-			return
-		}
-		if err := json.Unmarshal([]byte(data), &view); err != nil {
-			done <- result{err: err}
-			return
-		}
-		if id != "" && view.Cursor != id {
-			done <- result{err: fmt.Errorf("event id %q doesn't match cursor %q", id, view.Cursor)}
-			return
-		}
-		done <- result{view: view}
+		done <- result{frame: frame}
 	}()
 	select {
 	case got := <-done:
 		if got.err != nil {
-			t.Fatalf("reading an event: %v", got.err)
+			t.Fatalf("reading an SSE frame: %v", got.err)
 		}
-		return got.view
+		return got.frame
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out reading an SSE event")
-		return protocol.EventView{}
+		t.Fatal("timed out reading an SSE frame")
+		return sseFrame{}
+	}
+}
+
+// readEvent reads the next SSE frame that carries an event, skipping the
+// id-only frames that advance a subscriber's cursor.
+func readEvent(t *testing.T, reader *bufio.Reader) protocol.EventView {
+	t.Helper()
+	for {
+		frame := readFrame(t, reader)
+		if frame.data == "" {
+			if frame.id == "" {
+				t.Fatal("SSE frame had neither an id nor data")
+			}
+			continue
+		}
+		var view protocol.EventView
+		if err := json.Unmarshal([]byte(frame.data), &view); err != nil {
+			t.Fatalf("reading an event: %v", err)
+		}
+		if frame.id != "" && view.Cursor != frame.id {
+			t.Fatalf("event id %q doesn't match cursor %q", frame.id, view.Cursor)
+		}
+		return view
 	}
 }
 
@@ -788,16 +803,181 @@ func TestEventsSSEFilters(t *testing.T) {
 	h := newHarness(t)
 	const alice = "local:user:alice"
 
+	// Teach the board who Alice is before the feed opens, so the next write
+	// appends only its message.posted.
+	h.postMessage(alice, "seed", "seen")
 	response, reader, cancel := h.openStream(t, "?channel=errors-www", nil)
 	defer cancel()
 	defer response.Body.Close()
 
-	// Another channel's post doesn't reach this feed.
+	// Another channel's post leaves the feed out of view but still advances
+	// the cursor with an id-only frame.
 	h.postMessage(alice, "other", "elsewhere")
+	skipped := readFrame(t, reader)
+	if skipped.id == "" || skipped.data != "" {
+		t.Fatalf("a filtered-out event should be an id-only frame, got %+v", skipped)
+	}
 	wanted := h.postMessage(alice, "errors-www", "here")
 	event := readEvent(t, reader)
 	if event.Message == nil || event.Message.ID != wanted.ID {
 		t.Fatalf("expected the filtered channel's post, got %+v", event)
+	}
+}
+
+// TestEventsSSEHiddenEventAdvancesCursor proves an event the feed leaves out
+// still moves the subscriber's cursor, without carrying its content.
+func TestEventsSSEHiddenEventAdvancesCursor(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+	const bob = "local:user:bob"
+
+	// Alice's post teaches the board who she is before the feed opens.
+	h.postMessage(alice, "work", "seed")
+	response, reader, cancel := h.openStream(t, "", nil)
+	defer cancel()
+	defer response.Body.Close()
+
+	// Bob's first write appends actor.seen (hidden) and then message.posted.
+	posted := h.postMessage(bob, "work", "from bob")
+	hidden := readFrame(t, reader)
+	if hidden.id == "" || hidden.data != "" {
+		t.Fatalf("a hidden event should be an id-only frame, got %+v", hidden)
+	}
+	visible := readEvent(t, reader)
+	if visible.Message == nil || visible.Message.ID != posted.ID {
+		t.Fatalf("the visible event after the hidden one should be the post, got %+v", visible)
+	}
+	hiddenSeq, hiddenOK := protocol.ParseRef(hidden.id)
+	visibleSeq, visibleOK := protocol.ParseRef(visible.Cursor)
+	if !hiddenOK || !visibleOK || visibleSeq <= hiddenSeq {
+		t.Fatalf("the hidden frame (%s) should precede the visible event (%s)", hidden.id, visible.Cursor)
+	}
+}
+
+// TestEventsSSEAllShowsHiddenEvents proves `all` still carries the event's
+// data instead of the id-only frame a normal feed gets.
+func TestEventsSSEAllShowsHiddenEvents(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+	const bob = "local:user:bob"
+
+	h.postMessage(alice, "work", "seed")
+	response, reader, cancel := h.openStream(t, "?all=1", nil)
+	defer cancel()
+	defer response.Body.Close()
+
+	posted := h.postMessage(bob, "work", "from bob")
+	seen := readEvent(t, reader)
+	if seen.Type != "actor.seen" || seen.Payload["actor"] != bob {
+		t.Fatalf("all=1 should carry the hidden event's data, got %+v", seen)
+	}
+	next := readEvent(t, reader)
+	if next.Message == nil || next.Message.ID != posted.ID {
+		t.Fatalf("the post should follow the actor.seen event, got %+v", next)
+	}
+}
+
+// TestEventsSSEPermissionIsIDOnly proves a channel the subscriber can't read
+// advances the cursor but never sends the event's content.
+func TestEventsSSEPermissionIsIDOnly(t *testing.T) {
+	denySecretRead := server.AuthorizerFunc(func(_ context.Context, _ string, _ protocol.Actor, channel string, permission protocol.Permission) error {
+		if channel == "secret" && permission == protocol.PermissionRead {
+			return protocol.Forbidden("no access to secret")
+		}
+		return nil
+	})
+	h := newHarness(t, server.Options{Authorize: denySecretRead})
+	const alice = "local:user:alice"
+
+	h.postMessage(alice, "public", "seed")
+	response, reader, cancel := h.openStream(t, "", nil)
+	defer cancel()
+	defer response.Body.Close()
+
+	h.postMessage(alice, "secret", "blind post")
+	hidden := readFrame(t, reader)
+	if hidden.id == "" || hidden.data != "" {
+		t.Fatalf("an unreadable channel's event should be an id-only frame, got %+v", hidden)
+	}
+	visible := h.postMessage(alice, "public", "visible after")
+	event := readEvent(t, reader)
+	if event.Message == nil || event.Message.ID != visible.ID {
+		t.Fatalf("the readable channel's post should follow, got %+v", event)
+	}
+}
+
+// TestEventsSSELastEventIDWins proves a reconnect's header is authoritative:
+// the stream starts after the header's cursor, not the `after` query's.
+func TestEventsSSELastEventIDWins(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+
+	response, reader, cancel := h.openStream(t, "", nil)
+	defer cancel()
+	defer response.Body.Close()
+	first := h.postMessage(alice, "work", "one")
+	firstEvent := readEvent(t, reader)
+	if firstEvent.Message == nil || firstEvent.Message.ID != first.ID {
+		t.Fatalf("expected the first post, got %+v", firstEvent)
+	}
+	second := h.postMessage(alice, "work", "two")
+	secondEvent := readEvent(t, reader)
+	if secondEvent.Message == nil || secondEvent.Message.ID != second.ID {
+		t.Fatalf("expected the second post, got %+v", secondEvent)
+	}
+	cancel()
+	response.Body.Close()
+
+	// Without a header, `after` still resumes.
+	queryResponse, queryReader, queryCancel := h.openStream(t, "?after="+string(firstEvent.Cursor), nil)
+	defer queryCancel()
+	defer queryResponse.Body.Close()
+	fromQuery := readEvent(t, queryReader)
+	if fromQuery.Message == nil || fromQuery.Message.ID != second.ID {
+		t.Fatalf("after should resume at the second post, got %+v", fromQuery)
+	}
+	queryCancel()
+	queryResponse.Body.Close()
+
+	// `after` names the second event, but the header names only the first.
+	// The header wins, so the second event is replayed.
+	resumed, resumedReader, resumedCancel := h.openStream(t,
+		"?after="+string(secondEvent.Cursor),
+		map[string]string{"Last-Event-ID": string(firstEvent.Cursor)})
+	defer resumedCancel()
+	defer resumed.Body.Close()
+	replayed := readEvent(t, resumedReader)
+	if replayed.Message == nil || replayed.Message.ID != second.ID {
+		t.Fatalf("Last-Event-ID should override after and replay the second post, got %+v", replayed)
+	}
+}
+
+// TestEventsSSELastReplaysVisibleEventsOnly pins the `last` feed's role: it
+// replays the newest visible events, then follows from the head. It is not a
+// cursor resume, so invisible events it skipped need no id-only frames.
+func TestEventsSSELastReplaysVisibleEventsOnly(t *testing.T) {
+	h := newHarness(t)
+	const alice = "local:user:alice"
+
+	newest := h.postMessage(alice, "work", "newest visible")
+	// channel.created carries no message, so a normal feed leaves it out; it is
+	// now the newest event that `last` must skip.
+	status, data := h.request(http.MethodPost, "/channels", map[string]any{"path": "bookkeeping"}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+
+	response, reader, cancel := h.openStream(t, "?last=1", nil)
+	defer cancel()
+	defer response.Body.Close()
+	event := readEvent(t, reader)
+	if event.Message == nil || event.Message.ID != newest.ID {
+		t.Fatalf("last=1 should replay the newest visible event, got %+v", event)
+	}
+
+	// The stream continues from the head, so no skipped event is replayed.
+	next := h.postMessage(alice, "work", "live after last")
+	following := readEvent(t, reader)
+	if following.Message == nil || following.Message.ID != next.ID {
+		t.Fatalf("the stream should continue from the head, got %+v", following)
 	}
 }
 

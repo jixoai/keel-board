@@ -343,6 +343,12 @@ upstream:
 - An SSE feed forces a catch-up when it opens, so `last` replay and a client's
   `Last-Event-ID` see the store's events. A cursor ahead of the log is refused
   (`invalid_cursor`), never silently clamped downward.
+- An invisible event still moves a subscriber's cursor: the feed writes an
+  id-only frame (`id: <cursor>` with no `data`), so filters and channel
+  permissions leak neither content nor the event type, and a reconnect doesn't
+  replay the same hidden backlog. On resume, `Last-Event-ID` wins over `after`.
+- `last` replays the newest visible events and then follows the head; it is a
+  bounded read, not a cursor resume, so it emits no id-only frames.
 
 Known deviations and deferred work:
 

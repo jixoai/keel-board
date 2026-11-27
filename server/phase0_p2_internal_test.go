@@ -22,9 +22,9 @@ func TestAsProtocolDoesNotEchoHostError(t *testing.T) {
 	}
 }
 
-// TestVersionIsTheReleaseVersion keeps discovery honest after the v0.1.0 tag.
+// TestVersionIsTheReleaseVersion keeps discovery honest after the v0.1.1 tag.
 func TestVersionIsTheReleaseVersion(t *testing.T) {
-	if Version != "0.1.0" {
-		t.Fatalf("Version = %q, want 0.1.0", Version)
+	if Version != "0.1.1" {
+		t.Fatalf("Version = %q, want 0.1.1", Version)
 	}
 }
