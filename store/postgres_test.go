@@ -406,7 +406,11 @@ func TestPostgresMigrationIdempotent(t *testing.T) {
 func TestPostgresBoardWaitSeesAnotherStore(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	// This timeout bounds the whole test, including opening two stores and
+	// their idempotent migrations. Under `-count=10` with packages in parallel,
+	// 10s was reached before the append on a busy PostgreSQL; the Wait itself
+	// only polls, so a looser bound does not weaken what is proved.
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	writer := log.New(log.Options{Store: openTestPostgres(t, dsn, schema)})
