@@ -97,6 +97,13 @@ type RootFetcher interface {
 	FetchRoot(ctx context.Context, key Key, thread string) (*RootDraft, error)
 }
 
+// Labeler applies a message's labels to a delivered copy without editing its
+// text. A labels.changed event reaches a Labeler even when no renderer would
+// change the text (a Linear issue's state and properties).
+type Labeler interface {
+	Labels(ctx context.Context, key Key, thread ThreadRef, labels map[string]string) error
+}
+
 // Linker maps between a platform's URLs and its own thread and message IDs.
 type Linker interface {
 	// Locate reads a URL as native thread and message IDs. nil means the URL

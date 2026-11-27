@@ -96,6 +96,7 @@ func TestRunnerOutboundDeliversOnceAndReceipts(t *testing.T) {
 	message := boardsync.Message{
 		ID: 812, Thread: 812, Channel: "support", Text: "ship it",
 		Actor: "slack:user:U1", ActorName: "Ada", Verified: true,
+		Labels: map[string]string{"state": "started"},
 	}
 	target := boardsync.ResolvedTarget{
 		Key: "slack", Platform: "slack", Channel: "C0123", Thread: "C0123:1727.9", Kind: boardsync.TargetThread,
@@ -116,9 +117,46 @@ func TestRunnerOutboundDeliversOnceAndReceipts(t *testing.T) {
 	if posts[0].Msg.Markdown != "**Ada**: ship it" || posts[0].Msg.Sender == nil || posts[0].Msg.Sender.Name != "Ada" {
 		t.Fatalf("outbound message = %+v", posts[0].Msg)
 	}
+	if posts[0].Msg.Labels["state"] != "started" {
+		t.Fatalf("outbound labels = %+v", posts[0].Msg.Labels)
+	}
 	records := host.Records()
 	if len(records) != 1 || records[0].Type != boardsync.BoardMessageSynced {
 		t.Fatalf("records = %+v", records)
+	}
+}
+
+func TestRunnerLabelsChangeReachesLabeler(t *testing.T) {
+	var got map[string]string
+	entry, provider, host := testEntry(t, func(ctx context.Context, call *boardsync.Call) error {
+		_, err := call.Deliver(ctx, boardsync.DeliverOptions{})
+		return err
+	})
+	provider.LabelsFunc = func(_ context.Context, _ boardsync.Key, _ boardsync.ThreadRef, labels map[string]string) error {
+		got = labels
+		return nil
+	}
+	runner := boardsync.NewRunner(host)
+	message := boardsync.Message{
+		ID: 812, Thread: 812, Channel: "support", Text: "ship it",
+		Labels: map[string]string{"state": "completed", "priority": "high"},
+	}
+	target := boardsync.ResolvedTarget{
+		Key: "slack", Platform: "slack", Channel: "C0123", Thread: "C0123:1727.9", Kind: boardsync.TargetThread,
+	}
+	if _, err := runner.Outbound(context.Background(), entry,
+		boardsync.BoardEvent{Type: boardsync.BoardLabelsChanged, Thread: 812},
+		message, &target, ""); err != nil {
+		t.Fatalf("Outbound: %v", err)
+	}
+	if got["state"] != "completed" || got["priority"] != "high" {
+		t.Fatalf("labels = %+v", got)
+	}
+	if calls := provider.LabelsCalls(); len(calls) != 1 || calls[0].Thread.External() != "slack:C0123:1727.9" {
+		t.Fatalf("label calls = %+v", calls)
+	}
+	if len(provider.Edits()) != 0 {
+		t.Fatal("a labels-only change reached Editor instead of Labeler")
 	}
 }
 

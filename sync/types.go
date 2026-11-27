@@ -483,6 +483,10 @@ type OutboundMessage struct {
 	// a provider writes into a platform comment.
 	BoardMessage uint64 `json:"boardMessage,omitempty"`
 	BoardThread  uint64 `json:"boardThread,omitempty"`
+	// Labels are the board message's labels, for a platform whose issues carry
+	// the same state and properties (Linear). A provider that doesn't mirror
+	// labels ignores the field.
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // Posted is a provider's answer to Post: native IDs, without the sync key.

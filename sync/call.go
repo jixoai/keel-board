@@ -407,6 +407,7 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 		External:     req.Message.From != "" && req.Message.From != "board",
 		BoardMessage: req.Message.ID,
 		BoardThread:  req.Message.Thread,
+		Labels:       req.Message.Labels,
 	}
 	if req.Renderer != nil {
 		rendered, err := req.Renderer(RenderInput{
@@ -475,9 +476,15 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 		err = reactor.React(ctx, req.Key, targetRef(req.Target), req.Copy, req.Event.Emoji, req.Event.Type == BoardReactionAdded)
 		receipt = Receipt{Target: req.Target, Thread: targetRef(req.Target), Message: req.Copy}
 	case BoardLabelsChanged:
-		// The default renderer reads no labels, so a label change edits a copy
-		// only when a renderer is given.
+		// A provider that mirrors labels (Linear's issue state/properties) is
+		// told even when no renderer would change the text. Others only edit a
+		// copy when a renderer reads labels.
 		if req.Renderer == nil {
+			if labeler, ok := o.provider.(Labeler); ok {
+				err = labeler.Labels(ctx, req.Key, targetRef(req.Target), req.Message.Labels)
+				receipt = Receipt{Target: req.Target, Thread: targetRef(req.Target), Message: req.Copy}
+				break
+			}
 			return Receipt{}, nil
 		}
 		editor, ok := o.provider.(Editor)
