@@ -14,11 +14,11 @@ grant HTTP routes remain a later phase.
 
 - Upstream pin: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0`
 - License: Apache-2.0 (see `LICENSE` and `NOTICE`)
-- Status: phase 1 core (channels, messages, tasks, claims, needs, labels, SSE),
-  the phase 3 message surface (edit/delete tombstones, reactions, files,
-  blocks/mentions, actors, batch tasks, threads), durable watchers/schedules
-  with management APIs and workers, the phase 2 sync design + adapter
-  skeletons, and a PostgreSQL log store with tenant-aware access
+- Status: phase 0 feature-complete for the standalone board: core log, message
+  and task surface, access grants, durable watchers/schedules, the two-way sync
+  engine with Slack/GitHub/Linear/Chat SDK adapters, management and source-read
+  APIs, a PostgreSQL store with forced RLS, and the E2E harness. Phase 1 (the
+  keel import and UI) is tracked in keel's `keel-board-v1` change.
 - Sync design: [`docs/SYNC.md`](docs/SYNC.md)
 
 ## Running

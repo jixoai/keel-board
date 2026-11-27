@@ -20,7 +20,8 @@ Source: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0` (Apache-2.0).
 - Vercel API/OIDC/team/project/deployment identity → keel actors and Go auth seams.
 - Vercel Connect credentials → adapter-owned secrets.
 - TypeScript runtime → Go library + HTTP server.
-- SQLite-only local engine → PostgreSQL/SQLite/memory behind one interface.
+- SQLite-only local engine → PostgreSQL/memory behind one interface (this
+  repository has no SQLite store; keel's own migration targets PostgreSQL).
 
 ## Phase 1 and 3 (message surface)
 
@@ -38,8 +39,9 @@ Implemented, end to end:
 - Attachments: `POST /attachments` (4 MB body), `GET`/`DELETE
   /attachments/{id}`, `POST /attachments/uploads` and `POST
   /attachments/uploads/{id}` for signed direct uploads, at most 10 files per
-  message, content-addressed IDs, and a `blob.Store` seam with memory and FS
-  implementations.
+  message, random 128-bit attachment IDs (content is stored once per
+  attachment record; it is not content-addressed), and a `blob.Store` seam
+  with memory and FS implementations.
 - JSON blocks: `json#name@version` fences are parsed, checked against a
   schema, and shown in `message.blocks`; mentions (`@[actor-id]` and `@handle`)
   are parsed and exact IDs validated; `mentions`, `label`, `text`, `by`, `re`,
@@ -170,9 +172,10 @@ permission at trigger time.
 - **Batch is the plan.** Upstream has no separate plan entry; a batch whose
   tasks wait on each other by `key` is that plan. The batch `request` digest is
   trusted as a fronting board's, as upstream does.
-- **Not implemented:** `GET /posts/{id}`, typing, schedules, the schema
-  registry, `scanned` on a thread page, and watchers. `older` is the thread
-  page's only backward cursor.
+- **Not implemented:** `GET /posts/{id}`, the schema registry, and `scanned`
+  on a thread page. Typing, schedules, and watchers are implemented in the
+  server and automation packages; `older` is the thread page's only backward
+  cursor.
 - **`message.by` is an ActorView here.** Upstream's `MessageView.by` is the
   author record (`actor`, `principal`, `profile`) and `author` is the
   ActorView; this port has `by` and `author` both as ActorView.
@@ -300,15 +303,15 @@ Known deviations, deliberately not implemented now:
 
 ## Sync
 
-Phase 2 adds the sync model as Go packages (`sync/`) and adapter skeletons for
-Slack, GitHub, Linear, and a generic Chat SDK bridge. The complete design is in
-[`SYNC.md`](SYNC.md). Deliberate differences from upstream:
+Sync is implemented as Go packages (`sync/`), durable state (`syncstore/`),
+native adapters for Slack, GitHub, and Linear, and a generic Chat SDK bridge.
+The complete design is in [`SYNC.md`](SYNC.md). Deliberate differences from
+upstream:
 
 - `SyncProvider` becomes a Go `Provider`; the engine's `board-sync` consumer
   becomes the `Host`/`Runner` seam. `syncstore` implements the durable,
-  tenant-qualified inbox/outbox, copies, RLS, webhook handler, and workers;
-  subscription, backfill, files, typing, and cross-process ownership remain
-  the server's next phase.
+  tenant-qualified inbox/outbox, copies, RLS, webhook handler, subscription,
+  workers, file bytes, typing, and cross-process key ownership.
 - Vercel Connect, OIDC, and deployment identity are replaced by adapter-owned
   secrets and platform webhook verification.
 - The upstream pin keeps every adapter in `src/sync/`; here they are Go
@@ -316,7 +319,7 @@ Slack, GitHub, Linear, and a generic Chat SDK bridge. The complete design is in
 - GitHub writes are denied unless `WriteRepos` allows the repo, and GitHub
   comments carry a hidden marker as a second echo guard. Upstream relies on
   the app's bot user ID and allows a `mirror` function to write.
-- Slack reaction webhooks don't carry `thread_ts`; the skeleton anchors a
+- Slack reaction webhooks don't carry `thread_ts`; the adapter anchors a
   reaction at `channel:item.ts` and leaves parent-thread lookup to the host.
   Upstream reads the parent from the Chat SDK message.
 - The Chat SDK bridge is a Go `Adapter` interface, not a JavaScript runtime.

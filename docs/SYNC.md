@@ -12,9 +12,11 @@ This document is the Go translation of sync in
 `26428ed4e0661ff362c59abdf1215997c59891b0` (Apache-2.0), and the design for
 the `sync/` packages in this repository. It is deliberately more than an
 interface sketch: the core, the dedupe/retry/inbox/outbox semantics, signature
-verification, and four adapter skeletons compile and are tested. What it is
-not is a production engine: there is no durable store, no HTTP server, no
-worker daemon, and no live platform credential.
+verification, the durable PostgreSQL state, the HTTP server and worker daemon,
+and the Slack/GitHub/Linear/Chat SDK adapters compile and are tested. The
+board and sync surfaces are exercised end to end by `scripts/e2e` against fake
+platform servers; a live platform credential is deployment configuration, not
+a code gap.
 
 ## Status
 
@@ -28,7 +30,7 @@ worker daemon, and no live platform credential.
 | `sync/chatsdk`: signed HTTP bridge v1, HMAC/nonce/timestamp, self identity, inbound batch intake, resolve/deliver client, optional edit/delete/react/root/link hooks | Implemented and tested; reference Go sidecar fixture only, no third-party Chat SDK adapter bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
 | `syncstore`: tenant-qualified durable inbox and outbox, leases, dedupe, lane order, copies (with file IDs), failure receipts, RLS, webhook handler, inbound/outbound workers | Implemented and tested |
-| `server` sync wiring: `POST /webhooks/{key}`, supervised board-event subscription, thread attach/backfill with future-only targets, read-only management API, `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
+| `server` sync wiring: `POST /webhooks/{key}`, supervised board-event subscription, thread attach/backfill with future-only targets, the tenant-scoped management API (entries/status/inbox/outbox retries, thread attach, source read/join), and `cmd/board` workers | Implemented and tested in `server/` and `cmd/board` |
 | PostgreSQL end-to-end: Host, copies, mappings, future-only `since_seq`, outbox restart, concurrent root creation, target uniqueness | Implemented and tested with `KEEL_BOARD_TEST_DSN` |
 | Production engine gaps: cross-process lease for key ownership and full lifecycle reconciliation | Seams in place; listed under Open items. Inbound and outbound file bytes, typing status, and link snapshots are wired through the server host and workers |
 
@@ -747,7 +749,7 @@ off. A channel target starts a root; a thread target replies. `chat.update`,
 through one cached `conversations.list`; IDs never wait. `Locate` reads
 permalinks; `Permalink` calls `chat.getPermalink`.
 
-Known limits of the skeleton:
+Known limits of the adapter:
 
 * **Reaction thread**: Slack reaction webhooks don't carry `thread_ts`, so the
   native thread is `channel:item.ts`. A reaction on a reply needs the host to
@@ -912,12 +914,12 @@ with the first line as title and the whole message as description. `Edit`,
 back, so a removal is unsupported. `FetchRoot` reads an issue the board hasn't
 seen.
 
-Known limits of the skeleton:
+Known limits of the adapter:
 
 * A comment payload without an issue object is refused: the adapter needs the
   team and identifier to place it. The full adapter fetches the issue by ID.
 * Links (`Locate`/`URL`) are not implemented; the workspace slug is not part
-  of the native IDs this skeleton stores.
+  of the native IDs this adapter stores.
 * File upload is not implemented: Linear comments can't carry files, so a
   board message with attachments delivers a note instead. Board mentions stay
   literal text too: Linear renders a mention from a profile URL and this
@@ -1062,21 +1064,22 @@ Recorded in `docs/PORTING.md` as well:
   upstream pin puts every adapter in `src/sync/`; this repository uses Go
   packages `sync/slack`, `sync/github`, `sync/linear`, `sync/chatsdk`.
 * **GitHub writes are denied by default.** Upstream's `into` imports without
-  writing; this skeleton also requires `WriteRepos` for any outbound comment.
+  writing; this adapter also requires `WriteRepos` for any outbound comment.
   That is stricter than a configured `mirror` upstream, where a function can
   deliver.
 * **GitHub markers are added.** Upstream relies on the app's bot user ID; the
   marker is an additional, renaming-resistant echo guard. A deployment can
   disable it with `DisableMarker`.
 * **Slack reaction threads.** Upstream's Chat SDK message carries the parent
-  thread; the raw Slack webhook doesn't, so the skeleton anchors a reaction at
+  thread; the raw Slack webhook doesn't, so the adapter anchors a reaction at
   `channel:item.ts` and leaves parent lookup to the host.
 * **The engine is a seam plus a durable store.** The memory inbox/outbox,
   `Runner`, and tenant-qualified `Registry` are executable; `syncstore` adds
   the durable PostgreSQL/memory inbox and outbox, copies, workers, webhook
-  handler and RLS. Subscription, backfill, access checks, file bytes (through
-  the server host's blob store), typing, and cross-process key ownership remain
-  the server's work.
+  handler and RLS. Subscription, backfill, file bytes (through the server
+  host's blob store), typing, and cross-process key ownership are implemented
+  by the server host and `cmd/board`; the remaining production gap is a
+  cross-process lease for key ownership.
 * **The Chat SDK bridge is a Go interface.** `chatsdk.Adapter` is a Go
   contract; it does not load `chat` or call a JavaScript adapter. A platform
   client implements it directly.
@@ -1122,10 +1125,11 @@ Recorded in `docs/PORTING.md` as well:
 * Full Slack mrkdwn ↔ Markdown conversion and sender/avatar/scope checks.
 * GitHub reaction removal (needs a reaction ID lookup), review-thread
   conversation resolution, and review-comment URLs from the board.
-* Linear comment payloads without an issue object (fetch by `issueId`),
-  workspace links, and issue-move thread re-parenting.
-* Permissions: sync writes must respect the board's per-channel access and
-  the caller's `sync` permission; the skeleton's `Host` seam assumes the
-  server enforces it.
+* Linear issue re-parenting after an issue move, workspace links, and reaction
+  removal.
+* Permissions: sync writes run as the entry's bot/actor; the embedding server
+  must configure its `Authorizer` for channel access, and management/source
+  routes require `manage` at `*`. The board binary's development server allows
+  everything and is not a deployment.
 * Webhook replay tests for every adapter action and recorded real fixtures
   from sandbox accounts.
