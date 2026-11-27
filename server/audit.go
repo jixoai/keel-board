@@ -62,6 +62,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 			Detail: boundedDetail(event.Detail),
 		})
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, map[string]any{"events": views, "count": len(views)})
 }
 

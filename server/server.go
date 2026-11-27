@@ -29,7 +29,7 @@ import (
 const APIPrefix = "/v1/board"
 
 // Version is the discovery version this phase reports.
-const Version = "0.1.0-phase1"
+const Version = "0.1.0"
 
 // Server is the board's HTTP handler.
 type Server struct {
@@ -354,7 +354,9 @@ func asProtocol(err error) *protocol.Error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &protocol.Error{Status: http.StatusServiceUnavailable, Code: protocol.CodeUnavailable, Message: "request timed out"}
 	}
-	return protocol.Forbidden(err.Error())
+	// Never echo a host hook's error text: it may carry a DSN, URL, or
+	// credential context. The protocol error types above are the safe ones.
+	return protocol.Forbidden("permission denied")
 }
 
 // writeJSON writes a JSON response.

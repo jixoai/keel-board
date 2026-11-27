@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/protocol"
@@ -585,5 +586,28 @@ func TestTenantEmptyIsDefault(t *testing.T) {
 	h.expect(status, data, http.StatusOK)
 	if got := decode[protocol.ThreadView](t, data).Message; got.ID != message.ID {
 		t.Fatalf("the default board didn't see the post: %+v", got)
+	}
+}
+
+// TestDirectUploadTicketExpiry proves an expired ticket cannot record bytes
+// that are already in the store. A late finish after the attachment exists is
+// still idempotent (covered above), but a first finish is refused.
+func TestDirectUploadTicketExpiry(t *testing.T) {
+	signer := &signingMemory{Memory: blob.NewMemory()}
+	h := newHarness(t, server.Options{Blobs: signer})
+	const alice = "local:user:alice"
+	status, data := h.request(http.MethodPost, "/attachments/uploads", map[string]any{
+		"name": "late.bin", "type": "application/octet-stream", "size": 5,
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	ticket := decode[protocol.UploadTicket](t, data)
+	if err := signer.Memory.Put(context.Background(), signer.lastKey, []byte("12345"), "application/octet-stream"); err != nil {
+		t.Fatal(err)
+	}
+	h.clock.Advance(31 * time.Minute)
+	status, data = h.request(http.MethodPost, "/attachments/uploads/"+ticket.ID, nil, alice, "", nil)
+	h.expect(status, data, http.StatusNotFound)
+	if code := errorCode(t, data); code != protocol.CodeUploadNotFound {
+		t.Fatalf("expired finish code = %s, want upload_not_found", code)
 	}
 }

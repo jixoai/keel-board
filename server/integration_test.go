@@ -62,6 +62,9 @@ func newHarness(t *testing.T, options ...server.Options) *harness {
 		}
 		opts.Blobs = supplied.Blobs
 		opts.Now = supplied.Now
+		if opts.Now == nil {
+			opts.Now = clock.Now
+		}
 		if supplied.Actor != nil {
 			opts.Actor = supplied.Actor
 		}

@@ -643,9 +643,17 @@ func (s *Server) handleUploadFinish(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeUploadNotFound, fmt.Sprintf("no upload: %s", id)))
 		return
 	}
-	// A second finish answers what the first recorded.
+	// A second finish answers what the first recorded, even after the ticket
+	// expired: the attachment already exists. A first finish after expiry is
+	// refused; the bytes may still be in the store, but the ticket no longer
+	// authorizes recording them.
 	if existing, err := s.loadAttachmentRecord(r, req.tenant, id); err == nil {
 		writeJSON(w, http.StatusCreated, protocol.AttachmentResponse{Attachment: existing.view()})
+		return
+	}
+	if !ticket.ExpiresAt.IsZero() && !s.now().Before(ticket.ExpiresAt) {
+		writeError(w, protocol.NotFound(protocol.CodeUploadNotFound,
+			"the upload ticket expired; start a new upload"))
 		return
 	}
 	size, err := s.blobs.Stat(req.ctx, attachmentDataKey(req.tenant, id))

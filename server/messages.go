@@ -11,20 +11,22 @@ import (
 	"github.com/jixoai/keel-board/protocol"
 )
 
-// handleDiscovery answers GET /v1/board: where the board is and what it
-// syncs. Phase 1 has no sync entries.
+// handleDiscovery answers GET /v1/board: where the board is and whether this
+// process serves sync. It is tenant-neutral, so it lists no entries; the
+// authenticated /sync/entries surface is authoritative.
 func (s *Server) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	base := strings.TrimSuffix(r.URL.Path, "/")
 	if base == "" {
 		base = APIPrefix
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":    s.version,
-		"url":        base,
-		"audience":   base,
-		"team_id":    nil,
-		"project_id": nil,
-		"sync":       []any{},
+		"version":        s.version,
+		"url":            base,
+		"audience":       base,
+		"team_id":        nil,
+		"project_id":     nil,
+		"sync":           []any{},
+		"syncConfigured": s.sync != nil,
 	})
 }
 

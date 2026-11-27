@@ -326,12 +326,20 @@ func (s *Server) SyncWorkerHooks() syncstore.WorkerHooks {
 			if s.telemetry.metrics != nil && key != "" {
 				s.telemetry.metrics.SyncDeadLetters.Inc(metrics.KeyLabel(string(key)))
 			}
-			s.telemetry.record(audit.Event{
+			event := audit.Event{
 				Tenant: tenant, Kind: audit.KindOutboxDead, Key: string(key),
-				Platform: string(platform), Target: target, DeliveryID: delivery,
-				Status: audit.StatusDead, Attempts: attempts,
+				Platform: string(platform), Status: audit.StatusDead, Attempts: attempts,
 				Detail: map[string]any{"code": code},
-			})
+			}
+			// Platform target and delivery IDs come from outside the board;
+			// one unusual shape must not drop the whole dead-letter row.
+			if audit.SafeTarget(target) {
+				event.Target = target
+			}
+			if audit.SafeDeliveryID(delivery) {
+				event.DeliveryID = delivery
+			}
+			s.telemetry.record(event)
 		},
 		DeliveryFailed: func(tenant string, key boardsync.Key, platform boardsync.Platform, code string) {
 			defer s.recoverHook("worker.delivery.failed")

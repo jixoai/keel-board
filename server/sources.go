@@ -1,9 +1,11 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/protocol"
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/syncstore"
@@ -37,13 +39,13 @@ func (s *Server) handleSourceRead(w http.ResponseWriter, r *http.Request) {
 	after := strings.TrimSpace(queryValue(r, "after"))
 	provider, perr := s.sourceProvider(req, entry, key)
 	if perr != nil {
-		s.logSourceRead(req.tenant, key, entry.Platform, perr.Status, 0)
+		s.logSourceRead(req.ctx, req.tenant, key, entry.Platform, perr.Status, 0)
 		writeError(w, perr)
 		return
 	}
 	reader, supported := provider.Provider.(boardsync.SourceReader)
 	if !supported {
-		s.logSourceRead(req.tenant, key, entry.Platform, http.StatusNotImplemented, 0)
+		s.logSourceRead(req.ctx, req.tenant, key, entry.Platform, http.StatusNotImplemented, 0)
 		writeError(w, protocol.NewError(protocol.CodeUnsupported,
 			"this sync connection can't read platform sources"))
 		return
@@ -53,7 +55,7 @@ func (s *Server) handleSourceRead(w http.ResponseWriter, r *http.Request) {
 		// A platform body never reaches the response or the log: only the
 		// stable class the adapter returned.
 		perr := syncFailureFor(err)
-		s.logSourceRead(req.tenant, key, entry.Platform, perr.Status, 0)
+		s.logSourceRead(req.ctx, req.tenant, key, entry.Platform, perr.Status, 0)
 		writeError(w, perr)
 		return
 	}
@@ -61,7 +63,7 @@ func (s *Server) handleSourceRead(w http.ResponseWriter, r *http.Request) {
 		// Keep one JSON shape: an empty read is [], never null.
 		read.Messages = []boardsync.SourceMessage{}
 	}
-	s.logSourceRead(req.tenant, key, entry.Platform, http.StatusOK, len(read.Messages))
+	s.logSourceRead(req.ctx, req.tenant, key, entry.Platform, http.StatusOK, len(read.Messages))
 	writeJSON(w, http.StatusOK, read)
 }
 
@@ -85,13 +87,13 @@ func (s *Server) handleSourceJoin(w http.ResponseWriter, r *http.Request) {
 	}
 	provider, perr := s.sourceProvider(req, entry, key)
 	if perr != nil {
-		s.logSourceJoin(req.tenant, key, entry.Platform, perr.Status)
+		s.logSourceJoin(req.ctx, req.tenant, key, entry.Platform, perr.Status)
 		writeError(w, perr)
 		return
 	}
 	joiner, supported := provider.Provider.(boardsync.SourceJoiner)
 	if !supported {
-		s.logSourceJoin(req.tenant, key, entry.Platform, http.StatusNotImplemented)
+		s.logSourceJoin(req.ctx, req.tenant, key, entry.Platform, http.StatusNotImplemented)
 		writeError(w, protocol.NewError(protocol.CodeUnsupported,
 			"this sync connection can't join platform channels"))
 		return
@@ -99,11 +101,11 @@ func (s *Server) handleSourceJoin(w http.ResponseWriter, r *http.Request) {
 	join, err := joiner.JoinSource(req.ctx, key, target)
 	if err != nil {
 		perr := syncFailureFor(err)
-		s.logSourceJoin(req.tenant, key, entry.Platform, perr.Status)
+		s.logSourceJoin(req.ctx, req.tenant, key, entry.Platform, perr.Status)
 		writeError(w, perr)
 		return
 	}
-	s.logSourceJoin(req.tenant, key, entry.Platform, http.StatusOK)
+	s.logSourceJoin(req.ctx, req.tenant, key, entry.Platform, http.StatusOK)
 	writeJSON(w, http.StatusOK, join)
 }
 
@@ -222,21 +224,37 @@ func (s *Server) sourceProvider(req *request, entry syncstore.Entry, key boardsy
 	return provider, nil
 }
 
-// logSourceRead records one bounded read audit line: connection, platform,
-// action, status and how many messages came back. It carries no target and no
-// message text.
-func (s *Server) logSourceRead(tenant string, key boardsync.Key, platform boardsync.Platform, status, messages int) {
+// logSourceRead records one bounded read in the log and in the durable audit:
+// connection, platform, action, status and how many messages came back. It
+// carries no target and no message text.
+func (s *Server) logSourceRead(ctx context.Context, tenant string, key boardsync.Key, platform boardsync.Platform, status, messages int) {
 	s.sync.logger.Info("sync source read",
 		"tenant", tenant, "key", key, "platform", platform,
 		"action", "read", "status", status, "messages", messages)
+	auditStatus := audit.StatusOK
+	if status < 200 || status >= 300 {
+		auditStatus = audit.StatusFailed
+	}
+	s.recordAudit(ctx, audit.Event{
+		Tenant: tenant, Kind: audit.KindSourceRead, Key: string(key), Platform: string(platform),
+		Status: auditStatus, Detail: map[string]any{"http": status, "messages": messages},
+	})
 }
 
-// logSourceJoin records one bounded join audit line, with the same fields and
-// no target.
-func (s *Server) logSourceJoin(tenant string, key boardsync.Key, platform boardsync.Platform, status int) {
+// logSourceJoin records one bounded join in the log and in the durable audit,
+// with the same fields and no target.
+func (s *Server) logSourceJoin(ctx context.Context, tenant string, key boardsync.Key, platform boardsync.Platform, status int) {
 	s.sync.logger.Info("sync source join",
 		"tenant", tenant, "key", key, "platform", platform,
 		"action", "join", "status", status)
+	auditStatus := audit.StatusOK
+	if status < 200 || status >= 300 {
+		auditStatus = audit.StatusFailed
+	}
+	s.recordAudit(ctx, audit.Event{
+		Tenant: tenant, Kind: audit.KindSourceJoin, Key: string(key), Platform: string(platform),
+		Status: auditStatus, Detail: map[string]any{"http": status},
+	})
 }
 
 // queryValue returns a query parameter, trimmed. Empty and absent are the

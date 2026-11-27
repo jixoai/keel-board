@@ -271,6 +271,36 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read the replay and the feed's starting state before announcing the
+	// stream: a store failure must be a 503, not an empty 200 stream.
+	var lastViews []protocol.EventView
+	if last > 0 {
+		events, err := s.board.History(req.tenant, 1, head)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		views, err := s.visibleViews(req, filter, events)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if len(views) > last {
+			views = views[len(views)-last:]
+		}
+		lastViews = views
+		cursor = head
+	}
+	feed := log.NewState()
+	prefix, err := s.board.History(req.tenant, 1, cursor)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	for _, event := range prefix {
+		feed.Apply(event)
+	}
+
 	w.Header().Set("content-type", "text/event-stream; charset=utf-8")
 	w.Header().Set("cache-control", "no-cache")
 	w.Header().Set("connection", "keep-alive")
@@ -286,31 +316,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	flusher.Flush()
-
-	if last > 0 {
-		events, err := s.board.History(req.tenant, 1, head)
-		if err != nil {
+	for _, view := range lastViews {
+		if !writeSSE(w, flusher, view) {
 			return
-		}
-		views := s.visibleViews(req, filter, events)
-		if len(views) > last {
-			views = views[len(views)-last:]
-		}
-		for _, view := range views {
-			if !writeSSE(w, flusher, view) {
-				return
-			}
-		}
-		cursor = head
-		s.observeSSELag(head, cursor)
-	}
-
-	// A live feed folds each event as it lands, so an event's message is as
-	// that event left it. The state before the cursor comes from the log.
-	feed := log.NewState()
-	if prefix, err := s.board.History(req.tenant, 1, cursor); err == nil {
-		for _, event := range prefix {
-			feed.Apply(event)
 		}
 	}
 	for {
@@ -361,12 +369,12 @@ func hasQuery(r *http.Request, name string) bool {
 }
 
 // visibleViews filters events and renders them as subscribers see them.
-func (s *Server) visibleViews(req *request, filter eventFilter, events []log.Event) []protocol.EventView {
+func (s *Server) visibleViews(req *request, filter eventFilter, events []log.Event) ([]protocol.EventView, error) {
 	if len(events) == 0 {
-		return nil
+		return nil, nil
 	}
 	views := make([]protocol.EventView, 0, len(events))
-	_ = s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
+	err := s.board.Read(req.tenant, func(snapshot *log.Snapshot) error {
 		for _, event := range events {
 			if !filter.visible(s, req, snapshot, event, nil) {
 				continue
@@ -375,7 +383,10 @@ func (s *Server) visibleViews(req *request, filter eventFilter, events []log.Eve
 		}
 		return nil
 	})
-	return views
+	if err != nil {
+		return nil, err
+	}
+	return views, nil
 }
 
 // writeSSE writes one event and flushes it.

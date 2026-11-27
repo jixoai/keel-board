@@ -12,8 +12,9 @@
 // The board log (board_events) stays the domain audit: who changed what is a
 // fact there. This package is the operational trace beside it.
 //
-// Phase 0 writes: webhook acceptance and refusal, bridge failures, inbox and
-// outbox dead letters, and manual inbox/outbox retries. Per-attempt outbound
+// Phase 0 writes: webhook acceptance and refusal, bridge failures, source
+// read/join, inbox and outbox dead letters, and manual inbox/outbox retries.
+// Per-attempt outbound
 // success and inbound-processed rows are deliberately not written: the board
 // log's message.synced/message.sync_failed receipts carry the delivery trace,
 // and per-attempt rows would grow with every delivery. Those remain a Phase 1
@@ -45,16 +46,16 @@ const (
 	KindOutboxRetry     = "sync.outbox.retry"
 	KindBridgeRejected  = "sync.bridge.rejected"
 
-	// KindSourceRead and KindSourceJoin are reserved for the source-read and
-	// join routes (§14.10). This worktree serves no source route yet, so
-	// nothing writes them; the tokens exist so the route's audit has a home
-	// when it lands, and so a dashboards query doesn't guess a spelling.
+	// KindSourceRead and KindSourceJoin are written by the on-demand source
+	// routes (§14.10): who read or joined what connection, with a bounded
+	// status and no target or message body.
 	KindSourceRead = "sync.source.read"
 	KindSourceJoin = "sync.source.join"
 )
 
 // Status values shared by writers.
 const (
+	StatusOK       = "ok"
 	StatusAccepted = "accepted"
 	StatusRejected = "rejected"
 	StatusFailed   = "failed"
@@ -213,6 +214,13 @@ func SafeToken(value string) bool {
 // ID can never stand in for one.
 func SafeDeliveryID(value string) bool {
 	return validToken(value, 200)
+}
+
+// SafeTarget reports whether value has the bounded shape the Target field
+// accepts. A writer whose target comes from a platform omits it rather than
+// losing the whole audit row.
+func SafeTarget(value string) bool {
+	return value != "" && validTarget(value)
 }
 
 func validDetailKey(key string) bool {

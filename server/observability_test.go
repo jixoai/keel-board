@@ -7,12 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jixoai/keel-board/audit"
+	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/metrics"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
@@ -567,5 +569,31 @@ func TestSyncStatusSurvivesOptionalDepthFailure(t *testing.T) {
 	}
 	if err := json.Unmarshal(body, &view); err != nil {
 		t.Fatalf("decode status: %v (%s)", err, body)
+	}
+}
+
+// TestOutboxDeadKeepsRowWhenTargetIsUnbounded proves a platform target with an
+// unusual shape omits the target field instead of losing the whole dead-letter
+// audit row.
+func TestOutboxDeadKeepsRowWhenTargetIsUnbounded(t *testing.T) {
+	auditStore := audit.NewMemory()
+	api := server.New(server.Options{
+		Board:  log.New(log.Options{}),
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Audit:  auditStore,
+	})
+	hooks := api.SyncWorkerHooks()
+	hooks.OutboxDead("t1", "slack", "slack", "delivery-1", "slack:C%1:T1", 3, "failed")
+	events, err := auditStore.Recent(t.Context(), "t1", 10)
+	if err != nil {
+		t.Fatalf("recent: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("audit rows = %d, want 1: %+v", len(events), events)
+	}
+	event := events[0]
+	if event.Kind != audit.KindOutboxDead || event.Target != "" || event.DeliveryID != "delivery-1" ||
+		event.Status != audit.StatusDead || event.Attempts != 3 {
+		t.Fatalf("outbox dead audit = %+v", event)
 	}
 }

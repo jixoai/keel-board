@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jixoai/keel-board/audit"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -601,5 +602,48 @@ func TestSourceLogsAreBounded(t *testing.T) {
 		if strings.Contains(text, secret) {
 			t.Fatalf("logs leaked %q:\n%s", secret, text)
 		}
+	}
+}
+
+// TestSourceReadAndJoinAreAudited proves the on-demand source routes leave a
+// bounded durable audit row: kind, connection, platform, status and a small
+// detail object, never a target or message text.
+func TestSourceReadAndJoinAreAudited(t *testing.T) {
+	auditStore := audit.NewMemory()
+	h := newSyncHarness(t, syncHarnessOptions{audit: auditStore})
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{Kind: "channel", Channel: "C_SUPPORT"}, nil
+	}
+	h.provider.JoinSourceFunc = func(context.Context, boardsync.Key, string) (boardsync.SourceJoin, error) {
+		return boardsync.SourceJoin{Channel: "C_JOIN", Joined: true}, nil
+	}
+	if status, body := h.request(http.MethodGet, "/v1/board/sources/slack/read?target=C_SUPPORT", nil, nil); status != http.StatusOK {
+		t.Fatalf("read = %d %s", status, body)
+	}
+	if status, body := h.request(http.MethodPost, "/v1/board/sources/slack/join", map[string]any{"target": "C_JOIN"}, nil); status != http.StatusOK {
+		t.Fatalf("join = %d %s", status, body)
+	}
+	events, err := auditStore.Recent(t.Context(), "t1", 10)
+	if err != nil {
+		t.Fatalf("audit recent: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("audit rows = %d, want 2: %+v", len(events), events)
+	}
+	seen := map[string]audit.Event{}
+	for _, event := range events {
+		seen[event.Kind] = event
+		if event.Target != "" {
+			t.Fatalf("source audit carries a target: %+v", event)
+		}
+	}
+	read, ok := seen[audit.KindSourceRead]
+	if !ok || read.Key != "slack" || read.Platform != "slack" || read.Status != audit.StatusOK ||
+		read.Detail["messages"] != 0 || read.Detail["http"] != http.StatusOK {
+		t.Fatalf("read audit = %+v", read)
+	}
+	join, ok := seen[audit.KindSourceJoin]
+	if !ok || join.Key != "slack" || join.Status != audit.StatusOK || join.Detail["http"] != http.StatusOK {
+		t.Fatalf("join audit = %+v", join)
 	}
 }
