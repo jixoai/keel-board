@@ -141,6 +141,43 @@ func TestPostgresProjectionCheckAndRebuild(t *testing.T) {
 	}
 }
 
+func TestPostgresProjectionLagAndRebuild(t *testing.T) {
+	dsn := pgTestDSN(t)
+	schema := newPGTestSchema(t, dsn)
+	events := openPGTestStore(t, dsn, schema)
+	board := newProjectionBoard(events)
+	root, reply := seedProjection(t, board, "default")
+	records, err := events.Load(t.Context(), "default")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	through := records[0].Seq
+	lagProjection(t, board, "default", through)
+
+	report, err := board.CheckProjection(t.Context(), "default")
+	if err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	if report.Consistent || !hasProblem(report, "lags") {
+		t.Fatalf("lag: %+v", report)
+	}
+	if report.ProjectionHead != through || report.LogHead != uint64(len(records)) {
+		t.Fatalf("watermarks: %+v", report)
+	}
+	if report.Digest != report.ReplayDigest {
+		t.Fatalf("a lagging prefix should match its own replay: %+v", report)
+	}
+	if _, err := board.Rebuild(t.Context(), "default"); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if text := messageText(t, board, "default", root); text != "root" {
+		t.Fatalf("root text after rebuild: %q", text)
+	}
+	if text := messageText(t, board, "default", reply); text != "reply" {
+		t.Fatalf("reply text after rebuild: %q", text)
+	}
+}
+
 func TestPostgresInconsistentHeadRejectsWrites(t *testing.T) {
 	dsn := pgTestDSN(t)
 	schema := newPGTestSchema(t, dsn)
