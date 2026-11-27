@@ -1229,7 +1229,7 @@ func (h *SyncHost) recordMessageSynced(ctx context.Context, event boardsync.Boar
 		if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
 			Tenant: event.Tenant, BoardThread: root.ID, Key: key,
 			Platform: boardsync.Platform(target.Platform), Channel: target.Channel,
-			Thread: target.Thread, Kind: boardsync.TargetThread,
+			Thread: target.Thread, Subthread: target.Subthread, Kind: boardsync.TargetThread,
 			Since: message.ID,
 		}); err != nil {
 			return err
