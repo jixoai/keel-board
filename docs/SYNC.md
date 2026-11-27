@@ -863,7 +863,8 @@ optional `Editor`, `Deleter`, `Reactor`, `ChannelResolver`, `TargetResolver`,
 bridge, _ := chatsdk.New(chatsdk.Config{
     Key: "telegram",
     Adapter: myAdapter{...},
-    Caps: boardsync.Capabilities{StartThreads: false},
+    SelfIDs: []string{"telegram:user:77"},
+    Caps:        boardsync.Capabilities{StartThreads: false},
 })
 ```
 
