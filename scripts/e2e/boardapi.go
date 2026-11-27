@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -89,6 +90,55 @@ func (e *e2eEnv) postMessage(step *Step, channel, text string) (protocol.Message
 	}
 	if status != http.StatusCreated {
 		return protocol.MessageView{}, fmt.Errorf("post root status %d: %s", status, clip(string(body), 500))
+	}
+	return posted.Message, nil
+}
+
+// uploadAttachment POSTs one raw file to the board's attachment endpoint and
+// returns its attachment view.
+func (e *e2eEnv) uploadAttachment(step *Step, name, contentType string, data []byte) (protocol.Attachment, error) {
+	request, err := http.NewRequest(http.MethodPost, e.harness.baseURL+"/v1/board/attachments", bytes.NewReader(data))
+	if err != nil {
+		return protocol.Attachment{}, err
+	}
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("X-Board-Filename", url.PathEscape(name))
+	response, err := e.harness.httpClient().Do(request)
+	if err != nil {
+		return protocol.Attachment{}, err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	step.Trace("upload attachment", http.MethodPost, "/v1/board/attachments", response.StatusCode, name, string(body))
+	if err != nil {
+		return protocol.Attachment{}, err
+	}
+	var decoded protocol.AttachmentResponse
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		return protocol.Attachment{}, fmt.Errorf("upload attachment: %w (%s)", err, clip(string(body), 300))
+	}
+	if response.StatusCode != http.StatusCreated {
+		return protocol.Attachment{}, fmt.Errorf("upload attachment status %d: %s", response.StatusCode, clip(string(body), 300))
+	}
+	return decoded.Attachment, nil
+}
+
+// postMessageAttachments creates a board root carrying uploaded files.
+func (e *e2eEnv) postMessageAttachments(step *Step, channel, text string, attachments []string) (protocol.MessageView, error) {
+	status, body, err := e.api(step, "post root with files", http.MethodPost, "/messages", map[string]any{
+		"channel": channel, "text": text, "attachments": attachments,
+	})
+	if err != nil {
+		return protocol.MessageView{}, err
+	}
+	var posted struct {
+		Message protocol.MessageView `json:"message"`
+	}
+	if err := json.Unmarshal(body, &posted); err != nil {
+		return protocol.MessageView{}, err
+	}
+	if status != http.StatusCreated {
+		return protocol.MessageView{}, fmt.Errorf("post root with files status %d: %s", status, clip(string(body), 500))
 	}
 	return posted.Message, nil
 }

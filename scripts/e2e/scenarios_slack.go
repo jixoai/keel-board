@@ -163,9 +163,9 @@ func (e *e2eEnv) scenarioSlackMirror() {
 	}
 
 	var fileRoot protocol.MessageView
-	if err := sc.Step("入站文件事件：元数据保留，非白名单 URL 被剥离且不抓取",
+	if err := sc.Step("入站文件事件：抓取白名单文件到 blob，非白名单 URL 降级 note",
 		"POST signed Slack file_share（files.slack.com + 169.254.169.254）",
-		"board 附件 2 个元数据（合法 URL 保留、非白名单 URL 不落库），无抓取、无回发", func(step *Step) error {
+		"board 附件 2 个：run.log 为实际字节（1 次下载），unsafe.bin 保留元数据并带 note；无回发", func(step *Step) error {
 			e.fake.ResetCalls()
 			files := []any{
 				map[string]any{
@@ -196,13 +196,25 @@ func (e *e2eEnv) scenarioSlackMirror() {
 			if err != nil {
 				return err
 			}
-			if len(fileRoot.Attachments) == 1 {
-				step.CheckEQ("附件名", "run.log", fileRoot.Attachments[0].Name)
-				step.CheckEQ("附件大小", int64(2048), fileRoot.Attachments[0].Size)
+			step.CheckEQ("附件数（1 个实际字节 + 1 个元数据占位）", 2, len(fileRoot.Attachments))
+			var safe protocol.Attachment
+			var unsafePlaceholder protocol.Attachment
+			for _, attachment := range fileRoot.Attachments {
+				switch attachment.Name {
+				case "run.log":
+					safe = attachment
+				case "unsafe.bin":
+					unsafePlaceholder = attachment
+				}
 			}
-			step.CheckEQ("附件数（元数据都保留；非白名单 URL 在 adapter/Host 被剥离）", 2, len(fileRoot.Attachments))
-			// Parse the same payload through the real adapter once more and
-			// assert the unsafe URL is cleared before the Host ever sees it.
+			step.CheckEQ("安全附件名", "run.log", safe.Name)
+			step.CheckEQ("安全附件大小（实际字节）", int64(len(fakeSlackFileBytes)), safe.Size)
+			step.Check("安全附件 ID 形状", len(safe.ID) == 22, "22 字符", safe.ID)
+			step.CheckEQ("非白名单附件元数据保留", "unsafe.bin", unsafePlaceholder.Name)
+			step.CheckContains("非白名单附件 note", "unsafe.bin", fileRoot.Text)
+			step.CheckContains("非白名单 note 原因", "download URL isn't available", fileRoot.Text)
+			// The same payload through the real adapter: the unsafe URL is
+			// cleared before the Host ever sees it.
 			provider := e.harness.adapters["slack"]
 			headers := slackSignedHeaders(body)
 			webhook := &boardsync.WebhookRequest{Method: http.MethodPost, Header: http.Header{}, Body: body}
@@ -219,10 +231,16 @@ func (e *e2eEnv) scenarioSlackMirror() {
 				step.CheckEQ("安全文件 URL 保留", "https://files.slack.com/files-pri/T-F/run.log", files[0].URL)
 				step.CheckEQ("非白名单文件 URL 已清空", "", files[1].URL)
 			}
-			step.CheckEQ("未触发文件下载（Host 只存元数据）", 0, len(e.fake.CallsTo("files.slack.com", "/")))
+			downloads := e.fake.CallsTo("files.slack.com", "/files-pri")
+			step.CheckEQ("文件下载次数", 1, len(downloads))
+			status, data, err := e.api(step, "download inbound attachment", http.MethodGet, "/attachments/"+safe.ID, nil)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("附件读取状态", http.StatusOK, status)
+			step.CheckEQ("附件实际字节", fakeSlackFileBytes, string(data))
 			step.CheckEQ("未向 Slack 回发", 0, len(e.fake.SlackPosts()))
-			step.Note("文件字节抓取是 SYNC.md 的 open item；本步骤只验证元数据/安全过滤。")
-			step.Actual = fmt.Sprintf("attachments=%v", fileRoot.Attachments)
+			step.Actual = fmt.Sprintf("attachments=%v downloads=%d", fileRoot.Attachments, len(downloads))
 			return nil
 		}); err != nil {
 		return
@@ -853,15 +871,29 @@ func (e *e2eEnv) scenarioSlackFailures() {
 			if err != nil {
 				return err
 			}
-			thread, err = e.getThread(step, root.Message.ID)
+			// The retry accepted is not the receipt landing: wait for the
+			// successful delivery's message.synced to clear the projection.
+			var cleared bool
+			err = waitFor(10*time.Second, func() error {
+				thread, findErr := e.getThread(step, root.Message.ID)
+				if findErr != nil {
+					return findErr
+				}
+				for _, candidate := range thread.Replies {
+					if candidate.ID == reply.ID {
+						if len(candidate.Undelivered) != 0 {
+							return fmt.Errorf("undelivered=%v", candidate.Undelivered)
+						}
+						cleared = true
+						return nil
+					}
+				}
+				return fmt.Errorf("reply %s missing", reply.ID)
+			})
 			if err != nil {
 				return err
 			}
-			for _, candidate := range thread.Replies {
-				if candidate.ID == reply.ID {
-					step.CheckEQ("retry 后 undelivered 清空", 0, len(candidate.Undelivered))
-				}
-			}
+			step.CheckBool("retry 后 undelivered 清空", true, cleared)
 			step.Actual = fmt.Sprintf("delivery=%s attempts=%d", deadDelivery, attempts)
 			return nil
 		}); err != nil {
@@ -1098,6 +1130,126 @@ func (e *e2eEnv) scenarioAdapterTyping() {
 			step.CheckEQ("typing thread_ts", slackRootTS, typing.Thread)
 			step.CheckContains("typing status", "Typing", typing.Status)
 			step.Note("board 级 typing 未接线：已记录为 SKIP。")
+			return nil
+		}); err != nil {
+		return
+	}
+}
+
+// scenarioSlackOutboundFiles proves a board attachment's bytes reach Slack:
+// the upload worker reads the board blob, Slack posts the text first, then
+// uploads the file into the same thread.
+func (e *e2eEnv) scenarioSlackOutboundFiles() {
+	sc := e.report.Scenario("slack-files")
+	if err := sc.Step("出站文件：board attachment → blob → fake Slack 上传",
+		"POST /attachments + POST /messages{channel=files,attachments=[id]} + attach C0FILES；等待 fake files.* 与 chat.postMessage",
+		"fake 收到 1 次文件 PUT（实际字节）；files.getUploadURLExternal/completeUploadExternal 各 1 次；文本先发", func(step *Step) error {
+			data := []byte("outbound file bytes")
+			attachment, err := e.uploadAttachment(step, "board.txt", "text/plain", data)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("attachment 大小", int64(len(data)), attachment.Size)
+			step.Check("attachment ID 形状", len(attachment.ID) == 22, "22 字符", attachment.ID)
+
+			e.fake.ResetSlack()
+			root, err := e.postMessageAttachments(step, "files", "outbound file root", []string{attachment.ID})
+			if err != nil {
+				return err
+			}
+			// Attach a valid Slack channel ID: C_SUPPORT is only a fixture
+			// channel name and the adapter's target parser rejects underscores.
+			view, err := e.attachThread(step, "slack", root.ID, "C0FILES")
+			if err != nil {
+				return err
+			}
+			step.CheckContains("attach channel", "C0FILES", view.Target)
+			err = waitFor(15*time.Second, func() error {
+				if len(e.fake.SlackUploads()) == 0 {
+					return fmt.Errorf("fake Slack 尚未收到文件上传")
+				}
+				for _, post := range e.fake.SlackPosts() {
+					if strings.Contains(post.Text, "outbound file root") {
+						return nil
+					}
+				}
+				return fmt.Errorf("fake Slack 尚未收到文本")
+			})
+			if err != nil {
+				return err
+			}
+			uploads := e.fake.SlackUploads()
+			step.CheckEQ("文件上传次数", 1, len(uploads))
+			if len(uploads) > 0 {
+				step.CheckEQ("上传字节数", len(data), uploads[0].Bytes)
+				step.CheckContains("上传 URL", "/upload/v1/", uploads[0].Path)
+			}
+			step.CheckEQ("getUploadURLExternal 调用", 1, len(e.fake.CallsTo("slack.com", "/api/files.getUploadURLExternal")))
+			step.CheckEQ("completeUploadExternal 调用", 1, len(e.fake.CallsTo("slack.com", "/api/files.completeUploadExternal")))
+			posts := e.fake.SlackPosts()
+			step.CheckEQ("文本 post 次数", 1, countSlackPosts(posts, "outbound file root"))
+			if len(posts) > 0 {
+				step.CheckEQ("post channel", "C0FILES", posts[0].Channel)
+				step.CheckContains("文本先发", "outbound file root", posts[0].Text)
+				step.Check("文件 note 未出现", !strings.Contains(posts[0].Text, "📎"), "无 📎", posts[0].Text)
+			}
+			err = waitFor(10*time.Second, func() error {
+				thread, findErr := e.getThread(step, root.ID)
+				if findErr != nil {
+					return findErr
+				}
+				if len(thread.Message.Undelivered) != 0 {
+					return fmt.Errorf("undelivered=%v", thread.Message.Undelivered)
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+			step.Actual = fmt.Sprintf("attachment=%s uploads=%d", attachment.ID, len(uploads))
+			return nil
+		}); err != nil {
+		return
+	}
+}
+
+// scenarioBoardTyping proves the outbox worker's typing seam: a board reply
+// shows a status in the Slack thread before the post lands.
+func (e *e2eEnv) scenarioBoardTyping() {
+	sc := e.report.Scenario("board-typing")
+	root, err := e.findThreadQuiet("support", "slack root inbound")
+	if err != nil {
+		sc.Skip("board 级 typing", "board reply → assistant.threads.setStatus", "前置 slack-mirror 未完成："+err.Error())
+		return
+	}
+	if err := sc.Step("board 级 typing：board reply → worker → assistant.threads.setStatus",
+		"POST /messages{re=slack root}，等待 fake typing 与 chat.postMessage",
+		"fake 收到 C_SUPPORT/slackRootTS 的 Typing…，随后文本投递一次", func(step *Step) error {
+			e.fake.ResetSlack()
+			reply, err := e.replyMessage(step, root.Message.ID, "board typing reply")
+			if err != nil {
+				return err
+			}
+			err = waitFor(10*time.Second, func() error {
+				if len(e.fake.SlackTyping()) == 0 {
+					return fmt.Errorf("fake Slack 尚未收到 typing")
+				}
+				for _, post := range e.fake.SlackPosts() {
+					if strings.Contains(post.Text, "board typing reply") {
+						return nil
+					}
+				}
+				return fmt.Errorf("文本尚未投递")
+			})
+			if err != nil {
+				return err
+			}
+			typing := e.fake.SlackTyping()[0]
+			step.CheckEQ("typing channel", "C_SUPPORT", typing.Channel)
+			step.CheckEQ("typing thread_ts", slackRootTS, typing.Thread)
+			step.CheckContains("typing status", "Typing", typing.Status)
+			step.CheckEQ("文本只投递一次", 1, countSlackPosts(e.fake.SlackPosts(), "board typing reply"))
+			step.Actual = fmt.Sprintf("reply=%s typing=%q", reply.ID, typing.Status)
 			return nil
 		}); err != nil {
 		return

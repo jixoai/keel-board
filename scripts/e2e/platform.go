@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"sort"
@@ -187,17 +189,34 @@ func (f *fakePlatform) route(w http.ResponseWriter, r *http.Request) {
 	f.mu.Unlock()
 }
 
+// fakeSlackFileBytes is what the fake Slack file host serves and what the
+// inbound file assertions compare against.
+const fakeSlackFileBytes = "fake-slack-file-bytes"
+
 // serveSlackFile answers the pre-signed upload URL and file downloads.
 func (f *fakePlatform) serveSlackFile(w http.ResponseWriter, r *http.Request) string {
 	switch r.Method {
 	case http.MethodPost:
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
-		f.slack.recordUpload(r.URL.Path, len(body))
+		// Slack's upload is a multipart form; record the file part's bytes,
+		// not the envelope, so a test can compare the uploaded content size.
+		size := 0
+		if mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err == nil && strings.HasPrefix(mediaType, "multipart/") {
+			if reader := multipart.NewReader(r.Body, params["boundary"]); reader != nil {
+				if part, partErr := reader.NextPart(); partErr == nil {
+					body, _ := io.ReadAll(io.LimitReader(part, 8<<20))
+					size = len(body)
+				}
+			}
+		} else {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+			size = len(body)
+		}
+		f.slack.recordUpload(r.URL.Path, size)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
-		return fmt.Sprintf("upload %d bytes", len(body))
+		return fmt.Sprintf("upload %d bytes", size)
 	case http.MethodGet:
-		_, _ = w.Write([]byte("fake-slack-file-bytes"))
+		_, _ = w.Write([]byte(fakeSlackFileBytes))
 		return "download"
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -244,6 +263,7 @@ func (f *fakePlatform) SlackEdits() []slackEdit              { return f.slack.ed
 func (f *fakePlatform) SlackDeletes() []slackDelete          { return f.slack.deletesSnapshot() }
 func (f *fakePlatform) SlackReactions() []slackReaction      { return f.slack.reactionsSnapshot() }
 func (f *fakePlatform) SlackTyping() []slackTyping           { return f.slack.typingSnapshot() }
+func (f *fakePlatform) SlackUploads() []slackUpload          { return f.slack.uploadsSnapshot() }
 func (f *fakePlatform) GitHubWrites() []githubWrite          { return f.github.writesSnapshot() }
 func (f *fakePlatform) LinearWrites() []linearWrite          { return f.linear.writesSnapshot() }
 func (f *fakePlatform) SlackFailText(text string, times int) { f.slack.failText(text, times) }
@@ -611,6 +631,12 @@ func (s *slackFake) deletesSnapshot() []slackDelete {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]slackDelete(nil), s.deletes...)
+}
+
+func (s *slackFake) uploadsSnapshot() []slackUpload {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]slackUpload(nil), s.uploads...)
 }
 
 func (s *slackFake) reactionsSnapshot() []slackReaction {

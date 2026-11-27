@@ -276,6 +276,7 @@ func (h *harness) startWorkers(ctx context.Context) {
 		outbound, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
 			Store: h.syncStore, Registry: h.registry, Runner: runner, Host: host,
 			Tenant: h.tenant, Keys: []boardsync.Key{key}, Owner: "e2e-outbound-" + string(key),
+			Files:        boardsync.FileLoader(host.LoadFiles),
 			PollInterval: 10 * time.Millisecond, Defer: 50 * time.Millisecond, Logger: h.logger,
 		})
 		if err != nil {

@@ -188,6 +188,8 @@ func (e *e2eEnv) run() {
 		e.scenarioAutomation()
 		e.scenarioChatSDK()
 		e.scenarioSlackMirror()
+		e.scenarioSlackOutboundFiles()
+		e.scenarioBoardTyping()
 		e.scenarioSlackChanges()
 		e.scenarioSlackAttach()
 		e.scenarioSlackFailures()
@@ -197,7 +199,7 @@ func (e *e2eEnv) run() {
 		e.scenarioAdapterTyping()
 		e.harness.Stop()
 	} else {
-		for _, group := range []string{"automation", "chatsdk", "slack-mirror", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "adapter-typing"} {
+		for _, group := range []string{"automation", "chatsdk", "slack-mirror", "slack-files", "board-typing", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "adapter-typing"} {
 			e.report.Scenario(group).Skip("场景未执行", group, "harness 服务器未启动（前置步骤失败），按 SKIP 记录而非假通过")
 		}
 	}
@@ -224,8 +226,10 @@ func (e *e2eEnv) addCoverage() {
 		"chat.postMessage 线程内投递；CameFrom 阻止回声", r.StepsIn("slack-mirror"))
 	r.AddCoverage("双向 edit / delete / reaction", r.GroupStatus("slack-changes"),
 		"Slack message_changed/deleted/reaction 入站；board edit/reaction/delete 出站 chat.update/reactions/chat.delete", r.StepsIn("slack-changes"))
-	r.AddCoverage("文件事件（入站元数据 + 安全过滤）", r.GroupStatus("slack-mirror"),
-		"files.slack.com 元数据保留；非白名单 URL 丢弃；不抓取字节（产品 open item）", r.StepsIn("slack-mirror"))
+	r.AddCoverage("文件字节（入站抓取）", r.GroupStatus("slack-mirror"),
+		"files.slack.com 下载 1 次写入 blob；附件大小/ID/实际字节可读回；非白名单 URL 保留元数据并降级 note", r.StepsIn("slack-mirror"))
+	r.AddCoverage("文件字节（出站上传）", r.GroupStatus("slack-files"),
+		"board attachment → worker FileLoader → fake Slack files.getUploadURLExternal/upload/completeUploadExternal；文本先发、实际字节一致", r.StepsIn("slack-files"))
 	r.AddCoverage("attach channel target + backfill", r.GroupStatus("slack-attach"),
 		"root 先发，再从 outbox 依序回填 live replies；已删除回复跳过", r.StepsIn("slack-attach"))
 	r.AddCoverage("thread target future-only", r.GroupStatus("slack-attach"),
@@ -238,14 +242,13 @@ func (e *e2eEnv) addCoverage() {
 		"issue_comment 入站/create/edit/delete；board comment/edit/reaction/delete 出站；marker；重复 delivery；签名 401", r.StepsIn("github"))
 	r.AddCoverage("Linear GraphQL 双向", r.GroupStatus("linear"),
 		"Comment create/update/remove 入站；commentCreate/commentUpdate/reactionCreate/commentDelete 出站；签名/时间窗 401", r.StepsIn("linear"))
-	r.AddCoverage("typing（adapter 级）", r.GroupStatus("adapter-typing"),
-		"真实 Slack adapter → fake assistant.threads.setStatus；board 无 wiring", r.StepsIn("adapter-typing"))
+	r.AddCoverage("typing（board + adapter 级）", r.GroupStatus("board-typing"),
+		"board reply → outbox worker → fake assistant.threads.setStatus；adapter 级直接调用另有一组覆盖", r.StepsIn("board-typing")+", "+r.StepsIn("adapter-typing"))
 	r.AddCoverage("watchers / schedules（automation）", r.GroupStatus("automation"),
 		"POST /watchers 后触发 board 事件 → bot post；一次性 schedule 到点写入 board；视图不回显 schedule text", r.StepsIn("automation"))
 	r.AddCoverage("Chat SDK bridge（sidecar fixture）", r.GroupStatus("chatsdk"),
 		"sidecar /deliver message/edit/reaction/delete；PushInbound 签名事件入站/编辑；HMAC/重放 nonce/时间窗；self 身份丢弃", r.StepsIn("chatsdk"))
 	r.AddCoverage("source read / join（本期范围外）", StatusSkip, "本 harness 未覆盖；非本期 Phase 0 E2E 范围，适配器单测覆盖", "skips")
-	r.AddCoverage("文件字节（入站抓取 / 出站上传，本期范围外）", StatusSkip, "本 harness 未覆盖文件字节；Host 不抓取字节、OutboundMessage.Files 无来源，属产品 open item", "skips")
 }
 
 // scenarioRealServe exercises the actual board serve binary over PostgreSQL.
@@ -509,15 +512,10 @@ func (e *e2eEnv) scenarioHarnessBoot() {
 // scenarioSkips records the explicitly missing product seams or changes.
 func (e *e2eEnv) scenarioSkips() {
 	sc := e.report.Scenario("skips")
-	sc.Skip("board 级 typing", "board 活动 → 平台 typing", "本 harness 未覆盖 board 级 typing（本期范围外）：Typing 只有 adapter 方法，server/worker 无调用缝。adapter 级 setStatus 已单独覆盖")
 	sc.Skip("source read / join", "平台 source read/join", "本 harness 未覆盖（本期 Phase 0 E2E 范围外）：server 未挂载 sources/join 路由；适配器 source 单测覆盖")
-	sc.Skip("文件字节（入站抓取）", "平台文件下载落盘", "本 harness 未覆盖（产品 open item）：SyncHost.Import 只保留附件元数据，不抓取字节")
-	sc.Skip("文件字节（出站上传）", "board attachment → 平台文件上传", "本 harness 未覆盖（产品 open item）：OutboundMessage.Files 在 sync/call 中没有填充路径")
 	sc.Skip("真实 cmd/board 承载镜像链路", "cmd/board 进程 + fake 平台双向镜像", "本 harness 用 harness-hosted server 跑镜像：cmd/board 没有平台 endpoint/transport 注入缝且约束不改产品代码；real-serve 组只验证真实二进制的 API/sync boot/重启")
 
-	e.report.AddSkip("typing（board 级）", "本 harness 未覆盖/本期范围外；adapter 级已覆盖", "task 4.7")
 	e.report.AddSkip("source read / join", "本 harness 未覆盖/本期范围外", "task 4.6/4.7")
-	e.report.AddSkip("文件字节（双向）", "本 harness 未覆盖；Host 不抓取入站字节，OutboundMessage.Files 无来源", "SYNC.md open items")
 	e.report.AddSkip("真实 cmd/board 承载镜像链路", "cmd/board 无平台 endpoint 注入；mirror 场景使用 harness-hosted server，装配差异见 README", "设计约束：不修改产品代码")
 }
 

@@ -66,7 +66,7 @@ fake 平台使用自签 CA/证书，只被 harness 注入的 client 信任；ada
 | Slack webhook → inbox → board | 签名验证、root/reply、dedupe、bot 回声抑制、未签名 401 |
 | board → outbound → fake Slack | `chat.postMessage` 线程内投递、CameFrom 跳过来源 |
 | 双向 edit / delete / reaction | Slack 入站三类事件；board 出站 `chat.update`/`reactions.*`/`chat.delete` |
-| 文件 | 入站元数据 + 安全过滤（非白名单 URL 在 adapter 层被剥离）；不抓取字节 |
+| 文件 | 入站：白名单 URL 下载 1 次写入 blob，附件实际字节可读回；非白名单 URL 保留元数据 + note。出站：board attachment → worker FileLoader → fake Slack files.* 上传，文本先发 |
 | attach channel target + backfill | root 先发、live replies 依序回填、已删除回复跳过 |
 | thread target future-only | attach 不回发旧消息；之后消息只发一次；入站回到同一线程 |
 | 失败/重试/dead letter | 出站 500 瞬态重试、永久失败 dead + `undelivered` + 手动 retry；入站 copy 未就绪重试；入站 dead + retry 端点 |
@@ -75,11 +75,10 @@ fake 平台使用自签 CA/证书，只被 harness 注入的 client 信任；ada
 | Linear | Comment create/update/remove 入站；commentCreate/commentUpdate/reactionCreate/commentDelete 出站；签名/时间窗 401 |
 | automation watcher/schedule | 创建 watcher、匹配标签事件→bot post、delivery done；一次性 schedule 到点写入、status done/sent=1、视图不回显 text |
 | Chat SDK bridge | sidecar `/deliver` message/edit/reaction/delete；`PushInbound` root/edit；HMAC 坏签名/重放 nonce/过期 timestamp；self author 丢弃 |
-| typing | adapter 级 `assistant.threads.setStatus`；board 级未接线（本期范围外） |
+| typing | board 级：board reply → outbox worker → `assistant.threads.setStatus`；adapter 级直接调用另测 |
 
 显式 SKIP 都是“本 harness 未覆盖/本期范围外”，不是“产品不存在”：
-board 级 typing（只有 adapter 方法）、source read/join（本期范围外）、文件字节入站
-抓取/出站上传（产品 open item），以及“真实 cmd/board 承载镜像链路”（无平台
+source read/join（本期范围外），以及“真实 cmd/board 承载镜像链路”（无平台
 endpoint 注入缝，改用 harness-hosted server；`real-serve` 只验证二进制 API/同步启动/
 重启）。报告「未覆盖 / 跳过项」逐条列出原因。
 
