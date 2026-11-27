@@ -1133,7 +1133,10 @@ func decodeEvent(record store.Record) (Event, error) {
 	case EventTaskReopened:
 		payload = &TaskReopenedPayload{}
 	default:
-		return Event{}, fmt.Errorf("unknown event type %q", record.Type)
+		// An event kind this build doesn't know stays in the log for the
+		// version that does; folding skips it.
+		event.Payload = append(json.RawMessage(nil), record.Payload...)
+		return event, nil
 	}
 	if err := json.Unmarshal(record.Payload, payload); err != nil {
 		return Event{}, err
