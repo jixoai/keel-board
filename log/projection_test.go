@@ -797,3 +797,24 @@ func TestRebuildDoesNotHoldTheBoardLockWhileLoading(t *testing.T) {
 		t.Fatalf("events after the rebuild: %d", got)
 	}
 }
+
+// stuckStore never finishes a Load until its context ends.
+type stuckStore struct {
+	*store.Memory
+}
+
+func (s *stuckStore) Load(ctx context.Context, _ string) ([]store.Record, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestRebuildRespectsItsContext proves a hung store can't run a rebuild past
+// the caller's (or the rebuild's own) deadline.
+func TestRebuildRespectsItsContext(t *testing.T) {
+	board := newProjectionBoard(&stuckStore{Memory: store.NewMemory()})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := board.Rebuild(ctx, "default"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a hung load should end the rebuild: %v", err)
+	}
+}
