@@ -157,6 +157,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+base+"/attachments/uploads", s.handleUploadStart)
 	s.mux.HandleFunc("POST "+base+"/attachments/uploads/{id}", s.handleUploadFinish)
 	s.mux.HandleFunc("GET "+base+"/events", s.handleEvents)
+	s.mux.HandleFunc("POST "+base+"/admin/projection/check", s.handleProjectionCheck)
+	s.mux.HandleFunc("POST "+base+"/admin/projection/rebuild", s.handleProjectionRebuild)
 	if s.sync != nil {
 		s.mux.Handle("POST /webhooks/{key}", s.sync.webhook)
 		s.mux.HandleFunc("POST "+base+"/sync/bridge/{key}/events", s.sync.bridgeEvents)
@@ -297,6 +299,11 @@ func writeError(w http.ResponseWriter, err *protocol.Error) {
 func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	if boardErr, ok := protocol.AsError(err); ok {
 		writeError(w, boardErr)
+		return
+	}
+	if errors.Is(err, log.ErrLogInconsistent) || errors.Is(err, log.ErrProjectionAhead) {
+		writeError(w, protocol.NewError(protocol.CodeUnavailable,
+			"the board's log and its projection disagree: rebuild the projection or restore the log before writing"))
 		return
 	}
 	if errors.Is(err, log.ErrHeadMoved) {
