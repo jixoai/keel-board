@@ -62,9 +62,15 @@ Implemented, end to end:
 Grant and access HTTP routes are not in phase 1, but the policy is a Go package
 now (`access/`): grants, channel patterns, principal matching, reach,
 admission and lockout checks, a tenant-aware authorizer, and the anywhere seam
-uploads use. Sync and its receipts, schedules, a writable schema registry, and
-watchers remain outside phase 1; their wire types are not served, and requests
-that name them are refused rather than half-accepted.
+uploads use. A writable schema registry remains outside phase 1.
+
+Watchers and schedules are delivered by `automation/`: durable
+`board_watchers`, `board_watch_deliveries`, and `board_schedules` tables (with
+RLS), a board-log planner, lease/ack/backoff/dead-letter workers, and the
+`/watchers*` and `/schedules*` management API. Watcher actions are code or
+plugin implementations registered at deploy time; the runtime never accepts or
+fetches a URL. Schedules persist their plan and re-check the creator's channel
+permission at trigger time.
 
 ### Message surface semantics
 

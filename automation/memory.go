@@ -52,6 +52,10 @@ func (m *Memory) WithClock(now func() time.Time) *Memory {
 
 func (m *Memory) nowLocked() time.Time { return m.now().UTC() }
 
+// LeaseTTL returns the lease the store grants. Workers compare it with their
+// action timeout before they run.
+func (m *Memory) LeaseTTL() time.Duration { return m.cfg.LeaseTTL }
+
 func (m *Memory) tenantLocked(tenant string) *memoryTenant {
 	data := m.tenants[tenant]
 	if data == nil {
@@ -86,6 +90,7 @@ func (m *Memory) deliveryLaneLocked(tenant, watcherID string) map[uint64]*Delive
 
 // CreateWatcher implements Store.
 func (m *Memory) CreateWatcher(_ context.Context, watcher Watcher) (Watcher, error) {
+	watcher = normalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -143,6 +148,7 @@ func (m *Memory) Watchers(_ context.Context, tenant string) ([]Watcher, error) {
 
 // UpdateWatcher implements Store.
 func (m *Memory) UpdateWatcher(_ context.Context, watcher Watcher) (Watcher, error) {
+	watcher = normalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -379,6 +385,30 @@ func (m *Memory) ReleaseDelivery(_ context.Context, tenant, watcherID string, ev
 	return nil
 }
 
+// RenewDelivery implements Store.
+func (m *Memory) RenewDelivery(_ context.Context, tenant, watcherID string, eventSeq uint64, lease string, ttl time.Duration) error {
+	if err := expectTenant(tenant); err != nil {
+		return err
+	}
+	if ttl <= 0 {
+		ttl = m.cfg.LeaseTTL
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data := m.tenants[tenant]
+	if data == nil {
+		return ErrLeaseLost
+	}
+	row := data.deliveries[watcherID][eventSeq]
+	now := m.nowLocked()
+	if row == nil || row.State != StateLeased || row.Lease != lease || !row.LeaseUntil.After(now) {
+		return ErrLeaseLost
+	}
+	row.LeaseUntil = now.Add(ttl)
+	row.UpdatedAt = now
+	return nil
+}
+
 // Deliveries implements Store.
 func (m *Memory) Deliveries(_ context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
 	return m.listDeliveries(tenant, watcherID, "", limit)
@@ -516,6 +546,19 @@ func (m *Memory) CreateSchedule(_ context.Context, schedule Schedule) (Schedule,
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	data := m.tenantLocked(schedule.Tenant)
+	if schedule.CreationKey != "" {
+		for _, existing := range data.schedules {
+			if existing.CreationKey != schedule.CreationKey {
+				continue
+			}
+			if existing.CreationDigest != schedule.CreationDigest {
+				return Schedule{}, ErrExists
+			}
+			replayed := cloneSchedule(*existing)
+			replayed.Replayed = true
+			return replayed, nil
+		}
+	}
 	if _, exists := data.schedules[schedule.ID]; exists {
 		return Schedule{}, ErrExists
 	}
@@ -526,6 +569,7 @@ func (m *Memory) CreateSchedule(_ context.Context, schedule Schedule) (Schedule,
 	stored.Attempts = 0
 	stored.LastError = ""
 	stored.CancelReason = ""
+	stored.Replayed = false
 	stored.Completed = nil
 	stored.Lease = ""
 	stored.LeaseOwner = ""
@@ -589,10 +633,18 @@ func (m *Memory) UpdateSchedule(_ context.Context, schedule Schedule) (Schedule,
 		return Schedule{}, ErrNotFound
 	}
 	now := m.nowLocked()
+	if schedule.ExpectedUpdatedAt != nil && !sameInstant(current.UpdatedAt, *schedule.ExpectedUpdatedAt) {
+		return Schedule{}, ErrVersionConflict
+	}
 	if current.LeaseUntil.After(now) {
 		return Schedule{}, ErrLeased
 	}
 	updated := cloneSchedule(schedule)
+	updated.Creator = current.Creator
+	updated.CreatorKind = current.CreatorKind
+	updated.CreatorVia = current.CreatorVia
+	updated.CreationKey = current.CreationKey
+	updated.CreationDigest = current.CreationDigest
 	updated.Status = current.Status
 	updated.Sent = current.Sent
 	updated.Attempts = current.Attempts

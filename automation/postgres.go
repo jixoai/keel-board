@@ -79,6 +79,10 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 // Close closes the connection pool.
 func (p *Postgres) Close() { p.pool.Close() }
 
+// LeaseTTL returns the lease the store grants. Workers compare it with their
+// action timeout before they run.
+func (p *Postgres) LeaseTTL() time.Duration { return p.cfg.LeaseTTL }
+
 // withTenant runs fn in a transaction whose session variable names the tenant.
 // Every automation table has FORCE ROW LEVEL SECURITY with a policy over that
 // variable, so a statement without this setting sees and writes no rows.
@@ -111,6 +115,32 @@ type scanner interface {
 
 const watcherColumns = `tenant_id, watcher_id, channel, filter, action, bot_id, enabled, cursor_seq, cursor_set, created_at, updated_at`
 
+// actionRecord is the stored form of an ActionSpec. ActionSpec's Params is
+// json:"-" so a watcher can never accidentally serialise deployment
+// parameters; this record is the one place they are persisted.
+type actionRecord struct {
+	Name   string          `json:"name"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func marshalAction(action ActionSpec) ([]byte, error) {
+	raw, err := json.Marshal(actionRecord{Name: action.Name, Params: action.Params})
+	if err != nil {
+		return nil, protocol.Invalid("action: it isn't JSON")
+	}
+	return raw, nil
+}
+
+func unmarshalAction(raw []byte) (ActionSpec, error) {
+	var record actionRecord
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return ActionSpec{}, fmt.Errorf("automation: decoding an action: %w", err)
+		}
+	}
+	return ActionSpec{Name: record.Name, Params: record.Params}, nil
+}
+
 func scanWatcher(row scanner) (Watcher, error) {
 	var (
 		watcher        Watcher
@@ -128,16 +158,17 @@ func scanWatcher(row scanner) (Watcher, error) {
 			return Watcher{}, fmt.Errorf("automation: decoding watcher %s filter: %w", watcher.ID, err)
 		}
 	}
-	if len(action) > 0 {
-		if err := json.Unmarshal(action, &watcher.Action); err != nil {
-			return Watcher{}, fmt.Errorf("automation: decoding watcher %s action: %w", watcher.ID, err)
-		}
+	decodedAction, err := unmarshalAction(action)
+	if err != nil {
+		return Watcher{}, fmt.Errorf("automation: decoding watcher %s: %w", watcher.ID, err)
 	}
+	watcher.Action = decodedAction
 	return watcher, nil
 }
 
 // CreateWatcher implements Store.
 func (p *Postgres) CreateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
+	watcher = normalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -145,9 +176,9 @@ func (p *Postgres) CreateWatcher(ctx context.Context, watcher Watcher) (Watcher,
 	if err != nil {
 		return Watcher{}, protocol.Invalid("filter: it isn't JSON")
 	}
-	action, err := json.Marshal(watcher.Action)
+	action, err := marshalAction(watcher.Action)
 	if err != nil {
-		return Watcher{}, protocol.Invalid("action: it isn't JSON")
+		return Watcher{}, err
 	}
 	var stored Watcher
 	err = p.withTenant(ctx, watcher.Tenant, func(tx pgx.Tx) error {
@@ -217,6 +248,7 @@ func (p *Postgres) Watchers(ctx context.Context, tenant string) ([]Watcher, erro
 
 // UpdateWatcher implements Store.
 func (p *Postgres) UpdateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
+	watcher = normalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -224,9 +256,9 @@ func (p *Postgres) UpdateWatcher(ctx context.Context, watcher Watcher) (Watcher,
 	if err != nil {
 		return Watcher{}, protocol.Invalid("filter: it isn't JSON")
 	}
-	action, err := json.Marshal(watcher.Action)
+	action, err := marshalAction(watcher.Action)
 	if err != nil {
-		return Watcher{}, protocol.Invalid("action: it isn't JSON")
+		return Watcher{}, err
 	}
 	var stored Watcher
 	err = p.withTenant(ctx, watcher.Tenant, func(tx pgx.Tx) error {
@@ -558,6 +590,28 @@ func (p *Postgres) ReleaseDelivery(ctx context.Context, tenant, watcherID string
 	})
 }
 
+// RenewDelivery implements Store.
+func (p *Postgres) RenewDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, ttl time.Duration) error {
+	if ttl <= 0 {
+		ttl = p.cfg.LeaseTTL
+	}
+	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
+			UPDATE board_watch_deliveries
+			SET lease_until = now() + make_interval(secs => $5), updated_at = now()
+			WHERE tenant_id = $1 AND watcher_id = $2 AND event_seq = $3
+				AND state = 'leased' AND lease_token = $4 AND lease_until > now()`,
+			tenant, watcherID, int64(eventSeq), lease, ttl.Seconds())
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrLeaseLost
+		}
+		return nil
+	})
+}
+
 // Deliveries implements Store.
 func (p *Postgres) Deliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
 	return p.listDeliveries(ctx, tenant, watcherID, "", limit)
@@ -671,7 +725,9 @@ func (p *Postgres) DeliveryDepth(ctx context.Context, tenant, watcherID string) 
 }
 
 const scheduleColumns = `tenant_id, schedule_id, channel, COALESCE(re, 0), text, labels,
-	creator_actor, next_run_at, COALESCE(every_seconds, 0), until_at, COALESCE(times, 0),
+	creator_actor, creator_kind, COALESCE(creator_via, '{}'::jsonb),
+	creation_key, creation_digest,
+	next_run_at, COALESCE(every_seconds, 0), until_at, COALESCE(times, 0),
 	sent, status, attempts, last_error, cancel_reason, lease_owner, lease_token,
 	lease_until, created_at, updated_at, completed_at`
 
@@ -682,12 +738,14 @@ func scanSchedule(row scanner) (Schedule, error) {
 		everySeconds int
 		times        int
 		labels       []byte
+		creatorVia   []byte
 		untilAt      pgtype.Timestamptz
 		leaseUntil   pgtype.Timestamptz
 		completed    pgtype.Timestamptz
 	)
 	if err := row.Scan(&schedule.Tenant, &schedule.ID, &schedule.Channel, &re,
-		&schedule.Text, &labels, &schedule.Creator, &schedule.NextRunAt,
+		&schedule.Text, &labels, &schedule.Creator, &schedule.CreatorKind, &creatorVia,
+		&schedule.CreationKey, &schedule.CreationDigest, &schedule.NextRunAt,
 		&everySeconds, &untilAt, &times, &schedule.Sent, &schedule.Status,
 		&schedule.Attempts, &schedule.LastError, &schedule.CancelReason,
 		&schedule.LeaseOwner, &schedule.Lease, &leaseUntil,
@@ -697,6 +755,15 @@ func scanSchedule(row scanner) (Schedule, error) {
 	if len(labels) > 0 {
 		if err := json.Unmarshal(labels, &schedule.Labels); err != nil {
 			return Schedule{}, fmt.Errorf("automation: decoding schedule %s labels: %w", schedule.ID, err)
+		}
+	}
+	if len(creatorVia) > 0 && string(creatorVia) != "{}" {
+		var via protocol.Via
+		if err := json.Unmarshal(creatorVia, &via); err != nil {
+			return Schedule{}, fmt.Errorf("automation: decoding schedule %s creator via: %w", schedule.ID, err)
+		}
+		if via.Name != "" {
+			schedule.CreatorVia = &via
 		}
 	}
 	if re != 0 {
@@ -766,18 +833,50 @@ func (p *Postgres) CreateSchedule(ctx context.Context, schedule Schedule) (Sched
 		value := schedule.Times
 		times = &value
 	}
+	via, err := json.Marshal(schedule.CreatorVia)
+	if err != nil {
+		return Schedule{}, protocol.Invalid("creatorVia: it isn't JSON")
+	}
+	if schedule.CreatorVia == nil {
+		via = nil
+	}
 	var stored Schedule
 	err = p.withTenant(ctx, schedule.Tenant, func(tx pgx.Tx) error {
 		var err error
 		stored, err = scanSchedule(tx.QueryRow(ctx, `
 			INSERT INTO board_schedules
 				(tenant_id, schedule_id, channel, re, text, labels, creator_actor,
+				 creator_kind, creator_via, creation_key, creation_digest,
 				 next_run_at, every_seconds, until_at, times, status)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending')
+			ON CONFLICT DO NOTHING
 			RETURNING `+scheduleColumns,
 			schedule.Tenant, schedule.ID, schedule.Channel, re, schedule.Text, labels,
-			schedule.Creator, schedule.NextRunAt, every, schedule.UntilAt, times))
-		return err
+			schedule.Creator, schedule.CreatorKind, via, schedule.CreationKey,
+			schedule.CreationDigest, schedule.NextRunAt, every, schedule.UntilAt, times))
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		// A unique conflict: a creation-key retry answers the first plan,
+		// while another digest or a duplicate schedule ID is a conflict.
+		if schedule.CreationKey == "" {
+			return ErrExists
+		}
+		existing, lookupErr := scanSchedule(tx.QueryRow(ctx, `
+			SELECT `+scheduleColumns+` FROM board_schedules
+			WHERE tenant_id = $1 AND creation_key = $2`, schedule.Tenant, schedule.CreationKey))
+		if lookupErr != nil {
+			return ErrExists
+		}
+		if existing.CreationDigest != schedule.CreationDigest {
+			return ErrExists
+		}
+		existing.Replayed = true
+		stored = existing
+		return nil
 	})
 	if isUniqueViolation(err) {
 		return Schedule{}, ErrExists
@@ -847,10 +946,18 @@ func (p *Postgres) UpdateSchedule(ctx context.Context, schedule Schedule) (Sched
 		if err != nil {
 			return err
 		}
+		if schedule.ExpectedUpdatedAt != nil && !sameInstant(current.UpdatedAt, *schedule.ExpectedUpdatedAt) {
+			return ErrVersionConflict
+		}
 		if current.LeaseUntil.After(time.Now().UTC()) {
 			return ErrLeased
 		}
 		updated := cloneSchedule(schedule)
+		updated.Creator = current.Creator
+		updated.CreatorKind = current.CreatorKind
+		updated.CreatorVia = current.CreatorVia
+		updated.CreationKey = current.CreationKey
+		updated.CreationDigest = current.CreationDigest
 		updated.Status = current.Status
 		updated.Sent = current.Sent
 		updated.Attempts = current.Attempts

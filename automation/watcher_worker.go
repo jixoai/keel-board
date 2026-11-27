@@ -3,7 +3,9 @@ package automation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/jixoai/keel-board/log"
@@ -48,9 +50,14 @@ type WatcherWorkerConfig struct {
 	Defer time.Duration
 	// ActionTimeout bounds one action run. A timed-out action is a retryable
 	// failure; an action that ignores its context can still block this worker,
-	// so plugins must honor it. Zero means two minutes.
+	// so plugins must honor it. Zero means two minutes. It must be shorter
+	// than the store's lease, or two workers could run one delivery; startup
+	// refuses that.
 	ActionTimeout time.Duration
-	Logger        *slog.Logger
+	// BotAllowlist limits the bot actors a watcher may act as. Empty allows
+	// every bot (development); a deployment should list its registered bots.
+	BotAllowlist []string
+	Logger       *slog.Logger
 }
 
 // WatcherWorker matches board events to watchers and runs their actions.
@@ -66,6 +73,8 @@ type WatcherWorker struct {
 	poll          time.Duration
 	deferFor      time.Duration
 	actionTimeout time.Duration
+	leaseTTL      time.Duration
+	botAllowlist  []string
 	logger        *slog.Logger
 }
 
@@ -92,6 +101,13 @@ func NewWatcherWorker(cfg WatcherWorkerConfig) (*WatcherWorker, error) {
 	if cfg.ActionTimeout <= 0 {
 		cfg.ActionTimeout = 2 * time.Minute
 	}
+	leaseTTL := cfg.Store.LeaseTTL()
+	if leaseTTL <= 0 {
+		leaseTTL = DefaultLeaseTTL
+	}
+	if cfg.ActionTimeout >= leaseTTL {
+		return nil, fmt.Errorf("automation: action timeout %s must be shorter than the lease %s", cfg.ActionTimeout, leaseTTL)
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
@@ -99,7 +115,8 @@ func NewWatcherWorker(cfg WatcherWorkerConfig) (*WatcherWorker, error) {
 		store: cfg.Store, board: cfg.Board, actions: cfg.Actions,
 		authorize: cfg.Authorize, tenant: cfg.Tenant, owner: leaseOwner(cfg.Owner),
 		limit: cfg.Limit, planLimit: cfg.PlanLimit, poll: cfg.PollInterval,
-		deferFor: cfg.Defer, actionTimeout: cfg.ActionTimeout, logger: cfg.Logger,
+		deferFor: cfg.Defer, actionTimeout: cfg.ActionTimeout, leaseTTL: leaseTTL,
+		botAllowlist: append([]string(nil), cfg.BotAllowlist...), logger: cfg.Logger,
 	}, nil
 }
 
@@ -215,12 +232,15 @@ func (w *WatcherWorker) candidates(ctx context.Context, events []log.Event) ([]c
 	err := w.board.ReadContext(ctx, w.tenant, func(snapshot *log.Snapshot) error {
 		for _, event := range events {
 			item := candidate{Seq: event.Seq, Type: string(event.Type)}
-			author := eventAuthor(event)
+			author, boardGenerated := eventAuthor(event)
 			if id := log.ConcernedMessageID(event); id != 0 {
 				if message := snapshot.Message(id); message != nil {
 					item.Channel = message.Channel
-					item.Labels = message.Labels
-					if author == "" {
+					item.Labels = eventLabels(event, message)
+					// A board-generated fact (task.ready, task.expired) has no
+					// writer; falling back to the message's author would
+					// suppress a bot's own task forever.
+					if author == "" && !boardGenerated {
 						author = message.By.Actor
 					}
 				}
@@ -241,51 +261,80 @@ func (w *WatcherWorker) candidates(ctx context.Context, events []log.Event) ([]c
 	return out, nil
 }
 
-// eventAuthor is the actor who wrote an event. A message's stored author is
-// the fallback for board-generated facts such as receipts; an edit, label, or
-// reaction names its own writer so a bot's own changes never wake its watcher.
-func eventAuthor(event log.Event) string {
+// eventLabels is a message's labels as the event left them. A post carries
+// its labels; a label change applies its set/unset to the snapshot. Other
+// events don't change labels, so the snapshot is their state.
+func eventLabels(event log.Event, message *log.Message) map[string]string {
 	switch payload := event.Payload.(type) {
 	case *log.MessagePostedPayload:
-		return payload.By.Actor
-	case *log.ChannelCreatedPayload:
-		return payload.By.Actor
-	case *log.MessageEditedPayload:
-		return payload.By.Actor
-	case *log.MessageDeletedPayload:
-		return payload.By.Actor
-	case *log.ReactionPayload:
-		return payload.By.Actor
+		return cloneLabels(payload.Labels)
 	case *log.LabelsChangedPayload:
-		return payload.By.Actor
-	case *log.TaskCreatedPayload:
-		return payload.By.Actor
-	case *log.TaskAssignedPayload:
-		return payload.By.Actor
-	case *log.TaskNeedsChangedPayload:
-		return payload.By.Actor
-	case *log.TaskClaimedPayload:
-		return payload.By.Actor
-	case *log.TaskRenewedPayload:
-		return payload.By.Actor
-	case *log.TaskReleasedPayload:
-		return payload.By.Actor
-	case *log.TaskCompletedPayload:
-		return payload.By.Actor
-	case *log.TaskFailedPayload:
-		return payload.By.Actor
-	case *log.TaskBlockedPayload:
-		return payload.By.Actor
-	case *log.TaskUnblockedPayload:
-		return payload.By.Actor
-	case *log.TaskCanceledPayload:
-		return payload.By.Actor
-	case *log.TaskReopenedPayload:
-		return payload.By.Actor
-	case *log.ThreadSyncedPayload:
-		return payload.By.Actor
+		labels := cloneLabels(message.Labels)
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		for _, key := range payload.Unset {
+			delete(labels, key)
+		}
+		for key, value := range payload.Set {
+			labels[key] = value
+		}
+		return labels
 	default:
-		return ""
+		return cloneLabels(message.Labels)
+	}
+}
+
+// eventAuthor is the actor who wrote an event. The bool says the event is a
+// board-generated fact with no writer at all (task.ready, task.expired): those
+// must not inherit the message's author, or a watcher owned by that author
+// would suppress its own task. A message's stored author is the fallback for
+// other authorless facts such as receipts; an edit, label, or reaction names
+// its own writer so a bot's own changes never wake its watcher.
+func eventAuthor(event log.Event) (author string, boardGenerated bool) {
+	switch payload := event.Payload.(type) {
+	case *log.MessagePostedPayload:
+		return payload.By.Actor, false
+	case *log.ChannelCreatedPayload:
+		return payload.By.Actor, false
+	case *log.MessageEditedPayload:
+		return payload.By.Actor, false
+	case *log.MessageDeletedPayload:
+		return payload.By.Actor, false
+	case *log.ReactionPayload:
+		return payload.By.Actor, false
+	case *log.LabelsChangedPayload:
+		return payload.By.Actor, false
+	case *log.TaskCreatedPayload:
+		return payload.By.Actor, false
+	case *log.TaskAssignedPayload:
+		return payload.By.Actor, false
+	case *log.TaskNeedsChangedPayload:
+		return payload.By.Actor, false
+	case *log.TaskClaimedPayload:
+		return payload.By.Actor, false
+	case *log.TaskRenewedPayload:
+		return payload.By.Actor, false
+	case *log.TaskReleasedPayload:
+		return payload.By.Actor, false
+	case *log.TaskCompletedPayload:
+		return payload.By.Actor, false
+	case *log.TaskFailedPayload:
+		return payload.By.Actor, false
+	case *log.TaskBlockedPayload:
+		return payload.By.Actor, false
+	case *log.TaskUnblockedPayload:
+		return payload.By.Actor, false
+	case *log.TaskCanceledPayload:
+		return payload.By.Actor, false
+	case *log.TaskReopenedPayload:
+		return payload.By.Actor, false
+	case *log.ThreadSyncedPayload:
+		return payload.By.Actor, false
+	case *log.TaskReadyPayload, *log.TaskExpiredPayload:
+		return "", true
+	default:
+		return "", false
 	}
 }
 
@@ -326,9 +375,31 @@ func (w *WatcherWorker) execute(ctx context.Context) (WorkResult, error) {
 			}
 			continue
 		}
+		// Recheck the lease immediately before the action: a worker whose
+		// lease expired while queued must not run it.
+		if err := w.store.RenewDelivery(ctx, w.tenant, job.WatcherID, job.EventSeq, job.Lease, w.leaseTTL); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				result.Lost++
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		actionCtx, cancel := context.WithTimeout(ctx, w.actionTimeout)
+		stopHeartbeat, leaseLost := w.startHeartbeat(ctx, job)
 		jobErr := w.run(actionCtx, watcher, job)
 		cancel()
+		stopHeartbeat()
+		if leaseLost.Load() {
+			// Another worker took the delivery after this lease was lost.
+			// Don't ack a row this worker no longer owns.
+			result.Lost++
+			w.logger.Warn("watcher lease was lost during the action",
+				"tenant", w.tenant, "watcher", watcher.ID, "event", job.EventSeq)
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			// The action may not have finished; leave the lease to expire
 			// rather than recording a failure it didn't have.
@@ -362,6 +433,47 @@ func (w *WatcherWorker) execute(ctx context.Context) (WorkResult, error) {
 	return result, firstErr
 }
 
+// startHeartbeat renews a delivery's lease while its action runs. A lease
+// that another worker took stops the heartbeat and marks leaseLost; the worker
+// then skips the ack. The goroutine stops when stop is called or ctx ends.
+func (w *WatcherWorker) startHeartbeat(ctx context.Context, job Delivery) (stop func(), leaseLost *atomic.Bool) {
+	lost := &atomic.Bool{}
+	interval := w.leaseTTL / 3
+	if interval < 50*time.Millisecond {
+		interval = 50 * time.Millisecond
+	}
+	stopped := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopped:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := w.store.RenewDelivery(context.WithoutCancel(ctx), w.tenant, job.WatcherID, job.EventSeq, job.Lease, w.leaseTTL)
+				if errors.Is(err, ErrLeaseLost) {
+					lost.Store(true)
+					return
+				}
+				if err != nil {
+					w.logger.Warn("watcher lease renewal failed",
+						"tenant", w.tenant, "watcher", job.WatcherID, "event", job.EventSeq,
+						"error", ErrorCode(err))
+				}
+			}
+		}
+	}()
+	return func() {
+		close(stopped)
+		<-done
+	}, lost
+}
+
 // run executes one delivery's action. It never writes a delivery error's text
 // to a row; the store records ErrorCode instead.
 func (w *WatcherWorker) run(ctx context.Context, watcher Watcher, job Delivery) (err error) {
@@ -390,14 +502,24 @@ func (w *WatcherWorker) run(ctx context.Context, watcher Watcher, job Delivery) 
 		if err != nil {
 			return err
 		}
+		if message != nil {
+			// Detach from the folded state: the board may fold a later event
+			// while the action runs, and an action must never observe or
+			// mutate that shared message.
+			cloned := deepCopy(*message)
+			message = &cloned
+		}
+	}
+	if !BotAllowed(BotActor(watcher).ID, w.botAllowlist) {
+		return Permanent(errors.New("automation: the watcher bot is not allowlisted"))
 	}
 	action, ok := w.actions.Get(watcher.Action.Name)
 	if !ok {
 		return Permanent(errors.New("automation: the watcher action is not registered on this process"))
 	}
 	call := &ActionCall{
-		Tenant: w.tenant, Watcher: watcher, Event: event, Message: message,
-		Bot: BotActor(watcher), Board: w.board, Authorize: w.authorize,
+		tenant: w.tenant, watcher: watcher, event: event, message: message,
+		bot: BotActor(watcher), board: w.board, authorize: w.authorize,
 	}
 	return action.Run(ctx, call)
 }

@@ -136,7 +136,7 @@ func (w *ScheduleWorker) Process(ctx context.Context) (ScheduleWorkResult, error
 // send re-checks the creator's permission and posts the scheduled message.
 func (w *ScheduleWorker) send(ctx context.Context, schedule Schedule) ScheduleResult {
 	now := time.Now().UTC()
-	creator := ActorFromID(schedule.Creator)
+	creator := ScheduleActor(schedule)
 	channel := schedule.Channel
 	var (
 		rootID  *uint64
@@ -171,6 +171,9 @@ func (w *ScheduleWorker) send(ctx context.Context, schedule Schedule) ScheduleRe
 	}
 	if w.authorize != nil {
 		if err := w.authorize.Authorize(ctx, w.tenant, creator, channel, protocol.PermissionPost); err != nil {
+			if !IsAccessDenied(err) {
+				return ScheduleResult{Outcome: ScheduleRetry, At: now, Err: err}
+			}
 			w.logger.Warn("schedule creator lost channel access",
 				"tenant", w.tenant, "schedule", schedule.ID,
 				"creator", schedule.Creator, "channel", channel)
@@ -178,6 +181,9 @@ func (w *ScheduleWorker) send(ctx context.Context, schedule Schedule) ScheduleRe
 		}
 		if len(schedule.Labels) > 0 {
 			if err := w.authorize.Authorize(ctx, w.tenant, creator, channel, protocol.PermissionLabel); err != nil {
+				if !IsAccessDenied(err) {
+					return ScheduleResult{Outcome: ScheduleRetry, At: now, Err: err}
+				}
 				w.logger.Warn("schedule creator lost label access",
 					"tenant", w.tenant, "schedule", schedule.ID,
 					"creator", schedule.Creator, "channel", channel)
@@ -187,7 +193,14 @@ func (w *ScheduleWorker) send(ctx context.Context, schedule Schedule) ScheduleRe
 	}
 	readable := true
 	if w.authorize != nil {
-		readable = w.authorize.Authorize(ctx, w.tenant, creator, channel, protocol.PermissionRead) == nil
+		switch err := w.authorize.Authorize(ctx, w.tenant, creator, channel, protocol.PermissionRead); {
+		case err == nil:
+			readable = true
+		case IsAccessDenied(err):
+			readable = false
+		default:
+			return ScheduleResult{Outcome: ScheduleRetry, At: now, Err: err}
+		}
 	}
 	labels := schedule.Labels
 	if labels == nil {
@@ -211,7 +224,7 @@ func (w *ScheduleWorker) send(ctx context.Context, schedule Schedule) ScheduleRe
 		if tx.Actor(creator.ID) == nil {
 			tx.Emit(log.EventActorSeen, &log.ActorSeenPayload{
 				Actor: creator.ID, Kind: string(creator.Kind), Handle: creator.Handle,
-				Name: creator.Name, Platform: "local",
+				Name: creator.Name, Via: logVia(creator.Via), Platform: "local",
 			})
 			offset++
 		}

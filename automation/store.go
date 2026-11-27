@@ -29,12 +29,14 @@ var (
 	ErrScheduleNotPending = errors.New("automation: the schedule is finished or canceled")
 	// ErrLeased means a row is being worked on and can't be updated now.
 	ErrLeased = errors.New("automation: the row is leased")
+	// ErrVersionConflict means an update's expected version isn't current.
+	ErrVersionConflict = errors.New("automation: the row changed")
 	// ErrPermanent marks a failure that must not be retried.
 	ErrPermanent = errors.New("automation: permanent failure")
 )
 
 // Config bounds retries and leases. Zero fields take the defaults: five
-// attempts, one second doubling to thirty with jitter, and a one-minute lease.
+// attempts, one second doubling to thirty with jitter, and a five-minute lease.
 type Config struct {
 	Retry    RetryPolicy
 	LeaseTTL time.Duration
@@ -48,6 +50,11 @@ type RetryPolicy struct {
 	MaxDelay    time.Duration `json:"maxDelay"`
 	Jitter      float64       `json:"jitter"`
 }
+
+// DefaultLeaseTTL is the lease a worker holds on one delivery or schedule. It
+// is comfortably longer than the default watcher action timeout, so a healthy
+// action cannot outlive its lease.
+const DefaultLeaseTTL = 5 * time.Minute
 
 // DefaultRetry is the policy automation uses when none is configured.
 var DefaultRetry = RetryPolicy{
@@ -105,7 +112,7 @@ func (c Config) withDefaults() (Config, error) {
 		return Config{}, err
 	}
 	if c.LeaseTTL <= 0 {
-		c.LeaseTTL = time.Minute
+		c.LeaseTTL = DefaultLeaseTTL
 	}
 	return c, nil
 }
@@ -116,6 +123,10 @@ func (c Config) withDefaults() (Config, error) {
 // Every method is tenant-scoped and safe for concurrent use. A missing tenant
 // is refused rather than treated as a shared namespace.
 type Store interface {
+	// LeaseTTL is the lease this store grants. A watcher worker refuses an
+	// action timeout that isn't shorter, so two workers can't run one row.
+	LeaseTTL() time.Duration
+
 	// Watchers. CreateWatcher stores a declaration; a duplicate ID is
 	// ErrExists. UpdateWatcher replaces the declarative fields and preserves
 	// the enabled flag and cursor.
@@ -142,6 +153,10 @@ type Store interface {
 	// ReleaseDelivery clears a lease without counting an attempt, so a worker
 	// that isn't ready doesn't burn the delivery's retry budget.
 	ReleaseDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, delay time.Duration) error
+	// RenewDelivery extends a live lease. It is the worker's execution-time
+	// recheck and heartbeat: a row another worker has taken answers
+	// ErrLeaseLost, so no action starts on a stale lease.
+	RenewDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, ttl time.Duration) error
 	Deliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error)
 	DeadDeliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error)
 	RetryDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64) error

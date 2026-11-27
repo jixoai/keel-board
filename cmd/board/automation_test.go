@@ -25,7 +25,7 @@ func TestAutomationWorkersSmoke(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	board := log.New(log.Options{Store: store.NewMemory()})
 	runtime, err := buildAutomation(context.Background(), &automationFlags{
-		tenant: "default", poll: 10 * time.Millisecond, lease: time.Minute,
+		tenant: "default", poll: 10 * time.Millisecond, lease: 5 * time.Minute,
 	}, "")
 	if err != nil {
 		t.Fatalf("build automation: %v", err)
@@ -42,6 +42,8 @@ func TestAutomationWorkersSmoke(t *testing.T) {
 	}
 	defer func() {
 		cancel()
+		stop()
+		// A second stop is a no-op, not a second store close or a hang.
 		stop()
 	}()
 

@@ -339,3 +339,154 @@ func TestScheduleReplyTargetAPI(t *testing.T) {
 func jsonUnmarshal(data []byte, into any) error {
 	return json.Unmarshal(data, into)
 }
+
+type automationScheduleCreateBody struct {
+	Schedule struct {
+		ID        string `json:"id"`
+		UpdatedAt string `json:"updatedAt"`
+	} `json:"schedule"`
+	Replayed bool `json:"replayed"`
+}
+
+func TestScheduleIdempotentCreateAndVersion(t *testing.T) {
+	h, store := newAutomationHarness(t)
+	const alice = "local:user:alice"
+	body := map[string]any{
+		"channel": "work", "text": "secret-body", "idempotencyKey": "create-1",
+	}
+	status, data := h.request(http.MethodPost, "/schedules", body, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	first := decode[automationScheduleCreateBody](t, data)
+	status, data = h.request(http.MethodPost, "/schedules", body, alice, "", nil)
+	h.expect(status, data, http.StatusOK)
+	replayed := decode[automationScheduleCreateBody](t, data)
+	if !replayed.Replayed || replayed.Schedule.ID != first.Schedule.ID {
+		t.Fatalf("idempotent create = %+v, want the first schedule", replayed)
+	}
+	if list, err := store.Schedules(t.Context(), "default"); err != nil || len(list) != 1 {
+		t.Fatalf("schedules = %+v, %v; want one", list, err)
+	}
+	body["text"] = "different-body"
+	status, data = h.request(http.MethodPost, "/schedules", body, alice, "", nil)
+	if status != http.StatusConflict {
+		t.Fatalf("same key different digest = %d: %s", status, data)
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	status, data = h.request(http.MethodPost, "/schedules/"+first.Schedule.ID, map[string]any{
+		"text": "changed", "ifUpdatedAt": first.Schedule.UpdatedAt,
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusOK)
+	updated := decode[automationScheduleBody](t, data)
+	status, data = h.request(http.MethodPost, "/schedules/"+first.Schedule.ID, map[string]any{
+		"text": "stale", "ifUpdatedAt": first.Schedule.UpdatedAt,
+	}, alice, "", nil)
+	if status != http.StatusConflict {
+		t.Fatalf("stale update = %d: %s", status, data)
+	}
+	if code := errorCode(t, data); code != protocol.CodeConflict {
+		t.Fatalf("stale update code = %s, want conflict", code)
+	}
+	_ = updated
+}
+
+func TestScheduleUpdateWhileLeasedIs409(t *testing.T) {
+	h, store := newAutomationHarness(t)
+	const alice = "local:user:alice"
+	id, _ := automation.NewScheduleID()
+	if _, err := store.CreateSchedule(t.Context(), automation.Schedule{
+		Tenant: "default", ID: id, Channel: "work", Text: "due",
+		Creator: alice, CreatorKind: string(protocol.ActorPerson),
+		NextRunAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	leases, err := store.LeaseSchedules(t.Context(), "default", 10, "test")
+	if err != nil || len(leases) != 1 {
+		t.Fatalf("lease = %+v, %v", leases, err)
+	}
+	status, data := h.request(http.MethodPost, "/schedules/"+id, map[string]any{"text": "new"}, alice, "", nil)
+	if status != http.StatusConflict {
+		t.Fatalf("leased update = %d: %s", status, data)
+	}
+	if code := errorCode(t, data); code != protocol.CodeConflict {
+		t.Fatalf("leased update code = %s, want conflict", code)
+	}
+}
+
+func TestWatcherBotAllowlistAPI(t *testing.T) {
+	memory, err := automation.NewMemory(automation.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := automation.NewRegistryWith(automation.PostAction{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, server.Options{Automation: &server.AutomationOptions{
+		Store: memory, Actions: registry, Bots: []string{"local:bot:allowed"},
+	}})
+	const alice = "local:user:alice"
+	status, data := h.request(http.MethodPost, "/watchers", map[string]any{
+		"id": "blocked", "channel": "work", "bot": "local:bot:blocked",
+		"action": map[string]any{"name": "post", "params": map[string]string{"text": "x"}},
+	}, alice, "", nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("blocked bot = %d: %s", status, data)
+	}
+	status, data = h.request(http.MethodPost, "/watchers", map[string]any{
+		"id": "allowed", "channel": "work", "bot": "local:bot:allowed",
+		"action": map[string]any{"name": "post", "params": map[string]string{"text": "x"}},
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+}
+
+func TestAutomationCrossTenantWritesAre404(t *testing.T) {
+	h, _ := newAutomationHarness(t)
+	const alice = "local:user:alice"
+	status, data := h.request(http.MethodPost, "/watchers", map[string]any{
+		"id": "alerts", "channel": "work",
+		"action": map[string]any{"name": "post", "params": map[string]string{"text": "x"}},
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	for _, request := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/watchers/alerts", map[string]any{"channel": "other"}},
+		{http.MethodDelete, "/watchers/alerts", nil},
+		{http.MethodPost, "/watchers/alerts/enable", nil},
+		{http.MethodPost, "/watchers/alerts/disable", nil},
+		{http.MethodPost, "/watchers/alerts/deliveries/1/retry", nil},
+		{http.MethodPost, "/watchers/alerts/deliveries/clear", nil},
+	} {
+		status, data := h.request(request.method, request.path, request.body, alice, "other", nil)
+		if status != http.StatusNotFound {
+			t.Fatalf("%s %s cross-tenant = %d: %s", request.method, request.path, status, data)
+		}
+	}
+
+	status, data = h.request(http.MethodPost, "/schedules", map[string]any{
+		"channel": "work", "text": "later", "nextRunAt": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}, alice, "", nil)
+	h.expect(status, data, http.StatusCreated)
+	scheduleID := decode[automationScheduleBody](t, data).Schedule.ID
+	for _, request := range []struct {
+		method string
+		path   string
+		body   any
+	}{
+		{http.MethodPost, "/schedules/" + scheduleID, map[string]any{"text": "other"}},
+		{http.MethodDelete, "/schedules/" + scheduleID, nil},
+		{http.MethodPost, "/schedules/" + scheduleID + "/enable", nil},
+		{http.MethodPost, "/schedules/" + scheduleID + "/disable", nil},
+		{http.MethodPost, "/schedules/" + scheduleID + "/retry", nil},
+		{http.MethodPost, "/schedules/" + scheduleID + "/clear", nil},
+	} {
+		status, data := h.request(request.method, request.path, request.body, alice, "other", nil)
+		if status != http.StatusNotFound {
+			t.Fatalf("%s %s cross-tenant = %d: %s", request.method, request.path, status, data)
+		}
+	}
+}

@@ -1,6 +1,9 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,13 +22,17 @@ import (
 type AutomationOptions struct {
 	Store   automation.Store
 	Actions *automation.Registry
-	Logger  *slog.Logger
+	// Bots is the deployment's allowlist of bot actors a watcher may act as.
+	// Empty allows any syntactically valid actor (development).
+	Bots   []string
+	Logger *slog.Logger
 }
 
 // automationService is one server's automation management wiring.
 type automationService struct {
 	store   automation.Store
 	actions *automation.Registry
+	bots    []string
 	logger  *slog.Logger
 }
 
@@ -36,7 +43,10 @@ func newAutomationService(opts AutomationOptions) (*automationService, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &automationService{store: opts.Store, actions: opts.Actions, logger: opts.Logger}, nil
+	return &automationService{
+		store: opts.Store, actions: opts.Actions,
+		bots: append([]string(nil), opts.Bots...), logger: opts.Logger,
+	}, nil
 }
 
 // permitAutomationManage gates the management surface on manage at *.
@@ -54,6 +64,14 @@ func (req *request) permitAutomationChannel(s *Server, channel string) *protocol
 	return req.permit(s, channel, protocol.PermissionPost)
 }
 
+// validateWatcherBot checks a watcher's bot against the deployment allowlist.
+func (s *Server) validateWatcherBot(watcher automation.Watcher) *protocol.Error {
+	if !automation.BotAllowed(automation.BotActor(watcher).ID, s.automation.bots) {
+		return protocol.Invalidf("bot: %q isn't an allowlisted bot", automation.BotActor(watcher).ID)
+	}
+	return nil
+}
+
 // validateAction checks an action's shape and, when the process has a registry,
 // that the name is registered.
 func (s *Server) validateAction(action automation.ActionSpec) *protocol.Error {
@@ -68,15 +86,27 @@ func (s *Server) validateAction(action automation.ActionSpec) *protocol.Error {
 	return nil
 }
 
+// actionRequest is the wire form of a watcher action. It exists because
+// ActionSpec.Params is json:"-" so a stored watcher can never leak deployment
+// parameters; only this request type accepts params.
+type actionRequest struct {
+	Name   string          `json:"name"`
+	Params json.RawMessage `json:"params,omitempty"`
+}
+
+func (a actionRequest) spec() automation.ActionSpec {
+	return automation.ActionSpec{Name: a.Name, Params: a.Params}
+}
+
 // watcherRequest is a create or partial update. Pointers distinguish an omitted
 // field from a zero value, so an update can't silently clear the bot or the
 // filter.
 type watcherRequest struct {
-	ID      string                 `json:"id,omitempty"`
-	Channel *string                `json:"channel,omitempty"`
-	Filter  *automation.Filter     `json:"filter,omitempty"`
-	Action  *automation.ActionSpec `json:"action,omitempty"`
-	Bot     *string                `json:"bot,omitempty"`
+	ID      string             `json:"id,omitempty"`
+	Channel *string            `json:"channel,omitempty"`
+	Filter  *automation.Filter `json:"filter,omitempty"`
+	Action  *actionRequest     `json:"action,omitempty"`
+	Bot     *string            `json:"bot,omitempty"`
 }
 
 // watcherView is the management DTO. It names the action but never returns its
@@ -141,14 +171,15 @@ func deliveryViewOf(delivery automation.Delivery) deliveryView {
 // scheduleRequest is a create. Channel and Re are alternatives; exactly one is
 // required. Text is the body the schedule sends and is never returned.
 type scheduleRequest struct {
-	Channel      string            `json:"channel,omitempty"`
-	Re           string            `json:"re,omitempty"`
-	Text         string            `json:"text"`
-	Labels       map[string]string `json:"labels,omitempty"`
-	NextRunAt    string            `json:"nextRunAt,omitempty"`
-	EverySeconds *int              `json:"everySeconds,omitempty"`
-	UntilAt      string            `json:"untilAt,omitempty"`
-	Times        *int              `json:"times,omitempty"`
+	Channel        string            `json:"channel,omitempty"`
+	Re             string            `json:"re,omitempty"`
+	Text           string            `json:"text"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	NextRunAt      string            `json:"nextRunAt,omitempty"`
+	EverySeconds   *int              `json:"everySeconds,omitempty"`
+	UntilAt        string            `json:"untilAt,omitempty"`
+	Times          *int              `json:"times,omitempty"`
+	IdempotencyKey string            `json:"idempotencyKey,omitempty"`
 }
 
 // scheduleUpdate is a partial update; Channel and Re are immutable because
@@ -160,6 +191,9 @@ type scheduleUpdate struct {
 	EverySeconds *int               `json:"everySeconds,omitempty"`
 	UntilAt      *string            `json:"untilAt,omitempty"`
 	Times        *int               `json:"times,omitempty"`
+	// IfUpdatedAt is the version the caller read; a mismatch is a 409 and no
+	// write. It is the scheduleView's updatedAt.
+	IfUpdatedAt *string `json:"ifUpdatedAt,omitempty"`
 }
 
 // scheduleView is the management DTO. It omits Text on purpose: a schedule's
@@ -286,7 +320,8 @@ func (s *Server) handleCreateWatcher(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("action: a watcher names a registered action"))
 		return
 	}
-	if perr := s.validateAction(*body.Action); perr != nil {
+	action := body.Action.spec()
+	if perr := s.validateAction(action); perr != nil {
 		writeError(w, perr)
 		return
 	}
@@ -312,10 +347,15 @@ func (s *Server) handleCreateWatcher(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	watcher, err := s.automation.store.CreateWatcher(req.ctx, automation.Watcher{
+	watcher := automation.Watcher{
 		Tenant: req.tenant, ID: id, Channel: channel, Filter: filter,
-		Action: *body.Action, Bot: bot, Enabled: true, Cursor: head, CursorSet: true,
-	})
+		Action: action, Bot: bot, Enabled: true, Cursor: head, CursorSet: true,
+	}
+	if perr := s.validateWatcherBot(watcher); perr != nil {
+		writeError(w, perr)
+		return
+	}
+	watcher, err = s.automation.store.CreateWatcher(req.ctx, watcher)
 	if err != nil {
 		s.failAutomation(w, r, err)
 		return
@@ -368,14 +408,19 @@ func (s *Server) handleUpdateWatcher(w http.ResponseWriter, r *http.Request) {
 		watcher.Filter = *body.Filter
 	}
 	if body.Action != nil {
-		if perr := s.validateAction(*body.Action); perr != nil {
+		action := body.Action.spec()
+		if perr := s.validateAction(action); perr != nil {
 			writeError(w, perr)
 			return
 		}
-		watcher.Action = *body.Action
+		watcher.Action = action
 	}
 	if body.Bot != nil {
 		watcher.Bot = strings.TrimSpace(*body.Bot)
+	}
+	if perr := s.validateWatcherBot(watcher); perr != nil {
+		writeError(w, perr)
+		return
 	}
 	updated, err := s.automation.store.UpdateWatcher(req.ctx, watcher)
 	if err != nil {
@@ -670,16 +715,38 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 	if body.Times != nil {
 		times = *body.Times
 	}
+	labels := body.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	creationKey := strings.TrimSpace(body.IdempotencyKey)
+	creationDigest := ""
+	nextRunKey := ""
+	if strings.TrimSpace(body.NextRunAt) != "" {
+		nextRunKey = protocol.FormatTime(nextRunAt)
+	}
+	if creationKey != "" {
+		creationDigest = scheduleRequestDigest(channel, re, body.Text, labels, req.actor,
+			nextRunKey, everySeconds, untilAt, times)
+	}
 	schedule, err := s.automation.store.CreateSchedule(req.ctx, automation.Schedule{
 		Tenant: req.tenant, Channel: channel, Re: re, Text: body.Text,
-		Labels: body.Labels, Creator: req.actor.ID, NextRunAt: nextRunAt,
-		EverySeconds: everySeconds, UntilAt: untilAt, Times: times,
+		Labels: labels, Creator: req.actor.ID,
+		CreatorKind: string(req.actor.Kind), CreatorVia: req.actor.Via,
+		NextRunAt: nextRunAt, EverySeconds: everySeconds, UntilAt: untilAt, Times: times,
+		CreationKey: creationKey, CreationDigest: creationDigest,
 	})
 	if err != nil {
 		s.failAutomation(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"schedule": scheduleViewOf(schedule)})
+	status := http.StatusCreated
+	if schedule.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{
+		"schedule": scheduleViewOf(schedule), "replayed": schedule.Replayed,
+	})
 }
 
 // handleUpdateSchedule answers POST /schedules/{id}.
@@ -743,6 +810,14 @@ func (s *Server) handleUpdateSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Times != nil {
 		schedule.Times = *body.Times
+	}
+	if body.IfUpdatedAt != nil {
+		parsed, err := protocol.ParseTime(strings.TrimSpace(*body.IfUpdatedAt))
+		if err != nil {
+			writeError(w, protocol.Invalid("ifUpdatedAt: "+err.Error()))
+			return
+		}
+		schedule.ExpectedUpdatedAt = &parsed
 	}
 	updated, err := s.automation.store.UpdateSchedule(req.ctx, schedule)
 	if err != nil {
@@ -839,13 +914,16 @@ func (s *Server) failAutomation(w http.ResponseWriter, r *http.Request, err erro
 		writeError(w, protocol.NotFound(protocol.CodeNotFound, "no such automation row"))
 		return
 	case errors.Is(err, automation.ErrExists):
-		writeError(w, protocol.Conflict(protocol.CodeDuplicateID, "that automation ID is already used"))
+		writeError(w, protocol.Conflict(protocol.CodeDuplicateID, "that automation ID or idempotency key is already used"))
 		return
 	case errors.Is(err, automation.ErrNotDead):
 		writeError(w, protocol.NotFound(protocol.CodeNotFound, "no dead-lettered row with that id"))
 		return
 	case errors.Is(err, automation.ErrLeased):
-		writeError(w, protocol.Invalid("the automation row is running; try again"))
+		writeError(w, protocol.Conflict(protocol.CodeConflict, "the automation row is running; try again"))
+		return
+	case errors.Is(err, automation.ErrVersionConflict):
+		writeError(w, protocol.Conflict(protocol.CodeConflict, "the automation row changed; read it again"))
 		return
 	case errors.Is(err, automation.ErrScheduleNotPending):
 		writeError(w, protocol.Invalid("the schedule is finished or canceled"))
@@ -856,4 +934,31 @@ func (s *Server) failAutomation(w http.ResponseWriter, r *http.Request, err erro
 	default:
 		s.fail(w, r, err)
 	}
+}
+
+// scheduleRequestDigest is the identity of a POST /schedules request. The same
+// key and the same normalized content answers the first plan; a different
+// digest is a 409, never a second schedule.
+func scheduleRequestDigest(channel string, re *uint64, text string, labels map[string]string,
+	actor protocol.Actor, nextRunKey string, every int, until *time.Time, times int) string {
+	raw, _ := json.Marshal(struct {
+		Channel     string            `json:"channel"`
+		Re          *uint64           `json:"re,omitempty"`
+		Text        string            `json:"text"`
+		Labels      map[string]string `json:"labels"`
+		Creator     string            `json:"creator"`
+		CreatorKind string            `json:"creatorKind,omitempty"`
+		CreatorVia  *protocol.Via     `json:"creatorVia,omitempty"`
+		NextRunAt   string            `json:"nextRunAt,omitempty"`
+		Every       int               `json:"every,omitempty"`
+		Until       *string           `json:"until,omitempty"`
+		Times       int               `json:"times,omitempty"`
+	}{
+		Channel: channel, Re: re, Text: text, Labels: labels,
+		Creator: actor.ID, CreatorKind: string(actor.Kind), CreatorVia: actor.Via,
+		NextRunAt: nextRunKey, Every: every,
+		Until: protocol.FormatTimePtr(until), Times: times,
+	})
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
 }

@@ -2,6 +2,7 @@ package automation_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jixoai/keel-board/automation"
+	"github.com/jixoai/keel-board/protocol"
 )
 
 func testDSN(t *testing.T) string {
@@ -72,7 +74,7 @@ func openPostgres(t *testing.T, dsn, schema string, cfg automation.Config) *auto
 func testConfig() automation.Config {
 	return automation.Config{
 		Retry:    automation.RetryPolicy{MaxAttempts: 3, BaseDelay: 0, MaxDelay: 0, Jitter: 0},
-		LeaseTTL: time.Minute,
+		LeaseTTL: 5 * time.Minute,
 	}
 }
 
@@ -170,6 +172,10 @@ func TestWatcherCRUDIsTenantScoped(t *testing.T) {
 		got, found, err := store.Watcher(ctx, "t1", "alerts")
 		if err != nil || !found || got.Channel != "work" || len(got.Filter.Types) != 1 {
 			t.Fatalf("get = %+v, %v, %v", got, found, err)
+		}
+		var params map[string]string
+		if err := json.Unmarshal(got.Action.Params, &params); err != nil || params["text"] != "hello" {
+			t.Fatalf("action params after a store round trip = %s, %v", got.Action.Params, err)
 		}
 		if _, found, err := store.Watcher(ctx, "t2", "alerts"); err != nil || found {
 			t.Fatalf("cross-tenant get = %v, %v", found, err)
@@ -680,4 +686,276 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 	if _, err := second.AckDelivery(t.Context(), "t1", "alerts", 2, again[0].Lease, nil); err != nil {
 		t.Fatalf("recovered ack: %v", err)
 	}
+}
+
+func TestRenewDeliveryContract(t *testing.T) {
+	cfg := testConfig()
+	cfg.LeaseTTL = 150 * time.Millisecond
+	withStores(t, cfg, func(t *testing.T, store automation.Store) {
+		ctx := t.Context()
+		if _, err := store.CreateWatcher(ctx, testWatcher("renew")); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := store.AdvanceWatcher(ctx, "t1", "renew", 2, []uint64{1}); err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		leased, err := store.LeaseDeliveries(ctx, "t1", 1, "worker")
+		if err != nil || len(leased) != 1 {
+			t.Fatalf("lease = %+v, %v", leased, err)
+		}
+		if err := store.RenewDelivery(ctx, "t1", "renew", 1, "wrong", time.Second); !errors.Is(err, automation.ErrLeaseLost) {
+			t.Fatalf("wrong-token renew = %v", err)
+		}
+		if err := store.RenewDelivery(ctx, "t1", "renew", 1, leased[0].Lease, 400*time.Millisecond); err != nil {
+			t.Fatalf("renew: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		again, err := store.LeaseDeliveries(ctx, "t1", 1, "other")
+		if err != nil || len(again) != 0 {
+			t.Fatalf("renewed lease was stolen = %+v, %v", again, err)
+		}
+		if _, err := store.AckDelivery(ctx, "t1", "renew", 1, leased[0].Lease, nil); err != nil {
+			t.Fatalf("ack after renewal: %v", err)
+		}
+	})
+}
+
+func TestScheduleCreatorMetadataPersists(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store automation.Store) {
+		ctx := t.Context()
+		id, _ := automation.NewScheduleID()
+		environment := "prod"
+		schedule := testSchedule(id, time.Now().Add(time.Hour))
+		schedule.CreatorKind = string(protocol.ActorAgent)
+		schedule.CreatorVia = &protocol.Via{Name: "deploy", Environment: &environment}
+		if _, err := store.CreateSchedule(ctx, schedule); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		stored, found, err := store.Schedule(ctx, "t1", id)
+		if err != nil || !found {
+			t.Fatalf("get = %v, %v", found, err)
+		}
+		if stored.CreatorKind != string(protocol.ActorAgent) || stored.CreatorVia == nil ||
+			stored.CreatorVia.Name != "deploy" || stored.CreatorVia.Environment == nil ||
+			*stored.CreatorVia.Environment != "prod" {
+			t.Fatalf("creator metadata = %+v, via = %+v", stored, stored.CreatorVia)
+		}
+	})
+}
+
+func TestWatcherFilterTypesAreTrimmed(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store automation.Store) {
+		ctx := t.Context()
+		watcher := testWatcher("trim")
+		watcher.Filter = automation.Filter{Types: []string{"  message.posted\t", "labels.changed "}}
+		stored, err := store.CreateWatcher(ctx, watcher)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if len(stored.Filter.Types) != 2 || stored.Filter.Types[0] != "message.posted" || stored.Filter.Types[1] != "labels.changed" {
+			t.Fatalf("types = %q", stored.Filter.Types)
+		}
+		read, _, _ := store.Watcher(ctx, "t1", "trim")
+		if read.Filter.Types[0] != "message.posted" {
+			t.Fatalf("stored types = %q", read.Filter.Types)
+		}
+	})
+}
+
+func TestCrossTenantWritesAreNotFound(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store automation.Store) {
+		ctx := t.Context()
+		if _, err := store.CreateWatcher(ctx, testWatcher("alerts")); err != nil {
+			t.Fatalf("create watcher: %v", err)
+		}
+		if _, err := store.AdvanceWatcher(ctx, "t1", "alerts", 2, []uint64{1}); err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		leased, err := store.LeaseDeliveries(ctx, "t1", 1, "worker")
+		if err != nil || len(leased) != 1 {
+			t.Fatalf("lease = %+v, %v", leased, err)
+		}
+		foreign := testWatcher("alerts")
+		foreign.Tenant = "t2"
+		foreign.Channel = "other"
+		if _, err := store.UpdateWatcher(ctx, foreign); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign watcher update = %v", err)
+		}
+		if _, err := store.SetWatcherEnabled(ctx, "t2", "alerts", false, nil); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign watcher enable = %v", err)
+		}
+		if err := store.DeleteWatcher(ctx, "t2", "alerts"); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign watcher delete = %v", err)
+		}
+		if _, err := store.ClearDeliveries(ctx, "t2", "alerts"); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign clear = %v", err)
+		}
+		if err := store.RetryDelivery(ctx, "t2", "alerts", 1); !errors.Is(err, automation.ErrNotDead) {
+			t.Fatalf("foreign retry = %v", err)
+		}
+		if _, err := store.AckDelivery(ctx, "t2", "alerts", 1, leased[0].Lease, nil); !errors.Is(err, automation.ErrLeaseLost) {
+			t.Fatalf("foreign ack = %v", err)
+		}
+		if jobs, err := store.LeaseDeliveries(ctx, "t2", 10, "worker"); err != nil || len(jobs) != 0 {
+			t.Fatalf("foreign lease = %+v, %v", jobs, err)
+		}
+
+		scheduleID, _ := automation.NewScheduleID()
+		if _, err := store.CreateSchedule(ctx, testSchedule(scheduleID, time.Now().Add(time.Hour))); err != nil {
+			t.Fatalf("create schedule: %v", err)
+		}
+		foreignSchedule := testSchedule(scheduleID, time.Now().Add(time.Hour))
+		foreignSchedule.Tenant = "t2"
+		foreignSchedule.Text = "foreign"
+		if _, err := store.UpdateSchedule(ctx, foreignSchedule); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign schedule update = %v", err)
+		}
+		if _, err := store.SetScheduleEnabled(ctx, "t2", scheduleID, false, time.Now()); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign schedule enable = %v", err)
+		}
+		if err := store.RetrySchedule(ctx, "t2", scheduleID); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign schedule retry = %v", err)
+		}
+		if err := store.ClearSchedule(ctx, "t2", scheduleID); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign schedule clear = %v", err)
+		}
+		if err := store.DeleteSchedule(ctx, "t2", scheduleID); !errors.Is(err, automation.ErrNotFound) {
+			t.Fatalf("foreign schedule delete = %v", err)
+		}
+		if _, err := store.AckSchedule(ctx, "t2", scheduleID, "lease", automation.ScheduleResult{Outcome: automation.ScheduleSent}); !errors.Is(err, automation.ErrLeaseLost) {
+			t.Fatalf("foreign schedule ack = %v", err)
+		}
+		if jobs, err := store.LeaseSchedules(ctx, "t2", 10, "worker"); err != nil || len(jobs) != 0 {
+			t.Fatalf("foreign schedule lease = %+v, %v", jobs, err)
+		}
+	})
+}
+
+func TestPostgresRLSTenantIsolation(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	store := openPostgres(t, dsn, schema, testConfig())
+	ctx := t.Context()
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		watcher := testWatcher("rls-" + tenant)
+		watcher.Tenant = tenant
+		if _, err := store.CreateWatcher(ctx, watcher); err != nil {
+			t.Fatalf("create %s: %v", tenant, err)
+		}
+	}
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = admin.Close(cleanup)
+	})
+	if _, err := admin.Exec(ctx, `SET search_path TO `+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatalf("set search_path: %v", err)
+	}
+	var currentUser string
+	if err := admin.QueryRow(ctx, `SELECT current_user`).Scan(&currentUser); err != nil {
+		t.Fatalf("current_user: %v", err)
+	}
+	role := fmt.Sprintf("keel_automation_rls_%d", time.Now().UnixNano())
+	roleIdent := pgx.Identifier{role}.Sanitize()
+	userIdent := pgx.Identifier{currentUser}.Sanitize()
+	if _, err := admin.Exec(ctx, `CREATE ROLE `+roleIdent+` NOLOGIN`); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `GRANT `+roleIdent+` TO `+userIdent); err != nil {
+		admin.Exec(ctx, `DROP ROLE `+roleIdent)
+		t.Fatalf("grant role: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, _ = admin.Exec(cleanup, `DROP OWNED BY `+roleIdent)
+		_, _ = admin.Exec(cleanup, `REVOKE `+roleIdent+` FROM `+userIdent)
+		if _, err := admin.Exec(cleanup, `DROP ROLE `+roleIdent); err != nil {
+			t.Logf("dropping role %s: %v", role, err)
+		}
+	})
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, `GRANT USAGE ON SCHEMA `+schemaIdent+` TO `+roleIdent); err != nil {
+		t.Fatalf("grant schema: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA `+schemaIdent+` TO `+roleIdent); err != nil {
+		t.Fatalf("grant tables: %v", err)
+	}
+
+	// A restricted role sees only the tenant it set.
+	tx, err := admin.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+roleIdent); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("set role: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', 'tenant-a', true)`); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("set tenant: %v", err)
+	}
+	var visible int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM board_watchers`).Scan(&visible); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("count: %v", err)
+	}
+	if visible != 1 {
+		tx.Rollback(ctx)
+		t.Fatalf("tenant-a visible watchers = %d, want 1", visible)
+	}
+	_, insertErr := tx.Exec(ctx, `
+		INSERT INTO board_watchers (tenant_id, watcher_id, channel, action)
+		VALUES ('tenant-b', 'forged', 'work', '{"name":"post"}'::jsonb)`)
+	if insertErr == nil {
+		tx.Rollback(ctx)
+		t.Fatal("a cross-tenant insert succeeded under tenant-a's setting")
+	}
+	tx.Rollback(ctx)
+
+	// With no tenant setting the policy matches nothing.
+	tx, err = admin.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin unset: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+roleIdent); err != nil {
+		t.Fatalf("set role unset: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM board_watchers`).Scan(&visible); err != nil {
+		t.Fatalf("count unset: %v", err)
+	}
+	if visible != 0 {
+		t.Fatalf("unset tenant visible watchers = %d, want 0", visible)
+	}
+}
+
+func TestScheduleCreationKeyContract(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store automation.Store) {
+		ctx := t.Context()
+		id, _ := automation.NewScheduleID()
+		schedule := testSchedule(id, time.Now().Add(time.Hour))
+		schedule.CreationKey = "create-1"
+		schedule.CreationDigest = "digest-1"
+		first, err := store.CreateSchedule(ctx, schedule)
+		if err != nil || first.Replayed {
+			t.Fatalf("first create = %+v, %v", first, err)
+		}
+		replay, err := store.CreateSchedule(ctx, schedule)
+		if err != nil || !replay.Replayed || replay.ID != first.ID {
+			t.Fatalf("replay = %+v, %v", replay, err)
+		}
+		if list, err := store.Schedules(ctx, "t1"); err != nil || len(list) != 1 {
+			t.Fatalf("schedules = %+v, %v; want one", list, err)
+		}
+		conflict := schedule
+		conflict.CreationDigest = "digest-2"
+		if _, err := store.CreateSchedule(ctx, conflict); !errors.Is(err, automation.ErrExists) {
+			t.Fatalf("different digest = %v, want ErrExists", err)
+		}
+	})
 }

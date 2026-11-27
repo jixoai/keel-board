@@ -72,7 +72,8 @@ Usage:
               [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
               [--sync-start key=platformChannel]
               [--automation-tenant <tenant>] [--automation-dsn <dsn>] [--automation-schema <schema>]
-              [--automation-poll 1s] [--automation-lease 1m] [--automation-action-timeout 2m]
+              [--automation-poll 1s] [--automation-lease 5m] [--automation-action-timeout 2m]
+              [--automation-bot actor]
   board rebuild --dsn postgres://... [--tenant <tenant>]...
   board version
 
@@ -221,7 +222,6 @@ func serve(args []string) error {
 	defer stopSync()
 	stopAutomation, err := startAutomationWorkers(ctx, logger, automationRuntime, board, server.AllowAll{})
 	if err != nil {
-		stopSync()
 		return err
 	}
 	defer stopAutomation()

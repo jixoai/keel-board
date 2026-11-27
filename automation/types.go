@@ -72,8 +72,11 @@ var watcherIDExpr = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 // parameters. Nothing here is executed by name over HTTP; the action registry
 // is assembled by the process that runs the worker.
 type ActionSpec struct {
-	Name   string          `json:"name"`
-	Params json.RawMessage `json:"params,omitempty"`
+	Name string `json:"name"`
+	// Params is deployment configuration, sometimes sensitive. It is never
+	// part of a watcher's JSON/DTO; the store uses an internal record and the
+	// management API returns only the action name.
+	Params json.RawMessage `json:"-"`
 }
 
 // Validate checks the action's shape. It refuses parameter keys that name an
@@ -266,6 +269,19 @@ func (w Watcher) Validate() error {
 	return nil
 }
 
+// normalizeWatcher stores a filter's event types without surrounding
+// whitespace, so the value a caller validated is the value matching uses.
+func normalizeWatcher(w Watcher) Watcher {
+	if len(w.Filter.Types) > 0 {
+		types := make([]string, len(w.Filter.Types))
+		for index, value := range w.Filter.Types {
+			types[index] = strings.TrimSpace(value)
+		}
+		w.Filter.Types = types
+	}
+	return w
+}
+
 // ValidateWatcherID checks a watcher ID's shape.
 func ValidateWatcherID(id string) error {
 	if len(id) == 0 || len(id) > WatcherIDMax || !watcherIDExpr.MatchString(id) {
@@ -329,6 +345,8 @@ type Schedule struct {
 	Text         string            `json:"-"`
 	Labels       map[string]string `json:"labels,omitempty"`
 	Creator      string            `json:"creator"`
+	CreatorKind  string            `json:"creatorKind,omitempty"`
+	CreatorVia   *protocol.Via     `json:"creatorVia,omitempty"`
 	NextRunAt    time.Time         `json:"nextRunAt"`
 	EverySeconds int               `json:"everySeconds,omitempty"`
 	UntilAt      *time.Time        `json:"untilAt,omitempty"`
@@ -338,12 +356,21 @@ type Schedule struct {
 	Attempts     int               `json:"attempts"`
 	LastError    string            `json:"lastError,omitempty"`
 	CancelReason string            `json:"cancelReason,omitempty"`
-	Lease        string            `json:"-"`
-	LeaseOwner   string            `json:"-"`
-	LeaseUntil   time.Time         `json:"-"`
-	CreatedAt    time.Time         `json:"createdAt"`
-	UpdatedAt    time.Time         `json:"updatedAt"`
-	Completed    *time.Time        `json:"completedAt,omitempty"`
+	// CreationKey and CreationDigest make a POST /schedules retry answer the
+	// first plan. They are storage metadata, never a DTO field.
+	CreationKey    string `json:"-"`
+	CreationDigest string `json:"-"`
+	// Replayed is set by the store when a creation key matched; it is not
+	// persisted.
+	Replayed bool `json:"-"`
+	// ExpectedUpdatedAt is an update's optimistic-concurrency precondition.
+	ExpectedUpdatedAt *time.Time `json:"-"`
+	Lease             string     `json:"-"`
+	LeaseOwner        string     `json:"-"`
+	LeaseUntil        time.Time  `json:"-"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	UpdatedAt         time.Time  `json:"updatedAt"`
+	Completed         *time.Time `json:"completedAt,omitempty"`
 }
 
 // Validate checks a schedule before it is stored.
@@ -371,6 +398,28 @@ func (s Schedule) Validate() error {
 	}
 	if err := protocol.ValidateActorID(s.Creator); err != nil {
 		return protocol.Invalidf("creator: %s", err.Message)
+	}
+	switch s.CreatorKind {
+	case "", string(protocol.ActorPerson), string(protocol.ActorAgent),
+		string(protocol.ActorDeployment), string(protocol.ActorWorkflow), string(protocol.ActorExternal):
+	default:
+		return protocol.Invalid("creatorKind: it isn't an actor kind")
+	}
+	if s.CreatorVia != nil {
+		if strings.TrimSpace(s.CreatorVia.Name) == "" || len(s.CreatorVia.Name) > 128 {
+			return protocol.Invalid("creatorVia.name: 1 to 128 characters")
+		}
+		if s.CreatorVia.Environment != nil && len(*s.CreatorVia.Environment) > 128 {
+			return protocol.Invalid("creatorVia.environment: at most 128 characters")
+		}
+	}
+	if s.CreationKey != "" {
+		if len(s.CreationKey) > 200 || !protocol.Storable(s.CreationKey) || strings.TrimSpace(s.CreationKey) != s.CreationKey {
+			return protocol.Invalid("idempotencyKey: at most 200 storable characters")
+		}
+		if s.CreationDigest == "" {
+			return protocol.Invalid("the schedule creation key has no digest")
+		}
 	}
 	if s.NextRunAt.IsZero() {
 		return protocol.Invalid("nextRunAt: a schedule needs a next run time")
@@ -441,6 +490,12 @@ type ScheduleResult struct {
 	Err error
 }
 
+// sameInstant compares two timestamps at the board wire's millisecond
+// precision, which is what an update's expected version carries.
+func sameInstant(left, right time.Time) bool {
+	return protocol.FormatTime(left) == protocol.FormatTime(right)
+}
+
 // NewWatcherID returns a random watcher ID.
 func NewWatcherID() (string, error) {
 	var raw [16]byte
@@ -459,6 +514,19 @@ func NewScheduleID() (string, error) {
 	raw[6] = (raw[6] & 0x0f) | 0x40
 	raw[8] = (raw[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", raw[0:4], raw[4:6], raw[6:8], raw[8:10], raw[10:16]), nil
+}
+
+// IsAccessDenied reports a definitive authorization refusal: the policy
+// answered 401 or 403. Any other error from an authorizer is an unavailable
+// dependency, not a denial, so automation retries it instead of cancelling a
+// schedule or dead-lettering a delivery.
+func IsAccessDenied(err error) bool {
+	var boardErr *protocol.Error
+	if !errors.As(err, &boardErr) {
+		return false
+	}
+	return boardErr.Status == 401 || boardErr.Status == 403 ||
+		boardErr.Code == protocol.CodeUnauthorized || boardErr.Code == protocol.CodeForbidden
 }
 
 // IsPermanent reports whether a failure must not be retried.
@@ -528,6 +596,21 @@ func ErrorCode(err error) string {
 	}
 }
 
+// BotAllowed reports whether a bot may act. An empty allowlist allows every
+// bot (the development default); a deployment supplies the list of registered
+// bot actors.
+func BotAllowed(bot string, allowlist []string) bool {
+	if len(allowlist) == 0 {
+		return true
+	}
+	for _, allowed := range allowlist {
+		if allowed == bot {
+			return true
+		}
+	}
+	return false
+}
+
 // validTenant refuses an empty or unbounded tenant, so a caller can't
 // accidentally use "" as a tenant-wide namespace.
 func validTenant(tenant string) error {
@@ -565,6 +648,14 @@ func cloneSchedule(s Schedule) Schedule {
 	}
 	if s.Labels != nil {
 		s.Labels = cloneLabels(s.Labels)
+	}
+	if s.CreatorVia != nil {
+		via := *s.CreatorVia
+		if via.Environment != nil {
+			environment := *via.Environment
+			via.Environment = &environment
+		}
+		s.CreatorVia = &via
 	}
 	if s.UntilAt != nil {
 		until := *s.UntilAt

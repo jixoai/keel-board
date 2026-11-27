@@ -8,16 +8,17 @@ The upstream project is TypeScript and tied to Vercel's API, OIDC, Connect and
 deployment model. This repository keeps the parts that make the board a
 standard — one durable log, channels and threads, tasks with claims and
 leases, needs and labels — and replaces the backend with a plain Go library,
-an append-only log and HTTP/SSE. Watchers, grant HTTP routes and two-way sync
-follow in later phases; messages, reactions, files, blocks/mentions, actors,
-batch tasks, and the board's threads are served.
+an append-only log and HTTP/SSE. Messages, reactions, files, blocks/mentions,
+actors, batch tasks, the board's threads, watchers and schedules are served;
+grant HTTP routes remain a later phase.
 
 - Upstream pin: `vercel/board@26428ed4e0661ff362c59abdf1215997c59891b0`
 - License: Apache-2.0 (see `LICENSE` and `NOTICE`)
 - Status: phase 1 core (channels, messages, tasks, claims, needs, labels, SSE),
   the phase 3 message surface (edit/delete tombstones, reactions, files,
-  blocks/mentions, actors, batch tasks, threads), the phase 2 sync design +
-  adapter skeletons, and a PostgreSQL log store with tenant-aware access
+  blocks/mentions, actors, batch tasks, threads), durable watchers/schedules
+  with management APIs and workers, the phase 2 sync design + adapter
+  skeletons, and a PostgreSQL log store with tenant-aware access
 - Sync design: [`docs/SYNC.md`](docs/SYNC.md)
 
 ## Running
@@ -77,7 +78,7 @@ go test -race ./...
 PostgreSQL tests run only when `KEEL_BOARD_TEST_DSN` (or `TEST_DSN`) names a
 local server; each test creates and drops its own schema. CI must set it:
 with `CI` set and no DSN the PostgreSQL tests fail instead of skipping. The
-sync tables enable and force row-level security; the store sets
+sync and automation tables enable and force row-level security; the stores set
 `keel.tenant_id` transaction-locally, and an unset setting matches no rows.
 
 ## Layout
@@ -93,7 +94,8 @@ sync tables enable and force row-level security; the store sets
 | `server/` | HTTP API, SSE feed, authorizer and tenant seams |
 | `sync/` | Provider registry (tenant-qualified), normalized events, runners and adapters |
 | `syncstore/` | Durable sync inbox/outbox, copies and threads, webhook handler, workers |
-| `cmd/board/` | Standalone dev server (`board serve`, memory or `--dsn`, `--blobs`) |
+| `automation/` | Durable watchers/schedules, action registry, workers, management-store seam |
+| `cmd/board/` | Standalone dev server (`board serve`, memory or `--dsn`, `--blobs`, automation workers) |
 
 The translation is faithful in semantics, not a line-by-line copy. Every
 difference from upstream is recorded in `docs/PORTING.md`.

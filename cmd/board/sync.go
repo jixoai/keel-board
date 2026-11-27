@@ -442,19 +442,22 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 			logger.Error("sync subscription stopped", "error", syncstore.ErrorCode(err))
 		}
 	}()
+	var stopOnce sync.Once
 	stop = func() {
-		cancel()
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			logger.Warn("sync workers did not stop in time")
-		}
-		runtime.closeStore()
+		stopOnce.Do(func() {
+			cancel()
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				logger.Warn("sync workers did not stop in time")
+			}
+			runtime.closeStore()
+		})
 	}
 	return stop, nil
 }

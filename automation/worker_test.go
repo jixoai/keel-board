@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -139,6 +140,24 @@ func TestWatcherPlansFutureEventsAndRunsAsBot(t *testing.T) {
 	if err != nil || depth.Done != 1 || depth.Dead != 0 {
 		t.Fatalf("depth = %+v, %v", depth, err)
 	}
+	// The bot's own post is a board event on the watched channel; planning it
+	// must not wake the same watcher again.
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("self-wake pass: %v", err)
+	}
+	depth, err = memory.DeliveryDepth(ctx, "t1", "alerts")
+	if err != nil || depth.Done != 1 || depth.Dead != 0 || depth.Pending != 0 {
+		t.Fatalf("self-wake depth = %+v, %v", depth, err)
+	}
+	count := 0
+	for _, message := range messagesIn(t, board, "t1", "work") {
+		if message.By.Actor == "local:bot:alerts" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("bot posts = %d, want 1", count)
+	}
 }
 
 func TestWatcherFailureIsolationAndLaneProgress(t *testing.T) {
@@ -271,8 +290,8 @@ func TestWatcherNeverFetchesURLs(t *testing.T) {
 	registry, err := automation.NewRegistryWith(automation.ActionFunc{
 		ActionName: "record",
 		Fn: func(_ context.Context, call *automation.ActionCall) error {
-			if call.Message != nil {
-				seenText = call.Message.Text
+			if message := call.Message(); message != nil {
+				seenText = message.Text
 			}
 			return nil
 		},
@@ -724,5 +743,607 @@ func TestWatcherActionTimeoutRetriesThenDead(t *testing.T) {
 	depth, _ = memory.DeliveryDepth(ctx, "t1", "hang")
 	if depth.Dead != 1 {
 		t.Fatalf("depth after two timeouts = %+v", depth)
+	}
+}
+
+type failingAuthorizer struct{ err error }
+
+func (a failingAuthorizer) Authorize(context.Context, string, protocol.Actor, string, protocol.Permission) error {
+	return a.err
+}
+
+func TestWatcherAuthorizationOutageRetriesThenDead(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	cfg := testConfig()
+	cfg.Retry.MaxAttempts = 2
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "postbot",
+		Fn: func(ctx context.Context, call *automation.ActionCall) error {
+			_, err := call.Post(ctx, call.Channel(), "must not land", nil)
+			return err
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "first", nil)
+	postMessage(t, board, "t1", "work", "second", nil)
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"store 500", errors.New("grant store unavailable")},
+		{"timeout", context.DeadlineExceeded},
+		{"canceled", context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fresh, _ := automation.NewMemory(cfg)
+			worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+				Store: fresh, Board: board, Actions: registry, Authorize: failingAuthorizer{err: test.err},
+				Tenant: "t1", PollInterval: time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Recreate the watcher in the fresh store and feed the same event.
+			if _, err := fresh.CreateWatcher(ctx, automation.Watcher{
+				Tenant: "t1", ID: "outage", Channel: "work", Cursor: 1, Enabled: true,
+				Action: automation.ActionSpec{Name: "postbot"},
+			}); err != nil {
+				t.Fatalf("create fresh: %v", err)
+			}
+			if _, err := worker.Process(ctx); err != nil {
+				t.Fatalf("first pass: %v", err)
+			}
+			depth, _ := fresh.DeliveryDepth(ctx, "t1", "outage")
+			if depth.Dead != 0 || depth.Pending != 1 {
+				t.Fatalf("after an authorization outage = %+v; want a retry, not a dead letter", depth)
+			}
+			// The retried delivery is due immediately under the test policy.
+			if _, err := worker.Process(ctx); err != nil {
+				t.Fatalf("second pass: %v", err)
+			}
+			depth, _ = fresh.DeliveryDepth(ctx, "t1", "outage")
+			if depth.Dead != 1 {
+				t.Fatalf("after two attempts = %+v; want a dead letter", depth)
+			}
+		})
+	}
+}
+
+func TestScheduleAuthorizationOutageRetriesNotCancels(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"store 500", errors.New("grant store unavailable")},
+		{"timeout", context.DeadlineExceeded},
+		{"canceled", context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			board := newTestBoard(t)
+			ctx := t.Context()
+			cfg := testConfig()
+			cfg.Retry.MaxAttempts = 2
+			memory, err := automation.NewMemory(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, _ := automation.NewScheduleID()
+			if _, err := memory.CreateSchedule(ctx, automation.Schedule{
+				Tenant: "t1", ID: id, Channel: "work", Text: "must not send now",
+				Creator: "local:user:alice", NextRunAt: time.Now().Add(-time.Second),
+			}); err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			worker, err := automation.NewScheduleWorker(automation.ScheduleWorkerConfig{
+				Store: memory, Board: board, Authorize: failingAuthorizer{err: test.err},
+				Tenant: "t1", PollInterval: time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := worker.Process(ctx); err != nil {
+				t.Fatalf("first pass: %v", err)
+			}
+			schedule, _, _ := memory.Schedule(ctx, "t1", id)
+			if schedule.Status != automation.SchedulePending || schedule.Attempts != 1 || schedule.CancelReason != "" {
+				t.Fatalf("after an authorization outage = %+v; want a retry, not a cancellation", schedule)
+			}
+			if _, err := worker.Process(ctx); err != nil {
+				t.Fatalf("second pass: %v", err)
+			}
+			schedule, _, _ = memory.Schedule(ctx, "t1", id)
+			if schedule.Status != automation.ScheduleDead || schedule.CancelReason != "" {
+				t.Fatalf("after two attempts = %+v; want a dead letter, not a cancellation", schedule)
+			}
+			if got := len(messagesIn(t, board, "t1", "work")); got != 0 {
+				t.Fatalf("messages = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestWatcherWorkerRejectsActionTimeoutNotShorterThanLease(t *testing.T) {
+	memory, err := automation.NewMemory(automation.Config{LeaseTTL: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "noop", Fn: func(context.Context, *automation.ActionCall) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	board := newTestBoard(t)
+	if _, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Tenant: "t1",
+		ActionTimeout: 100 * time.Millisecond,
+	}); err == nil {
+		t.Fatal("an action timeout equal to the lease was accepted")
+	}
+	if _, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Tenant: "t1",
+		ActionTimeout: 50 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("a shorter action timeout was refused: %v", err)
+	}
+}
+
+func TestWatcherHeartbeatPreventsConcurrentExecution(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	cfg := testConfig()
+	cfg.LeaseTTL = 300 * time.Millisecond
+	memory, err := automation.NewMemory(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var starts atomic.Int64
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "slow",
+		Fn: func(context.Context, *automation.ActionCall) error {
+			starts.Add(1)
+			// Deliberately ignore the action context: the heartbeat must keep
+			// the lease alive even when a plugin overruns its timeout.
+			time.Sleep(450 * time.Millisecond)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "first", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "slow", Channel: "work", Cursor: 1, Enabled: true,
+		Action: automation.ActionSpec{Name: "slow"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	postMessage(t, board, "t1", "work", "second", nil)
+	workerA, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Tenant: "t1", Owner: "a",
+		PollInterval: time.Hour, ActionTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerB, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Tenant: "t1", Owner: "b",
+		PollInterval: time.Hour, ActionTimeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan automation.WorkResult, 1)
+	go func() {
+		result, _ := workerA.Process(ctx)
+		done <- result
+	}()
+	time.Sleep(350 * time.Millisecond)
+	if result, err := workerB.Process(ctx); err != nil {
+		t.Fatalf("second worker: %v", err)
+	} else if result.Leased != 0 {
+		t.Fatalf("second worker leased %d deliveries while the first action ran", result.Leased)
+	}
+	<-done
+	if starts.Load() != 1 {
+		t.Fatalf("action starts = %d, want 1", starts.Load())
+	}
+	depth, err := memory.DeliveryDepth(ctx, "t1", "slow")
+	if err != nil || depth.Done != 1 {
+		t.Fatalf("depth = %+v, %v", depth, err)
+	}
+}
+
+func TestBoardGeneratedTaskEventsWakeBotWatcher(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "record",
+		Fn: func(context.Context, *automation.ActionCall) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var messageID uint64
+	err = board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		messageID = tx.NextID(0)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: messageID, Channel: "work", Text: "bot task", Thread: log.ThreadKey(messageID),
+			Labels: map[string]string{}, By: protocol.Author{Actor: "local:bot:alerts", Principal: "local:bot:alerts"},
+		})
+		tx.RecordResult(messageID)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("post bot task: %v", err)
+	}
+	if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		tx.Emit(log.EventTaskReady, &log.TaskReadyPayload{ID: messageID, Thread: log.ThreadKey(messageID)})
+		return nil
+	}); err != nil {
+		t.Fatalf("emit task.ready: %v", err)
+	}
+	if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		tx.Emit(log.EventTaskExpired, &log.TaskExpiredPayload{ID: messageID, Thread: log.ThreadKey(messageID)})
+		return nil
+	}); err != nil {
+		t.Fatalf("emit task.expired: %v", err)
+	}
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "tasks", Channel: "work", Cursor: 1, Enabled: true,
+		Bot:    "local:bot:alerts",
+		Filter: automation.Filter{Types: []string{"task.ready", "task.expired"}},
+		Action: automation.ActionSpec{Name: "record"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Authorize: allowAll{},
+		Tenant: "t1", PollInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		if _, err := worker.Process(ctx); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("action calls = %d, want 2 (ready and expired must wake the bot's watcher)", calls.Load())
+	}
+}
+
+func TestActionCallIsReadOnlyAndCannotBypassWrites(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var exported []string
+	var seenMessage string
+	var seenLabel string
+	var seenPayload string
+	var seenWatcherChannel string
+	var seenBot string
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "mutate",
+		Fn: func(_ context.Context, call *automation.ActionCall) error {
+			// A read-only view must detach every mutable part.
+			if message := call.Message(); message != nil {
+				message.Text = "tampered"
+				message.Labels["tampered"] = "yes"
+			}
+			if event, ok := call.Event().Payload.(*log.MessagePostedPayload); ok {
+				event.Text = "tampered"
+				event.Labels["tampered"] = "yes"
+			}
+			watcher := call.Watcher()
+			watcher.Channel = "elsewhere"
+			watcher.Action.Params = []byte(`{"text":"tampered"}`)
+			bot := call.Bot()
+			bot.ID = "local:bot:evil"
+			// What a second read sees proves the copy.
+			seenMessage = call.Message().Text
+			seenLabel = call.Message().Labels["tampered"]
+			if event, ok := call.Event().Payload.(*log.MessagePostedPayload); ok {
+				seenPayload = event.Text
+			}
+			seenWatcherChannel = call.Watcher().Channel
+			seenBot = call.Bot().ID
+			typ := reflect.TypeOf(*call)
+			for index := 0; index < typ.NumField(); index++ {
+				if typ.Field(index).PkgPath == "" {
+					exported = append(exported, typ.Field(index).Name)
+				}
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "original", map[string]string{"kind": "alert"})
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "readonly", Channel: "work", Cursor: 1, Enabled: true,
+		Action: automation.ActionSpec{Name: "mutate", Params: []byte(`{"text":"original"}`)},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	postMessage(t, board, "t1", "work", "trigger", map[string]string{"kind": "alert"})
+	worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Authorize: allowAll{},
+		Tenant: "t1", PollInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if len(exported) != 0 {
+		t.Fatalf("ActionCall exposes fields %v; Board/write seams must stay unexported", exported)
+	}
+	if seenMessage != "trigger" || seenLabel != "" || seenPayload != "trigger" {
+		t.Fatalf("mutating a read-only view changed it: message=%q label=%q payload=%q", seenMessage, seenLabel, seenPayload)
+	}
+	if seenWatcherChannel != "work" || seenBot != "local:bot:readonly" {
+		t.Fatalf("mutating watcher/bot views changed them: channel=%q bot=%q", seenWatcherChannel, seenBot)
+	}
+	messages := messagesIn(t, board, "t1", "work")
+	for _, message := range messages {
+		if message.Text == "tampered" || message.Labels["tampered"] == "yes" {
+			t.Fatalf("action mutated the board: %+v", message)
+		}
+	}
+	stored, _, err := memory.Watcher(ctx, "t1", "readonly")
+	if err != nil || stored.Channel != "work" || string(stored.Action.Params) != `{"text":"original"}` {
+		t.Fatalf("action mutated the watcher: %+v, %v", stored, err)
+	}
+}
+
+func TestWatcherSubtreeMatchesOnlyWithin(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seenChannel string
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "record",
+		Fn: func(_ context.Context, call *automation.ActionCall) error {
+			if message := call.Message(); message != nil {
+				seenChannel = message.Channel
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "root", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "subtree", Channel: "work/", Cursor: 1, Enabled: true,
+		Action: automation.ActionSpec{Name: "record"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	postMessage(t, board, "t1", "work/deep", "inside", nil)
+	postMessage(t, board, "t1", "workshop", "outside", nil)
+	if _, err := workerProcess(t, memory, board, registry); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if seenChannel != "work/deep" {
+		t.Fatalf("subtree watcher saw %q, want work/deep", seenChannel)
+	}
+	depth, _ := memory.DeliveryDepth(ctx, "t1", "subtree")
+	if depth.Done != 1 {
+		t.Fatalf("depth = %+v; an unrelated channel must not match", depth)
+	}
+}
+
+func workerProcess(t *testing.T, store automation.Store, board *log.Board, registry *automation.Registry) (automation.WorkResult, error) {
+	t.Helper()
+	worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: store, Board: board, Actions: registry, Authorize: allowAll{},
+		Tenant: "t1", PollInterval: time.Hour,
+	})
+	if err != nil {
+		return automation.WorkResult{}, err
+	}
+	return worker.Process(t.Context())
+}
+
+func TestWatcherBotAllowlistWorker(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "record",
+		Fn: func(context.Context, *automation.ActionCall) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "first", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "blocked", Channel: "work", Cursor: 1, Enabled: true,
+		Bot: "local:bot:blocked", Action: automation.ActionSpec{Name: "record"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	postMessage(t, board, "t1", "work", "second", nil)
+	worker, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: memory, Board: board, Actions: registry, Authorize: allowAll{},
+		Tenant: "t1", PollInterval: time.Hour,
+		BotAllowlist: []string{"local:bot:allowed"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("blocked bot action ran %d times", calls.Load())
+	}
+	depth, _ := memory.DeliveryDepth(ctx, "t1", "blocked")
+	if depth.Dead != 1 {
+		t.Fatalf("depth = %+v; want a dead letter", depth)
+	}
+}
+
+func TestScheduleDeletedReplyTargetCancels(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID := postMessage(t, board, "t1", "work", "root", nil)
+	id, _ := automation.NewScheduleID()
+	if _, err := memory.CreateSchedule(ctx, automation.Schedule{
+		Tenant: "t1", ID: id, Channel: "work", Re: &rootID, Text: "reply later",
+		Creator: "local:user:alice", NextRunAt: time.Now().Add(-time.Second),
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		tx.Emit(log.EventMessageDeleted, &log.MessageDeletedPayload{
+			ID: rootID, Thread: log.ThreadKey(rootID),
+			By: protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"},
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("delete root: %v", err)
+	}
+	worker, err := automation.NewScheduleWorker(automation.ScheduleWorkerConfig{
+		Store: memory, Board: board, Authorize: allowAll{}, Tenant: "t1", PollInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worker.Process(ctx); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	schedule, _, _ := memory.Schedule(ctx, "t1", id)
+	if schedule.Status != automation.ScheduleCanceled || schedule.CancelReason != "message_deleted" {
+		t.Fatalf("schedule = %+v, want a message_deleted cancellation", schedule)
+	}
+	if got := len(messagesIn(t, board, "t1", "work")); got != 1 {
+		t.Fatalf("messages = %d, want only the tombstone", got)
+	}
+}
+
+func TestWatcherFilterUsesEventTimeLabels(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "record",
+		Fn: func(context.Context, *automation.ActionCall) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postMessage(t, board, "t1", "work", "before", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "labels", Channel: "work", Cursor: 1, Enabled: true,
+		Filter: automation.Filter{Types: []string{"message.posted"}, Labels: map[string]string{"kind": "alert"}},
+		Action: automation.ActionSpec{Name: "record"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	alertID := postMessage(t, board, "t1", "work", "alert", map[string]string{"kind": "alert"})
+	// Move the label before planning: the post's own labels must decide.
+	if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+		tx.Emit(log.EventLabelsChanged, &log.LabelsChangedPayload{
+			ID: alertID, Thread: log.ThreadKey(alertID),
+			Set: map[string]string{"kind": "other"},
+			By:  protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"},
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("labels: %v", err)
+	}
+	if _, err := workerProcess(t, memory, board, registry); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want the post matched at its event time", calls.Load())
+	}
+}
+
+func TestWatcherFilterUsesEventTimeLabelChanges(t *testing.T) {
+	board := newTestBoard(t)
+	ctx := t.Context()
+	memory, err := automation.NewMemory(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int64
+	registry, err := automation.NewRegistryWith(automation.ActionFunc{
+		ActionName: "record",
+		Fn: func(context.Context, *automation.ActionCall) error {
+			calls.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID := postMessage(t, board, "t1", "work", "root", nil)
+	if _, err := memory.CreateWatcher(ctx, automation.Watcher{
+		Tenant: "t1", ID: "changes", Channel: "work", Cursor: 1, Enabled: true,
+		Filter: automation.Filter{Types: []string{"labels.changed"}, Labels: map[string]string{"kind": "alert"}},
+		Action: automation.ActionSpec{Name: "record"},
+	}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	for _, value := range []string{"alert", "other"} {
+		value := value
+		if err := board.Update(ctx, "t1", log.UpdateOptions{}, func(tx *log.Tx) error {
+			tx.Emit(log.EventLabelsChanged, &log.LabelsChangedPayload{
+				ID: messageID, Thread: log.ThreadKey(messageID),
+				Set: map[string]string{"kind": value},
+				By:  protocol.Author{Actor: "local:user:alice", Principal: "local:user:alice"},
+			})
+			return nil
+		}); err != nil {
+			t.Fatalf("label %s: %v", value, err)
+		}
+	}
+	if _, err := workerProcess(t, memory, board, registry); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("calls = %d, want only the alert label change", calls.Load())
 	}
 }

@@ -167,6 +167,7 @@ func TestErrorStatuses(t *testing.T) {
 		protocol.CodeNotATask:        404,
 		protocol.CodeDuplicateID:     409,
 		protocol.CodeClaimLost:       409,
+		protocol.CodeConflict:        409,
 		protocol.CodeTaskClaimed:     409,
 		protocol.CodeUnavailable:     503,
 	}

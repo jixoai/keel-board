@@ -163,29 +163,79 @@ func ActorFromID(id string) protocol.Actor {
 	}
 }
 
+// logVia converts a protocol Via to the log's record type.
+func logVia(via *protocol.Via) *log.Via {
+	if via == nil {
+		return nil
+	}
+	out := &log.Via{Name: via.Name}
+	if via.Environment != nil {
+		environment := *via.Environment
+		out.Environment = &environment
+	}
+	return out
+}
+
+// ScheduleActor reconstructs the creator identity a schedule stored, including
+// the kind and Via a permission policy may read.
+func ScheduleActor(schedule Schedule) protocol.Actor {
+	actor := ActorFromID(schedule.Creator)
+	if schedule.CreatorKind != "" {
+		actor.Kind = protocol.ActorKind(schedule.CreatorKind)
+	}
+	if schedule.CreatorVia != nil {
+		via := deepCopy(*schedule.CreatorVia)
+		actor.Via = &via
+	}
+	return actor
+}
+
 // ActionCall is one action run: the triggering event, the watcher that matched
 // it, and the only way the action may write to the board. A write goes through
 // Post or Reply, which check the bot's post permission in the target channel;
 // an action that never calls them has no board side effect.
 type ActionCall struct {
-	Tenant    string
-	Watcher   Watcher
-	Event     log.Event
-	Message   *log.Message
-	Bot       protocol.Actor
-	Board     Board
-	Authorize Authorizer
+	tenant    string
+	watcher   Watcher
+	event     log.Event
+	message   *log.Message
+	bot       protocol.Actor
+	board     Board
+	authorize Authorizer
 
 	posts int
 }
 
+// Tenant returns the board an action runs on.
+func (c *ActionCall) Tenant() string { return c.tenant }
+
+// Watcher returns a detached copy of the watcher declaration.
+func (c *ActionCall) Watcher() Watcher { return cloneWatcher(c.watcher) }
+
+// Event returns a detached copy of the triggering event, including its typed
+// payload. Mutating it never changes the delivery or the board.
+func (c *ActionCall) Event() log.Event { return deepCopy(c.event) }
+
+// Message returns a detached copy of the event's message, or nil when the
+// event concerns none.
+func (c *ActionCall) Message() *log.Message {
+	if c.message == nil {
+		return nil
+	}
+	cloned := deepCopy(*c.message)
+	return &cloned
+}
+
+// Bot returns the actor the watcher's writes are made as.
+func (c *ActionCall) Bot() protocol.Actor { return deepCopy(c.bot) }
+
 // Channel returns the channel the triggering event concerns, or "" when it
 // concerns none.
 func (c *ActionCall) Channel() string {
-	if c.Message != nil {
-		return c.Message.Channel
+	if c.message != nil {
+		return c.message.Channel
 	}
-	switch payload := c.Event.Payload.(type) {
+	switch payload := c.event.Payload.(type) {
 	case *log.MessagePostedPayload:
 		return payload.Channel
 	case *log.ChannelCreatedPayload:
@@ -210,7 +260,7 @@ func (c *ActionCall) Reply(ctx context.Context, target uint64, text string, labe
 		replyTo *uint64
 		found   bool
 	)
-	err := c.Board.ReadContext(ctx, c.Tenant, func(snapshot *log.Snapshot) error {
+	err := c.board.ReadContext(ctx, c.tenant, func(snapshot *log.Snapshot) error {
 		message := snapshot.Message(target)
 		if message == nil || message.Deleted {
 			return nil
@@ -235,7 +285,7 @@ func (c *ActionCall) Reply(ctx context.Context, target uint64, text string, labe
 }
 
 func (c *ActionCall) write(ctx context.Context, channel string, re, replyTo *uint64, text string, labels map[string]string) (uint64, error) {
-	if c.Board == nil {
+	if c.board == nil {
 		return 0, errors.New("automation: action call has no board")
 	}
 	if err := protocol.ValidateChannel(channel); err != nil {
@@ -250,25 +300,38 @@ func (c *ActionCall) write(ctx context.Context, channel string, re, replyTo *uin
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	if c.Authorize != nil {
-		if err := c.Authorize.Authorize(ctx, c.Tenant, c.Bot, channel, protocol.PermissionPost); err != nil {
-			return 0, Permanent(fmt.Errorf("watcher bot may not post in %s: %w", channel, err))
+	if c.authorize != nil {
+		if err := c.authorize.Authorize(ctx, c.tenant, c.bot, channel, protocol.PermissionPost); err != nil {
+			if IsAccessDenied(err) {
+				return 0, Permanent(fmt.Errorf("watcher bot may not post in %s: %w", channel, err))
+			}
+			return 0, fmt.Errorf("watcher bot authorization is unavailable: %w", err)
 		}
 		if len(labels) > 0 {
-			if err := c.Authorize.Authorize(ctx, c.Tenant, c.Bot, channel, protocol.PermissionLabel); err != nil {
-				return 0, Permanent(fmt.Errorf("watcher bot may not label in %s: %w", channel, err))
+			if err := c.authorize.Authorize(ctx, c.tenant, c.bot, channel, protocol.PermissionLabel); err != nil {
+				if IsAccessDenied(err) {
+					return 0, Permanent(fmt.Errorf("watcher bot may not label in %s: %w", channel, err))
+				}
+				return 0, fmt.Errorf("watcher bot label authorization is unavailable: %w", err)
 			}
 		}
 	}
 	readable := true
-	if c.Authorize != nil {
-		readable = c.Authorize.Authorize(ctx, c.Tenant, c.Bot, channel, protocol.PermissionRead) == nil
+	if c.authorize != nil {
+		switch err := c.authorize.Authorize(ctx, c.tenant, c.bot, channel, protocol.PermissionRead); {
+		case err == nil:
+			readable = true
+		case IsAccessDenied(err):
+			readable = false
+		default:
+			return 0, fmt.Errorf("watcher bot read authorization is unavailable: %w", err)
+		}
 	}
-	key := fmt.Sprintf("watch:%s:%d:%d", c.Watcher.ID, c.Event.Seq, c.posts)
+	key := fmt.Sprintf("watch:%s:%d:%d", c.watcher.ID, c.event.Seq, c.posts)
 	c.posts++
 	digest := actionDigest(channel, re, replyTo, text, labels)
 	var id uint64
-	err := c.Board.Update(ctx, c.Tenant, log.UpdateOptions{
+	err := c.board.Update(ctx, c.tenant, log.UpdateOptions{
 		Idempotency: &log.Idempotency{Key: key, Digest: digest},
 	}, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
@@ -279,10 +342,10 @@ func (c *ActionCall) write(ctx context.Context, channel string, re, replyTo *uin
 			return nil
 		}
 		offset := 0
-		if tx.Actor(c.Bot.ID) == nil {
+		if tx.Actor(c.bot.ID) == nil {
 			tx.Emit(log.EventActorSeen, &log.ActorSeenPayload{
-				Actor: c.Bot.ID, Kind: string(c.Bot.Kind), Handle: c.Bot.Handle,
-				Name: c.Bot.Name, Platform: "local",
+				Actor: c.bot.ID, Kind: string(c.bot.Kind), Handle: c.bot.Handle,
+				Name: c.bot.Name, Via: logVia(c.bot.Via), Platform: "local",
 			})
 			offset++
 		}
@@ -293,7 +356,7 @@ func (c *ActionCall) write(ctx context.Context, channel string, re, replyTo *uin
 		}
 		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
 			ID: id, Channel: channel, Text: text, Re: re, ReplyTo: replyTo,
-			Thread: thread, Labels: labels, By: c.Bot.Actored(), Blind: !readable,
+			Thread: thread, Labels: labels, By: c.bot.Actored(), Blind: !readable,
 		})
 		tx.RecordResult(id)
 		return nil
@@ -329,13 +392,14 @@ func (PostAction) Name() string { return "post" }
 
 // Run implements Action.
 func (PostAction) Run(ctx context.Context, call *ActionCall) error {
-	if len(call.Watcher.Action.Params) == 0 {
+	watcher := call.Watcher()
+	if len(watcher.Action.Params) == 0 {
 		return Permanent(protocol.Invalid("action.params.text: the post action needs text"))
 	}
 	var params struct {
 		Text string `json:"text"`
 	}
-	decoder := json.NewDecoder(strings.NewReader(string(call.Watcher.Action.Params)))
+	decoder := json.NewDecoder(strings.NewReader(string(watcher.Action.Params)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&params); err != nil {
 		return Permanent(protocol.Invalid("action.params: the post action takes {text}"))

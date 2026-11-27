@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/jixoai/keel-board/automation"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 )
 
@@ -25,6 +27,7 @@ type automationFlags struct {
 	poll          time.Duration
 	lease         time.Duration
 	actionTimeout time.Duration
+	bots          []string
 }
 
 // registerAutomationFlags adds the automation flags to a serve flag set.
@@ -34,8 +37,12 @@ func registerAutomationFlags(flags *flag.FlagSet) *automationFlags {
 	flags.StringVar(&cfg.dsn, "automation-dsn", "", "PostgreSQL DSN for automation state; empty uses KEEL_AUTOMATION_DSN, --dsn, or memory")
 	flags.StringVar(&cfg.schema, "automation-schema", "", "schema for the automation tables; empty uses the database default")
 	flags.DurationVar(&cfg.poll, "automation-poll", time.Second, "how long an idle automation worker waits between passes")
-	flags.DurationVar(&cfg.lease, "automation-lease", time.Minute, "how long a worker holds a delivery or schedule lease")
-	flags.DurationVar(&cfg.actionTimeout, "automation-action-timeout", 2*time.Minute, "how long one watcher action may run before it is retried")
+	flags.DurationVar(&cfg.lease, "automation-lease", automation.DefaultLeaseTTL, "how long a worker holds a delivery or schedule lease")
+	flags.DurationVar(&cfg.actionTimeout, "automation-action-timeout", 2*time.Minute, "how long one watcher action may run before it is retried (must be shorter than the lease)")
+	flags.Func("automation-bot", "a bot actor a watcher may act as (repeatable; empty allows any)", func(value string) error {
+		cfg.bots = append(cfg.bots, strings.TrimSpace(value))
+		return nil
+	})
 	return cfg
 }
 
@@ -47,17 +54,38 @@ type automationRuntime struct {
 	tenant        string
 	poll          time.Duration
 	actionTimeout time.Duration
+	bots          []string
 }
 
 // options returns the management API's configuration.
 func (r *automationRuntime) options(logger *slog.Logger) *server.AutomationOptions {
-	return &server.AutomationOptions{Store: r.store, Actions: r.registry, Logger: logger}
+	return &server.AutomationOptions{
+		Store: r.store, Actions: r.registry, Bots: r.bots, Logger: logger,
+	}
 }
 
 // buildAutomation opens the automation store and registers the built-in
 // actions. The post action is a deployment-declared board write; no action
 // fetches a URL.
 func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN string) (*automationRuntime, error) {
+	lease := flags.lease
+	if lease <= 0 {
+		lease = automation.DefaultLeaseTTL
+	}
+	actionTimeout := flags.actionTimeout
+	if actionTimeout <= 0 {
+		actionTimeout = 2 * time.Minute
+	}
+	if actionTimeout >= lease {
+		return nil, fmt.Errorf("automation: action timeout %s must be shorter than the lease %s", actionTimeout, lease)
+	}
+	bots := make([]string, 0, len(flags.bots))
+	for _, bot := range flags.bots {
+		if err := protocol.ValidateActorID(bot); err != nil {
+			return nil, fmt.Errorf("automation-bot %q: %s", bot, err.Message)
+		}
+		bots = append(bots, bot)
+	}
 	dsn := strings.TrimSpace(flags.dsn)
 	if dsn == "" {
 		dsn = strings.TrimSpace(os.Getenv("KEEL_AUTOMATION_DSN"))
@@ -70,7 +98,7 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 		closeStore func()
 	)
 	if dsn == "" {
-		memory, err := automation.NewMemory(automation.Config{})
+		memory, err := automation.NewMemory(automation.Config{LeaseTTL: lease})
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +106,7 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 	} else {
 		postgres, err := automation.OpenPostgres(ctx, automation.PostgresOptions{
 			DSN: dsn, SearchPath: strings.TrimSpace(flags.schema),
-			Config: automation.Config{LeaseTTL: flags.lease},
+			Config: automation.Config{LeaseTTL: lease},
 		})
 		if err != nil {
 			return nil, err
@@ -98,13 +126,9 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 	if poll <= 0 {
 		poll = time.Second
 	}
-	actionTimeout := flags.actionTimeout
-	if actionTimeout <= 0 {
-		actionTimeout = 2 * time.Minute
-	}
 	return &automationRuntime{
 		store: store, closeStore: closeStore, registry: registry,
-		tenant: tenant, poll: poll, actionTimeout: actionTimeout,
+		tenant: tenant, poll: poll, actionTimeout: actionTimeout, bots: bots,
 	}, nil
 }
 
@@ -118,7 +142,8 @@ func startAutomationWorkers(ctx context.Context, logger *slog.Logger, runtime *a
 	watchers, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
 		Store: runtime.store, Board: board, Actions: runtime.registry,
 		Authorize: authorize, Tenant: runtime.tenant, Owner: "board-watcher",
-		PollInterval: runtime.poll, ActionTimeout: runtime.actionTimeout, Logger: logger,
+		PollInterval: runtime.poll, ActionTimeout: runtime.actionTimeout,
+		BotAllowlist: runtime.bots, Logger: logger,
 	})
 	if err != nil {
 		runtime.closeStore()
@@ -146,19 +171,22 @@ func startAutomationWorkers(ctx context.Context, logger *slog.Logger, runtime *a
 	}
 	start("watchers", watchers.Run)
 	start("schedules", schedules.Run)
+	var stopOnce sync.Once
 	stop = func() {
-		cancel()
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(10 * time.Second):
-			logger.Warn("automation workers did not stop in time")
-		}
-		runtime.closeStore()
+		stopOnce.Do(func() {
+			cancel()
+			done := make(chan struct{})
+			go func() {
+				wg.Wait()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				logger.Warn("automation workers did not stop in time")
+			}
+			runtime.closeStore()
+		})
 	}
 	return stop, nil
 }
