@@ -216,3 +216,16 @@ func TestValidateTaskShape(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestValidateClientIDReservesBoardNamespaces(t *testing.T) {
+	for _, value := range []string{"client-1", "key:local:0123456789abcdef0123456789abcdef"} {
+		if err := protocol.ValidateClientID(value); err != nil {
+			t.Errorf("%q should be accepted: %v", value, err)
+		}
+	}
+	for _, value := range []string{"sync:acme:1", "schedule:abc:1", "watch:alerts:1:0"} {
+		if err := protocol.ValidateClientID(value); err == nil {
+			t.Errorf("%q should be reserved to the board", value)
+		}
+	}
+}

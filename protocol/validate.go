@@ -227,6 +227,9 @@ func ValidateClientID(id string) *Error {
 	if strings.HasPrefix(id, "sync:") {
 		return Invalid("id: sync: IDs are sync's own")
 	}
+	if strings.HasPrefix(id, "schedule:") || strings.HasPrefix(id, "watch:") {
+		return Invalid("id: schedule: and watch: IDs are the board's automation IDs")
+	}
 	return nil
 }
 
