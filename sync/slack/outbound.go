@@ -142,14 +142,19 @@ func (p *Provider) renderBody(rawText string, notes []string, external bool, key
 
 // restoreMentions turns the board's explicit mention token for this entry
 // into Slack's own mention. A user ID from another workspace's key stays
-// text: this adapter's token cannot speak for it.
+// text: this adapter's token cannot speak for it. Code spans and fenced
+// blocks are literal text, so a token inside one is not a mention.
 func restoreMentions(text string, key boardsync.Key) string {
-	if key == "" || !strings.Contains(text, "@[") {
-		return text
-	}
-	pattern := regexp.MustCompile(`@\[` + regexp.QuoteMeta(string(key)) + `:user:([UW][A-Z0-9_]+)\]`)
-	return pattern.ReplaceAllString(text, "<@$1>")
+	return boardsync.ReplaceMentions(text, key, func(id string) (string, bool) {
+		if !slackUserID.MatchString(id) {
+			return "", false
+		}
+		return "<@" + id + ">", true
+	})
 }
+
+// slackUserID is a Slack user ID as it appears in a mention.
+var slackUserID = regexp.MustCompile(`^[UW][A-Z0-9_]+$`)
 
 // withoutLabel removes the "**name**: " a rendered message opens with, for a
 // message Slack shows under its author's name instead. Only the exact label

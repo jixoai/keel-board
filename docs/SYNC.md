@@ -229,8 +229,10 @@ converts only tokens under its own key to its native mention; another
 connection's token is left literally as written, which notifies no one.
 GitHub's `@org/team` stays text because it names a team, not a user. Linear's
 API renders a mention from a profile URL and this adapter has no workspace
-slug, so Linear posts tokens as text rather than fabricating an `@name`. Code
-spans and fenced blocks are never rewritten.
+slug, so Linear posts tokens as text rather than fabricating an `@name`.
+Outbound conversions and GitHub's inbound conversion leave code spans and
+fenced blocks as literal text; Slack's inbound mrkdwn converter is the older
+whole-text path.
 
 **Typing.** `Capabilities.Typing` plus the optional `Typist` interface carry an
 ephemeral status. `Runner.Typing` validates the entry and thread and answers
