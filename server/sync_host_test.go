@@ -184,8 +184,16 @@ func TestSyncHostEchoSuppressionAndSafeInput(t *testing.T) {
 		if strings.Contains(message.Text, "keel-board") {
 			t.Fatalf("marker leaked: %q", message.Text)
 		}
-		if len(message.Attachments) != 1 || message.Attachments[0].Name != "safe.txt" {
+		if len(message.Attachments) != 3 {
 			t.Fatalf("attachments = %+v", message.Attachments)
+		}
+		for _, attachment := range message.Attachments {
+			if len(attachment.ID) != 22 {
+				t.Fatalf("placeholder ID %q isn't shaped like an attachment ID", attachment.ID)
+			}
+		}
+		if !strings.Contains(message.Text, "unsafe.txt") || !strings.Contains(message.Text, "file hosts") {
+			t.Fatalf("unsafe file note missing: %q", message.Text)
 		}
 		links, _ := json.Marshal(message.Links)
 		if strings.Contains(string(links), "evil.test") || strings.Contains(string(links), "http://") {

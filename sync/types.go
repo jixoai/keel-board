@@ -528,8 +528,11 @@ type Origin struct {
 	Context   string `json:"context,omitempty"`
 }
 
-// AttachmentRef is a board attachment as the outbound side needs it.
+// AttachmentRef is a board attachment as the outbound side needs it. ID names
+// the bytes in the board's blob store; a loader reads them, never the sync
+// package.
 type AttachmentRef struct {
+	ID       string `json:"id,omitempty"`
 	Name     string `json:"name"`
 	Type     string `json:"type,omitempty"`
 	Size     int64  `json:"size,omitempty"`
@@ -670,6 +673,10 @@ type ImportRequest struct {
 	Channel   string        `json:"channel,omitempty"`
 	Event     Event         `json:"event"`
 	Overrides ImportOptions `json:"overrides,omitempty"`
+	// Fetcher reads a platform file's bytes for the import. It is the entry's
+	// provider when the platform can fetch files, nil otherwise: a board that
+	// keeps no bytes keeps the file's metadata and a note instead.
+	Fetcher FileFetcher `json:"-"`
 }
 
 // ImportResult is what an import touched. Zero means the event didn't land.
@@ -729,6 +736,10 @@ type OutboundOptions struct {
 	Renderer Renderer
 	// CopySink persists a post's copy before the receipt is written.
 	CopySink CopySink
+	// Files reads a board message's attachment bytes just before a post. A
+	// platform that can't upload files gets notes instead; a provider's Post
+	// receives the files only when the loader returned them.
+	Files FileLoader
 }
 
 // Errors a provider may return. The registry maps them to HTTP answers and the

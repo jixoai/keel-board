@@ -114,7 +114,7 @@ func New(opts Options) *Server {
 		if opts.Sync.Logger == nil {
 			opts.Sync.Logger = opts.Logger
 		}
-		service, err := newSyncService(opts.Board, *opts.Sync)
+		service, err := newSyncService(opts.Board, opts.Blobs, *opts.Sync)
 		if err != nil {
 			panic("server: " + err.Error())
 		}

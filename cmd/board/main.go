@@ -202,7 +202,8 @@ func serve(args []string) error {
 				secret, ok := syncRuntime.bridgeSecrets[key]
 				return secret, ok
 			},
-			Logger: logger,
+			FileHosts: syncRuntime.fileHosts,
+			Logger:    logger,
 		}
 	}
 	automationRuntime, err := buildAutomation(ctx, automationCfg, *dsn)

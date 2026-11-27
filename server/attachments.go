@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -134,16 +135,22 @@ func newAttachmentID() (string, error) {
 // the record already stored when the key was taken, so a retried finish
 // answers what landed.
 func (s *Server) saveAttachmentRecord(r *http.Request, tenant string, record attachmentRecord) (attachmentRecord, error) {
+	return putAttachmentRecord(r.Context(), s.blobs, tenant, record)
+}
+
+// putAttachmentRecord is saveAttachmentRecord for a caller outside an HTTP
+// request, such as an inbound sync import.
+func putAttachmentRecord(ctx context.Context, blobs blob.Store, tenant string, record attachmentRecord) (attachmentRecord, error) {
 	record.Tenant = tenant
 	encoded, err := json.Marshal(record)
 	if err != nil {
 		return attachmentRecord{}, err
 	}
-	err = s.blobs.Put(r.Context(), attachmentMetaKey(tenant, record.ID), encoded, attachmentTicketType)
+	err = blobs.Put(ctx, attachmentMetaKey(tenant, record.ID), encoded, attachmentTicketType)
 	if err == nil {
 		return record, nil
 	}
-	existing, readErr := s.loadAttachmentRecord(r, tenant, record.ID)
+	existing, readErr := readAttachmentRecord(ctx, blobs, tenant, record.ID)
 	if readErr == nil {
 		return existing, nil
 	}
@@ -153,7 +160,13 @@ func (s *Server) saveAttachmentRecord(r *http.Request, tenant string, record att
 // loadAttachmentRecord reads a file's record, or ErrNotFound. A record from
 // another tenant is not found, even if a caller names its ID.
 func (s *Server) loadAttachmentRecord(r *http.Request, tenant, id string) (attachmentRecord, error) {
-	data, _, err := s.blobs.Get(r.Context(), attachmentMetaKey(tenant, id))
+	return readAttachmentRecord(r.Context(), s.blobs, tenant, id)
+}
+
+// readAttachmentRecord is loadAttachmentRecord for a caller outside an HTTP
+// request.
+func readAttachmentRecord(ctx context.Context, blobs blob.Store, tenant, id string) (attachmentRecord, error) {
+	data, _, err := blobs.Get(ctx, attachmentMetaKey(tenant, id))
 	if err != nil {
 		return attachmentRecord{}, err
 	}

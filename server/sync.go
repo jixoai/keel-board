@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -48,6 +49,9 @@ type SyncOptions struct {
 	MaxFileBytes int64
 	// MaxFiles and MaxLinks bound one inbound message.
 	MaxFiles, MaxLinks int
+	// FileFetchTimeout bounds one inbound file download. Zero uses the sync
+	// package's default.
+	FileFetchTimeout time.Duration
 	// MaxWebhookBody caps a platform webhook body. Zero means 1 MiB.
 	MaxWebhookBody int64
 	// BridgeSecret resolves the HMAC v1 secret for one Chat SDK bridge entry.
@@ -75,7 +79,7 @@ type syncService struct {
 }
 
 // newSyncService validates opts and builds the sync seams.
-func newSyncService(board *log.Board, opts SyncOptions) (*syncService, error) {
+func newSyncService(board *log.Board, blobs blob.Store, opts SyncOptions) (*syncService, error) {
 	if board == nil {
 		return nil, errors.New("server: sync needs a board")
 	}
@@ -100,8 +104,9 @@ func newSyncService(board *log.Board, opts SyncOptions) (*syncService, error) {
 		}
 	}
 	host := NewSyncHost(board, opts.Store, SyncHostOptions{
-		FileHosts: opts.FileHosts, MaxFileBytes: opts.MaxFileBytes,
-		MaxFiles: opts.MaxFiles, MaxLinks: opts.MaxLinks, Logger: opts.Logger,
+		Blobs: blobs, FileHosts: opts.FileHosts, MaxFileBytes: opts.MaxFileBytes,
+		MaxFiles: opts.MaxFiles, MaxLinks: opts.MaxLinks, FileFetchTimeout: opts.FileFetchTimeout,
+		Logger: opts.Logger,
 	})
 	handler, err := syncstore.NewWebhookHandler(syncstore.WebhookConfig{
 		Registry: opts.Registry,

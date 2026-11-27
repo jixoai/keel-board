@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
@@ -34,6 +35,7 @@ type syncHarness struct {
 	provider *fake.Provider
 	server   *server.Server
 	wrapped  syncstore.Store
+	blobs    blob.Store
 	posts    atomic.Int64
 	cancel   context.CancelFunc
 	workers  sync.WaitGroup
@@ -60,6 +62,11 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 		StartThreads: true, Edits: true, Deletes: true, Reactions: true,
 	})
 	h := &syncHarness{t: t, board: board, store: store, provider: provider}
+	blobs := opts.blobs
+	if blobs == nil {
+		blobs = blob.NewMemory()
+	}
+	h.blobs = blobs
 	provider.ResolveTargetFunc = func(_ context.Context, key boardsync.Key, target string) (boardsync.ResolvedTarget, error) {
 		if channel, _, ok := strings.Cut(target, ":"); ok {
 			return boardsync.ResolvedTarget{Key: key, Platform: "slack", Channel: channel, Thread: target, Kind: boardsync.TargetThread}, nil
@@ -109,6 +116,7 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 			return "t1", nil
 		},
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Blobs:  blobs,
 		Sync: &server.SyncOptions{
 			Store: serverStore, Registry: registry, Tenant: tenant,
 			Owned:         []server.SyncKey{{Tenant: "t1", Key: "slack"}},
@@ -155,6 +163,7 @@ func (h *syncHarness) startWorkers(t *testing.T) {
 	}
 	worker, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
 		Store: h.serverStore(), Registry: h.registry, Runner: runner, Host: h.server.SyncHost(),
+		Files:  boardsync.FileLoader(h.server.SyncHost().LoadFiles),
 		Tenant: "t1", Keys: []boardsync.Key{"slack"},
 		PollInterval: 10 * time.Millisecond, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -195,6 +204,8 @@ type syncHarnessOptions struct {
 	// wrapStore lets a test inject one failure into the server's store while
 	// the harness keeps the concrete memory store for assertions.
 	wrapStore func(syncstore.Store) syncstore.Store
+	// blobs replaces the harness's memory store for attachment tests.
+	blobs blob.Store
 }
 
 func (h *syncHarness) request(method, path string, body any, extra map[string]string) (int, []byte) {

@@ -307,7 +307,7 @@ func (r *Runner) OutboundWithOptions(ctx context.Context, entry Entry, event Boa
 		Copy:      copy,
 		Renderer:  opts.Renderer,
 		ops: &outboundOps{
-			host: r.host, provider: entry.Provider, copySink: opts.CopySink,
+			host: r.host, provider: entry.Provider, copySink: opts.CopySink, files: opts.Files,
 		},
 	})
 	defer call.finish()
@@ -321,6 +321,30 @@ func (r *Runner) OutboundWithOptions(ctx context.Context, entry Entry, event Boa
 		return Receipt{}, nil
 	}
 	return call.state.deliverRes, nil
+}
+
+// Typing shows a short-lived status in one platform thread, such as "the
+// board is writing". It is ephemeral and best-effort: a caller ignores the
+// error and delivers the message anyway. A platform without a typing status
+// answers ErrUnsupported rather than pretending.
+func (r *Runner) Typing(ctx context.Context, entry Entry, thread ThreadRef, latest, status string) error {
+	if err := entry.Validate(); err != nil {
+		return err
+	}
+	if !entry.Provider.Capabilities().Typing {
+		return fmt.Errorf("%w: %s has no typing status", ErrUnsupported, entry.Provider.Platform())
+	}
+	typist, ok := entry.Provider.(Typist)
+	if !ok {
+		return fmt.Errorf("%w: %s has no typing status", ErrUnsupported, entry.Provider.Platform())
+	}
+	if thread.Key != entry.Key {
+		return fmt.Errorf("%w: thread belongs to %q, not %q", ErrBadRequest, thread.Key, entry.Key)
+	}
+	if thread.Channel == "" {
+		return fmt.Errorf("%w: typing needs a platform channel", ErrBadRequest)
+	}
+	return typist.Typing(ctx, entry.Key, thread, latest, status)
 }
 
 // OfferRoot offers a new board root to entry's sync function for one platform
@@ -361,6 +385,11 @@ func (o *inboundOps) Import(ctx context.Context, req ImportRequest) (ImportResul
 	if o.host == nil {
 		return ImportResult{}, errors.New("sync: inbound call has no host")
 	}
+	// The provider is the only side that can fetch its own files; the host
+	// decides whether the board keeps the bytes or a note.
+	if fetcher, ok := o.provider.(FileFetcher); ok {
+		req.Fetcher = fetcher
+	}
 	return o.host.Import(ctx, req)
 }
 
@@ -388,6 +417,7 @@ type outboundOps struct {
 	host     Host
 	provider Provider
 	copySink CopySink
+	files    FileLoader
 }
 
 func (o *outboundOps) Import(context.Context, ImportRequest) (ImportResult, error) {
@@ -441,6 +471,14 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 			return Receipt{}, err
 		}
 		msg.Markdown = rendered
+	}
+
+	var outboundFiles []OutboundFile
+	if isPostEvent(req.Event.Type) && len(req.Message.Attachments) > 0 {
+		var notes []string
+		outboundFiles, notes = o.attachmentFiles(ctx, req)
+		msg.Files = outboundFiles
+		msg.Markdown = AppendFileNotes(msg.Markdown, notes)
 	}
 
 	var receipt Receipt
@@ -528,6 +566,9 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 	if err != nil {
 		return receipt, err
 	}
+	if isPostEvent(req.Event.Type) {
+		receipt = o.finishFiles(ctx, req, msg, receipt, outboundFiles)
+	}
 	// Only a post creates a copy; edits, deletes, and reactions are
 	// best-effort changes to one and record no receipt (upstream semantics).
 	if req.Event.Type == BoardMessagePosted || req.Event.Type == BoardThreadSynced {
@@ -604,6 +645,117 @@ func (o *outboundOps) ResolveChannel(ctx context.Context, key Key, name string) 
 
 func (o *outboundOps) Permalink(context.Context, Key, Event) (string, error) {
 	return "", fmt.Errorf("%w: an outbound call has no permalink", ErrBadRequest)
+}
+
+// attachmentFiles turns a post's board attachments into what the platform can
+// take. A platform without file upload gets a note per attachment, so the
+// message still says what it carried; a loader that fails degrades the same
+// way instead of losing the text.
+func (o *outboundOps) attachmentFiles(ctx context.Context, req DeliverRequest) ([]OutboundFile, []string) {
+	attachments := req.Message.Attachments
+	if !o.provider.Capabilities().UploadsFiles {
+		notes := make([]string, 0, len(attachments))
+		for _, attachment := range attachments {
+			notes = append(notes, FileNote(attachment.Name, attachment.Size,
+				string(o.provider.Platform())+" messages carry no files"))
+		}
+		return nil, notes
+	}
+	if o.files == nil {
+		notes := make([]string, 0, len(attachments))
+		for _, attachment := range attachments {
+			notes = append(notes, FileNote(attachment.Name, attachment.Size, "this board kept no file bytes"))
+		}
+		return nil, notes
+	}
+	result, err := o.files(ctx, req.Tenant, req.Message)
+	if err != nil {
+		notes := make([]string, 0, len(attachments))
+		for _, attachment := range attachments {
+			notes = append(notes, FileNote(attachment.Name, attachment.Size, "the board couldn't read its files"))
+		}
+		return nil, notes
+	}
+	return result.Files, result.Notes
+}
+
+// finishFiles fills a post's receipt with the files the platform took. A
+// provider that uploads them itself reports their IDs on Posted; a provider
+// that doesn't gets a second call to FileUploader. An upload failure is a note
+// on the already-delivered text, never a lost message and never a retry that
+// would post it twice.
+func (o *outboundOps) finishFiles(ctx context.Context, req DeliverRequest, msg OutboundMessage, receipt Receipt, files []OutboundFile) Receipt {
+	if len(req.Message.Attachments) == 0 {
+		return receipt
+	}
+	if receipt.Files != nil {
+		receipt.FilesSet = true
+		return receipt
+	}
+	if len(files) == 0 {
+		// Every attachment became a note; the files were considered.
+		receipt.Files, receipt.FilesSet = []string{}, true
+		return receipt
+	}
+	uploader, ok := o.provider.(FileUploader)
+	if !ok {
+		o.noteFileFailure(ctx, req, msg, receipt, files, fmt.Errorf("%w: %s didn't take the files", ErrUnsupported, o.provider.Platform()))
+		receipt.Files, receipt.FilesSet = []string{}, true
+		return receipt
+	}
+	ids, err := uploader.UploadFiles(ctx, req.Key, receipt.Thread, files)
+	if err != nil {
+		o.noteFileFailure(ctx, req, msg, receipt, files, err)
+		receipt.Files, receipt.FilesSet = []string{}, true
+		return receipt
+	}
+	receipt.Files, receipt.FilesSet = ids, true
+	return receipt
+}
+
+// noteFileFailure adds the upload failure to the delivered message, when the
+// platform can edit it. The text is already posted, so this is best-effort:
+// a failed edit leaves the message without the note, not with a duplicate.
+func (o *outboundOps) noteFileFailure(ctx context.Context, req DeliverRequest, msg OutboundMessage, receipt Receipt, files []OutboundFile, uploadErr error) {
+	editor, ok := o.provider.(Editor)
+	if !ok || receipt.Message == "" || receipt.Thread.Native() == "" {
+		return
+	}
+	reason := uploadFailureReason(uploadErr)
+	notes := make([]string, 0, len(files))
+	for _, file := range files {
+		notes = append(notes, FileNote(file.Filename, int64(len(file.Data)), "the platform didn't take it: "+reason))
+	}
+	edited := msg
+	edited.Files = nil
+	edited.Markdown = AppendFileNotes(msg.Markdown, notes)
+	_ = editor.Edit(ctx, req.Key, receipt.Thread, receipt.Message, edited)
+}
+
+// uploadFailureReason is a short class, never a platform body.
+func uploadFailureReason(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, ErrUnsupported):
+		return "not supported there"
+	case errors.Is(err, ErrUnauthorized):
+		return "not authorized"
+	case errors.Is(err, ErrRateLimited):
+		return "rate limited"
+	case errors.Is(err, ErrNotFound):
+		return "not found"
+	case errors.Is(err, ErrBadRequest):
+		return "refused"
+	default:
+		return "the upload failed"
+	}
+}
+
+// isPostEvent reports whether delivering the board event creates a platform
+// message that can carry files.
+func isPostEvent(eventType BoardEventType) bool {
+	return eventType == BoardMessagePosted || eventType == BoardThreadSynced
 }
 
 func targetRef(target ResolvedTarget) ThreadRef { return target.Ref() }

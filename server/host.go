@@ -3,33 +3,45 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/syncstore"
 )
 
-// SyncHostOptions bound what an import may put on the board. The board never
-// fetches a platform URL; these limits decide what metadata is kept.
+// SyncHostOptions bound what an import may put on the board. The board fetches
+// a platform file only when an adapter supplies it and the URL is on the
+// allowlist; otherwise the file stays metadata and a note.
 type SyncHostOptions struct {
+	// Blobs keeps inbound file bytes and is read for outbound attachments.
+	// Nil keeps metadata only: no file bytes are fetched, stored, or sent.
+	Blobs blob.Store
 	// FileHosts is the allowlist of hosts a file or link URL may name. Empty
 	// refuses every URL (the file or link is kept without one).
 	FileHosts []string
-	// MaxFileBytes bounds one file's declared size. Zero means 50 MiB.
+	// MaxFileBytes bounds one file's declared and actual size. Zero means
+	// 50 MiB.
 	MaxFileBytes int64
 	// MaxFiles bounds one message's files. Zero means 32.
 	MaxFiles int
 	// MaxLinks bounds one message's links. Zero means 32.
 	MaxLinks int
+	// FileFetchTimeout bounds one inbound file download. Zero means
+	// boardsync.FileFetchTimeout.
+	FileFetchTimeout time.Duration
+	// Now is the clock attachment records use. Zero means time.Now.
+	Now func() time.Time
 	// Logger receives dropped-input summaries. Zero uses slog.Default.
 	Logger *slog.Logger
 }
@@ -39,15 +51,19 @@ type SyncHostOptions struct {
 //
 //   - idempotent imports, keyed by the inbox event ID;
 //   - echo suppression (own markers are fail-closed, other markers stripped);
-//   - safe file and link placeholders, with no network fetch;
+//   - bounded, allowlisted file fetches into the blob store, with a note when
+//     a file can't come over and no network fetch for links;
 //   - receipts projected onto the message they concern.
 type SyncHost struct {
 	board        *log.Board
 	store        syncstore.Store
+	blobs        blob.Store
 	fileHosts    map[string]struct{}
 	maxFileBytes int64
 	maxFiles     int
 	maxLinks     int
+	fetchTimeout time.Duration
+	now          func() time.Time
 	logger       *slog.Logger
 }
 
@@ -62,6 +78,12 @@ func NewSyncHost(board *log.Board, store syncstore.Store, opts SyncHostOptions) 
 	if opts.MaxLinks <= 0 {
 		opts.MaxLinks = 32
 	}
+	if opts.FileFetchTimeout <= 0 {
+		opts.FileFetchTimeout = boardsync.FileFetchTimeout
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -73,9 +95,9 @@ func NewSyncHost(board *log.Board, store syncstore.Store, opts SyncHostOptions) 
 		}
 	}
 	return &SyncHost{
-		board: board, store: store, fileHosts: hosts,
+		board: board, store: store, blobs: opts.Blobs, fileHosts: hosts,
 		maxFileBytes: opts.MaxFileBytes, maxFiles: opts.MaxFiles, maxLinks: opts.MaxLinks,
-		logger: opts.Logger,
+		fetchTimeout: opts.FileFetchTimeout, now: opts.Now, logger: opts.Logger,
 	}
 }
 
@@ -103,13 +125,13 @@ func (h *SyncHost) Import(ctx context.Context, req boardsync.ImportRequest) (boa
 	if err := event.Validate(); err != nil {
 		return boardsync.ImportResult{}, err
 	}
-	event, dropped := h.sanitize(event)
+	event, dropped, fileNotes := h.sanitize(event)
 	if dropped {
 		return boardsync.ImportResult{}, nil
 	}
 	switch event.Kind {
 	case boardsync.KindMessage:
-		return h.importMessage(ctx, req, event)
+		return h.importMessage(ctx, req, event, fileNotes)
 	case boardsync.KindEdited:
 		return h.importEdit(ctx, req, event)
 	case boardsync.KindDeleted:
@@ -124,55 +146,63 @@ func (h *SyncHost) Import(ctx context.Context, req boardsync.ImportRequest) (boa
 }
 
 // sanitize enforces echo suppression and safe input. A dropped event is our
-// own copy (a matching marker) or has nothing left to import.
-func (h *SyncHost) sanitize(event boardsync.Event) (boardsync.Event, bool) {
+// own copy (a matching marker) or has nothing left to import. File notes say
+// what was left out; they become part of the imported text.
+func (h *SyncHost) sanitize(event boardsync.Event) (boardsync.Event, bool, []string) {
 	text := event.Text
 	if boardsync.IsOwnMarker(text, event.Key) {
 		// Fail closed: losing a copied comment is better than echoing our own
 		// post back onto the board.
-		return event, true
+		return event, true, nil
 	}
 	text = boardsync.StripMarker(text)
 	event.Text = boardsync.StorableText(text, boardsync.MaxTextBytes)
-	event.Files = h.safeFiles(event.Files)
+	var notes []string
+	event.Files, notes = h.safeFiles(event.Files)
 	if event.Kind == boardsync.KindMessage && event.Text == "" && len(event.Files) == 0 {
-		return event, true
+		return event, true, notes
 	}
-	return event, false
+	return event, false, notes
 }
 
-// safeFiles keeps at most MaxFiles files, with bounded sizes and text. A URL
-// that isn't an allowed https host is dropped from the file, not fetched.
-func (h *SyncHost) safeFiles(files []boardsync.File) []boardsync.File {
+// safeFiles bounds one message's files and keeps only metadata the board may
+// store. A URL that isn't an allowed https host is removed rather than
+// fetched; the file's name and size still describe what the platform carried,
+// and a note says the bytes aren't coming. Nothing here does network I/O.
+func (h *SyncHost) safeFiles(files []boardsync.File) ([]boardsync.File, []string) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]boardsync.File, 0, len(files))
-	for _, file := range files {
-		if len(out) >= h.maxFiles {
-			break
-		}
-		if file.Size < 0 || file.Size > h.maxFileBytes {
+	var notes []string
+	for index, file := range files {
+		if index >= h.maxFiles {
+			notes = append(notes, boardsync.FileNote(file.Name, file.Size,
+				fmt.Sprintf("a message carries at most %d files", h.maxFiles)))
 			continue
 		}
 		file.Type = boardsync.StorableText(file.Type, 128)
 		file.Name = boardsync.StorableText(file.Name, 200)
 		file.MIMEType = boardsync.StorableText(file.MIMEType, 200)
 		file.FetchMetadata = nil
+		if file.Size < 0 {
+			file.Size = 0
+		}
 		originalURL := file.URL
 		file.URL = safeURL(originalURL, h.fileHosts)
 		if strings.TrimSpace(originalURL) != "" && file.URL == "" {
-			// A URL that isn't an allowed https host makes the file
-			// unimportable: keeping it without a handle would only mislead.
-			continue
+			notes = append(notes, boardsync.FileNote(file.Name, file.Size,
+				"its download URL isn't on this board's file hosts"))
 		}
 		out = append(out, file)
 	}
-	return out
+	return out, notes
 }
 
-// safeLinks keeps at most MaxLinks links. A link whose URL isn't https on an
-// allowed host is kept as an unavailable placeholder with no URL.
+// safeLinks keeps at most MaxLinks links. Only an https URL on an allowed host
+// is stored; the board never fetches one. A snapshot the platform supplied
+// with the link is kept as JSON, but no snapshot is fetched on the board's
+// behalf.
 func (h *SyncHost) safeLinks(links []boardsync.Link) []protocol.LinkView {
 	if len(links) == 0 {
 		return nil
@@ -185,7 +215,11 @@ func (h *SyncHost) safeLinks(links []boardsync.Link) []protocol.LinkView {
 		}
 		safe := safeURL(link.URL, h.fileHosts)
 		if safe == "" {
-			out = append(out, protocol.LinkView{Unavailable: "external link"})
+			unavailable := "external link"
+			if strings.TrimSpace(link.Why) != "" {
+				unavailable = boardsync.StorableText(link.Why, 200)
+			}
+			out = append(out, protocol.LinkView{Unavailable: unavailable})
 			continue
 		}
 		if _, duplicate := seen[safe]; duplicate {
@@ -194,10 +228,17 @@ func (h *SyncHost) safeLinks(links []boardsync.Link) []protocol.LinkView {
 		seen[safe] = struct{}{}
 		view := protocol.LinkView{URL: safe}
 		if link.Message != "" {
-			if len(link.Message) > 300 {
-				link.Message = link.Message[:300]
+			message := boardsync.StorableText(link.Message, 300)
+			view.Message = &message
+		}
+		if link.Snapshot != nil {
+			// A platform snapshot is display data, not a log payload: bound
+			// it well below a message's text so a chatty unfurl can't bloat
+			// the event.
+			if encoded, err := json.Marshal(link.Snapshot); err == nil && len(encoded) <= 32<<10 {
+				snapshot := string(encoded)
+				view.Snapshot = &snapshot
 			}
-			view.Message = &link.Message
 		}
 		out = append(out, view)
 	}
@@ -205,21 +246,11 @@ func (h *SyncHost) safeLinks(links []boardsync.Link) []protocol.LinkView {
 }
 
 // safeURL returns url if it is an absolute https URL on an allowed host
-// without credentials. An empty allowlist refuses every URL.
+// without credentials, a non-default port, or a literal IP. An empty allowlist
+// refuses every URL.
 func safeURL(raw string, hosts map[string]struct{}) string {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || len(raw) > 2048 || len(hosts) == 0 {
-		return ""
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
-		return ""
-	}
-	if parsed.User != nil {
-		return ""
-	}
-	host := strings.ToLower(parsed.Hostname())
-	if _, allowed := hosts[host]; !allowed {
+	if !boardsync.FileURLSafe(raw, hosts) {
 		return ""
 	}
 	return raw
@@ -227,14 +258,15 @@ func safeURL(raw string, hosts map[string]struct{}) string {
 
 // importMessage creates a thread root or a reply. Root creation is serialized
 // per external thread and keyed by the platform thread, so two concurrent
-// events cannot create two roots; the loser imports as a reply.
-func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
+// events cannot create two roots; the loser imports as a reply. fileNotes
+// describe files the import could not take.
+func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, fileNotes []string) (boardsync.ImportResult, error) {
 	mapping, mapped, err := h.lookupThread(ctx, req.Tenant, req.Key, event)
 	if err != nil {
 		return boardsync.ImportResult{}, err
 	}
 	if mapped {
-		return h.importReply(ctx, req, event, mapping)
+		return h.importReply(ctx, req, event, mapping, fileNotes)
 	}
 	if req.Channel == "" {
 		// A reply on a thread the board doesn't sync has nowhere to land.
@@ -256,20 +288,21 @@ func (h *SyncHost) importMessage(ctx context.Context, req boardsync.ImportReques
 		return boardsync.ImportResult{}, err
 	}
 	if mapped {
-		return h.importReply(ctx, req, event, mapping)
+		return h.importReply(ctx, req, event, mapping, fileNotes)
 	}
-	return h.importRoot(ctx, req, event)
+	return h.importRoot(ctx, req, event, fileNotes)
 }
 
 // importRoot creates the board root for an external thread. Its idempotency
 // key is the thread, not the event, so a duplicate root delivery replays the
 // same board message instead of creating a second one.
-func (h *SyncHost) importRoot(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
+func (h *SyncHost) importRoot(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, fileNotes []string) (boardsync.ImportResult, error) {
 	text, labels, err := overrideRoot(req, event, event.Text)
 	if err != nil {
 		return boardsync.ImportResult{}, err
 	}
-	attachments := attachmentRefs(event.Files)
+	attachments, notes := h.importFiles(ctx, req, event, fileNotes)
+	text = boardsync.AppendFileNotes(text, notes)
 	links := h.safeLinks(event.Links)
 	origin := originOf(event)
 	from := string(req.Key)
@@ -333,7 +366,7 @@ func (h *SyncHost) importRoot(ctx context.Context, req boardsync.ImportRequest, 
 				}
 			}
 		}
-		return h.importReply(ctx, req, event, mapping)
+		return h.importReply(ctx, req, event, mapping, fileNotes)
 	}
 	targets, err := h.threadTargetsFor(req, event)
 	if err != nil {
@@ -356,7 +389,7 @@ func (h *SyncHost) importRoot(ctx context.Context, req boardsync.ImportRequest, 
 }
 
 // importReply appends one imported reply to an existing board thread.
-func (h *SyncHost) importReply(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, mapping syncstore.Thread) (boardsync.ImportResult, error) {
+func (h *SyncHost) importReply(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, mapping syncstore.Thread, fileNotes []string) (boardsync.ImportResult, error) {
 	root, err := h.rootMessage(ctx, req.Tenant, mapping.BoardThread)
 	if err != nil {
 		return boardsync.ImportResult{}, err
@@ -367,7 +400,8 @@ func (h *SyncHost) importReply(ctx context.Context, req boardsync.ImportRequest,
 		return boardsync.ImportResult{Root: root.ID, Message: root.ID, CreatedRoot: true}, nil
 	}
 	text := overrideText(req, event.Text)
-	attachments := attachmentRefs(event.Files)
+	attachments, notes := h.importFiles(ctx, req, event, fileNotes)
+	text = boardsync.AppendFileNotes(text, notes)
 	links := h.safeLinks(event.Links)
 	origin := originOf(event)
 	from := string(req.Key)
@@ -896,31 +930,211 @@ func keyedSubthread(key boardsync.Key, event boardsync.Event) string {
 	return string(key) + ":" + event.Subthread
 }
 
-// attachmentRefs turns safe platform files into board attachment metadata. No
-// bytes and no URL are stored.
-func attachmentRefs(files []boardsync.File) []protocol.Attachment {
-	if len(files) == 0 {
-		return nil
+// importFiles turns safe platform files into board attachments. A file the
+// adapter can fetch within the byte limit is written to the blob store under a
+// deterministic ID (so a retry reuses it); everything else keeps its metadata
+// and adds a note. A failed fetch never fails the import.
+func (h *SyncHost) importFiles(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, notes []string) ([]protocol.Attachment, []string) {
+	if len(event.Files) == 0 {
+		return nil, notes
 	}
-	out := make([]protocol.Attachment, 0, len(files))
-	for _, file := range files {
-		name := file.Name
-		if name == "" {
-			name = "file"
+	out := make([]protocol.Attachment, 0, len(event.Files))
+	for index, file := range event.Files {
+		id := syncAttachmentID(req.Tenant, req.Key, req.EventID, index, file)
+		placeholder := placeholderAttachment(id, file)
+		if h.blobs == nil || req.Fetcher == nil {
+			// No bytes are kept: the attachment is a metadata placeholder and
+			// the message keeps the file's name and size.
+			out = append(out, placeholder)
+			continue
 		}
-		kind := file.Type
-		if kind == "" {
-			kind = file.MIMEType
+		if file.Size > h.maxFileBytes {
+			notes = append(notes, boardsync.FileNote(file.Name, file.Size,
+				fmt.Sprintf("over the %s file limit", boardsync.HumanBytes(h.maxFileBytes))))
+			out = append(out, placeholder)
+			continue
 		}
-		if kind == "" {
-			kind = "file"
+		if file.URL == "" {
+			// safeFiles already noted a URL it refused; a file the platform
+			// gave no URL for keeps its metadata and needs no second note.
+			out = append(out, placeholder)
+			continue
 		}
-		out = append(out, protocol.Attachment{
-			ID:   "sync:" + boardsync.Hash(kind+"\x00"+name+"\x00"+file.URL),
-			Name: name, Type: kind, Size: file.Size,
+		data, err := h.fetchFile(ctx, req, file)
+		if err != nil {
+			notes = append(notes, boardsync.FileFailureNote(file.Name, file.Size, err))
+			out = append(out, placeholder)
+			continue
+		}
+		if len(data) == 0 {
+			notes = append(notes, boardsync.FileNote(file.Name, 0, "the platform sent no bytes"))
+			out = append(out, placeholder)
+			continue
+		}
+		if int64(len(data)) > h.maxFileBytes {
+			notes = append(notes, boardsync.FileNote(file.Name, int64(len(data)),
+				fmt.Sprintf("over the %s file limit", boardsync.HumanBytes(h.maxFileBytes))))
+			out = append(out, placeholder)
+			continue
+		}
+		record := attachmentRecord{
+			ID: id, Name: protocol.SanitizeFileName(file.Name),
+			Type: protocol.MediaType(file.MIMEType), Size: int64(len(data)),
+			UploadedBy: boardsyncAuthor(event, req.Key).Actor,
+			CreatedAt:  h.now().UTC(),
+		}
+		if err := h.storeAttachment(ctx, req.Tenant, record, data); err != nil {
+			notes = append(notes, boardsync.FileNote(file.Name, int64(len(data)),
+				"this board couldn't store it"))
+			out = append(out, placeholder)
+			continue
+		}
+		out = append(out, record.view())
+	}
+	return out, notes
+}
+
+// fetchFile reads one file with the import's timeout and the board's byte
+// bound. The adapter owns scheme, domain, redirect, and credential checks; it
+// is called only for a URL safeURL already accepted.
+func (h *SyncHost) fetchFile(ctx context.Context, req boardsync.ImportRequest, file boardsync.File) ([]byte, error) {
+	if file.URL == "" {
+		return nil, fmt.Errorf("%w: no safe download URL", boardsync.ErrBadRequest)
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, h.fetchTimeout)
+	defer cancel()
+	data, err := req.Fetcher.FetchFile(fetchCtx, req.Key, file)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// storeAttachment writes a file's bytes and record. A retry of the same inbox
+// event derives the same ID: existing bytes with the same length are reused,
+// and an existing record is the answer.
+func (h *SyncHost) storeAttachment(ctx context.Context, tenant string, record attachmentRecord, data []byte) error {
+	dataKey := attachmentDataKey(tenant, record.ID)
+	size, err := h.blobs.Stat(ctx, dataKey)
+	switch {
+	case err == nil:
+		if size != int64(len(data)) {
+			return fmt.Errorf("server: sync attachment %s changed between retries", record.ID)
+		}
+	case errors.Is(err, blob.ErrNotFound):
+		if putErr := h.blobs.Put(ctx, dataKey, data, record.Type); putErr != nil {
+			// A concurrent import may have written the same deterministic key.
+			stored, statErr := h.blobs.Stat(ctx, dataKey)
+			if statErr != nil || stored != int64(len(data)) {
+				return putErr
+			}
+		}
+	default:
+		return err
+	}
+	if _, err := readAttachmentRecord(ctx, h.blobs, tenant, record.ID); err == nil {
+		return nil
+	} else if !errors.Is(err, blob.ErrNotFound) {
+		return err
+	}
+	_, err = putAttachmentRecord(ctx, h.blobs, tenant, record)
+	return err
+}
+
+// syncAttachmentID derives a stable 22-character attachment ID from the inbox
+// event, the file's position, and its URL. Import is idempotent by event, so a
+// retry must find the same bytes rather than write a second copy.
+func syncAttachmentID(tenant string, key boardsync.Key, eventID string, index int, file boardsync.File) string {
+	identity := fmt.Sprintf("sync-attachment\x00%s\x00%s\x00%s\x00%d\x00%s\x00%s",
+		tenant, key, eventID, index, file.URL, file.Name)
+	for salt := 0; salt < 8; salt++ {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d", identity, salt)))
+		id := base64.RawURLEncoding.EncodeToString(sum[:16])
+		if id[0] != '-' {
+			return id
+		}
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return base64.RawURLEncoding.EncodeToString(sum[:16])
+}
+
+// placeholderAttachment keeps what the board knows about a file it has no
+// bytes for. Its ID is shaped like a real attachment ID so views and receipts
+// stay consistent; a read of the bytes answers not found.
+func placeholderAttachment(id string, file boardsync.File) protocol.Attachment {
+	name := protocol.SanitizeFileName(file.Name)
+	kind := file.Type
+	if kind == "" {
+		kind = file.MIMEType
+	}
+	if kind == "" {
+		kind = "file"
+	}
+	return protocol.Attachment{ID: id, Name: name, Type: kind, Size: file.Size}
+}
+
+// LoadFiles implements boardsync.FileLoader: it reads a board message's
+// attachment bytes for delivery. A missing or oversized file becomes a note,
+// so the message still goes out; a store failure is returned because nothing
+// has been posted yet.
+func (h *SyncHost) LoadFiles(ctx context.Context, tenant string, message boardsync.Message) (boardsync.FileLoadResult, error) {
+	var result boardsync.FileLoadResult
+	if len(message.Attachments) == 0 {
+		return result, nil
+	}
+	if h == nil || h.blobs == nil {
+		for _, attachment := range message.Attachments {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, attachment.Size, "this board kept no file bytes"))
+		}
+		return result, nil
+	}
+	for index, attachment := range message.Attachments {
+		if index >= h.maxFiles {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, attachment.Size,
+				fmt.Sprintf("a message carries at most %d files", h.maxFiles)))
+			continue
+		}
+		if err := protocol.ValidateAttachmentID(attachment.ID); err != nil {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, attachment.Size, "it has no board attachment ID"))
+			continue
+		}
+		if attachment.Size > h.maxFileBytes {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, attachment.Size,
+				fmt.Sprintf("over the %s file limit", boardsync.HumanBytes(h.maxFileBytes))))
+			continue
+		}
+		data, storedType, err := h.blobs.Get(ctx, attachmentDataKey(tenant, attachment.ID))
+		if errors.Is(err, blob.ErrNotFound) {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, attachment.Size, "the file is no longer on this board"))
+			continue
+		}
+		if err != nil {
+			return boardsync.FileLoadResult{}, err
+		}
+		if len(data) == 0 {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, 0, "the file is empty"))
+			continue
+		}
+		if int64(len(data)) > h.maxFileBytes {
+			result.Notes = append(result.Notes, boardsync.FileNote(attachment.Name, int64(len(data)),
+				fmt.Sprintf("over the %s file limit", boardsync.HumanBytes(h.maxFileBytes))))
+			continue
+		}
+		mimeType := attachment.MIMEType
+		if mimeType == "" {
+			mimeType = storedType
+		}
+		if mimeType == "" {
+			mimeType = attachment.Type
+		}
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		result.Files = append(result.Files, boardsync.OutboundFile{
+			Data: data, Filename: protocol.SanitizeFileName(attachment.Name), MIMEType: mimeType,
 		})
 	}
-	return out
+	return result, nil
 }
 
 // sanitizeLabels keeps caller labels the board may store: reserved board.*
@@ -1396,9 +1610,13 @@ func (h *SyncHost) messageFor(tenant string, message *log.Message) (boardsync.Me
 		}
 	}
 	for _, attachment := range message.Attachments {
-		out.Attachments = append(out.Attachments, boardsync.AttachmentRef{
-			Name: attachment.Name, Type: attachment.Type, Size: attachment.Size,
-		})
+		ref := boardsync.AttachmentRef{
+			ID: attachment.ID, Name: attachment.Name, Type: attachment.Type, Size: attachment.Size,
+		}
+		if strings.Contains(attachment.Type, "/") {
+			ref.MIMEType = attachment.Type
+		}
+		out.Attachments = append(out.Attachments, ref)
 	}
 	var actorName string
 	var verified bool

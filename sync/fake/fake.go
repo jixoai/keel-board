@@ -30,6 +30,9 @@ type Provider struct {
 	ReactFunc          func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message, emoji string, added bool) error
 	PermalinkFunc      func(ctx context.Context, key boardsync.Key, event boardsync.Event) (string, error)
 	FetchRootFunc      func(ctx context.Context, key boardsync.Key, thread string) (*boardsync.RootDraft, error)
+	FetchFileFunc      func(ctx context.Context, key boardsync.Key, file boardsync.File) ([]byte, error)
+	UploadFilesFunc    func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, files []boardsync.OutboundFile) ([]string, error)
+	TypingFunc         func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, latest, status string) error
 	LabelsFunc         func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels, before map[string]string) error
 	LocateFunc         func(url string) (thread string, message string, ok bool)
 	URLFunc            func(thread, message string) (string, error)
@@ -42,6 +45,8 @@ type Provider struct {
 	edits     []EditCall
 	deletes   []DeleteCall
 	reactions []ReactCall
+	uploads   []UploadCall
+	typings   []TypingCall
 	labels    []LabelsCall
 	permalink []PermalinkCall
 	starts    []StartCall
@@ -102,6 +107,22 @@ type LabelsCall struct {
 	Thread boardsync.ThreadRef
 	Labels map[string]string
 	Before map[string]string
+}
+
+// UploadCall records one file upload.
+type UploadCall struct {
+	Key    boardsync.Key
+	Thread boardsync.ThreadRef
+	Files  []boardsync.OutboundFile
+	IDs    []string
+}
+
+// TypingCall records one typing status.
+type TypingCall struct {
+	Key    boardsync.Key
+	Thread boardsync.ThreadRef
+	Latest string
+	Status string
 }
 
 // PermalinkCall records one permalink lookup.
@@ -243,6 +264,39 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 	return nil, boardsync.ErrNotFound
 }
 
+// FetchFile implements boardsync.FileFetcher. Without a function it behaves
+// like an adapter that can't fetch: ErrUnsupported, so an import keeps the
+// file's metadata.
+func (p *Provider) FetchFile(ctx context.Context, key boardsync.Key, file boardsync.File) ([]byte, error) {
+	if p.FetchFileFunc != nil {
+		return p.FetchFileFunc(ctx, key, file)
+	}
+	return nil, boardsync.ErrUnsupported
+}
+
+// UploadFiles implements boardsync.FileUploader.
+func (p *Provider) UploadFiles(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, files []boardsync.OutboundFile) ([]string, error) {
+	p.mu.Lock()
+	call := UploadCall{Key: key, Thread: thread, Files: append([]boardsync.OutboundFile(nil), files...)}
+	p.uploads = append(p.uploads, call)
+	p.mu.Unlock()
+	if p.UploadFilesFunc != nil {
+		return p.UploadFilesFunc(ctx, key, thread, files)
+	}
+	return []string{}, nil
+}
+
+// Typing implements boardsync.Typist.
+func (p *Provider) Typing(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, latest, status string) error {
+	p.mu.Lock()
+	p.typings = append(p.typings, TypingCall{Key: key, Thread: thread, Latest: latest, Status: status})
+	p.mu.Unlock()
+	if p.TypingFunc != nil {
+		return p.TypingFunc(ctx, key, thread, latest, status)
+	}
+	return nil
+}
+
 // Locate implements boardsync.Linker.
 func (p *Provider) Locate(url string) (string, string, bool) {
 	if p.LocateFunc != nil {
@@ -313,6 +367,20 @@ func (p *Provider) LabelsCalls() []LabelsCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]LabelsCall(nil), p.labels...)
+}
+
+// Uploads returns recorded file uploads.
+func (p *Provider) Uploads() []UploadCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]UploadCall(nil), p.uploads...)
+}
+
+// Typings returns recorded typing statuses.
+func (p *Provider) Typings() []TypingCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]TypingCall(nil), p.typings...)
 }
 
 // Permalinks returns recorded permalink lookups.
@@ -438,11 +506,14 @@ func Now() time.Time { return time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC) }
 
 // Interface checks.
 var (
-	_ boardsync.Provider    = (*Provider)(nil)
-	_ boardsync.Editor      = (*Provider)(nil)
-	_ boardsync.Deleter     = (*Provider)(nil)
-	_ boardsync.Reactor     = (*Provider)(nil)
-	_ boardsync.Permalinker = (*Provider)(nil)
-	_ boardsync.RootFetcher = (*Provider)(nil)
-	_ boardsync.Linker      = (*Provider)(nil)
+	_ boardsync.Provider     = (*Provider)(nil)
+	_ boardsync.Editor       = (*Provider)(nil)
+	_ boardsync.Deleter      = (*Provider)(nil)
+	_ boardsync.Reactor      = (*Provider)(nil)
+	_ boardsync.Permalinker  = (*Provider)(nil)
+	_ boardsync.RootFetcher  = (*Provider)(nil)
+	_ boardsync.Linker       = (*Provider)(nil)
+	_ boardsync.FileFetcher  = (*Provider)(nil)
+	_ boardsync.FileUploader = (*Provider)(nil)
+	_ boardsync.Typist       = (*Provider)(nil)
 )

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -38,8 +39,11 @@ type OutboundWorkerConfig struct {
 	Keys []boardsync.Key
 	// Renderer, when set, renders labels.changed edits.
 	Renderer boardsync.Renderer
-	Owner    string
-	Limit    int
+	// Files reads a board message's attachment bytes just before a post. Nil
+	// leaves attachments as notes; the message still goes out.
+	Files boardsync.FileLoader
+	Owner string
+	Limit int
 	// PollInterval is how long Run waits after a pass with no work. Zero means
 	// one second.
 	PollInterval time.Duration
@@ -61,11 +65,15 @@ type OutboundWorker struct {
 	tenant   string
 	keys     []boardsync.Key
 	renderer boardsync.Renderer
+	files    boardsync.FileLoader
 	owner    string
 	limit    int
 	poll     time.Duration
 	deferFor time.Duration
 	logger   *slog.Logger
+
+	typingMu  sync.Mutex
+	typingOff map[boardsync.Key]bool
 }
 
 // NewOutboundWorker validates cfg.
@@ -101,8 +109,10 @@ func NewOutboundWorker(cfg OutboundWorkerConfig) (*OutboundWorker, error) {
 	}
 	return &OutboundWorker{
 		store: cfg.Store, registry: cfg.Registry, runner: cfg.Runner, host: cfg.Host,
-		tenant: cfg.Tenant, keys: keys, renderer: cfg.Renderer, owner: leaseOwner(cfg.Owner),
+		tenant: cfg.Tenant, keys: keys, renderer: cfg.Renderer, files: cfg.Files,
+		owner: leaseOwner(cfg.Owner),
 		limit: cfg.Limit, poll: cfg.PollInterval, deferFor: cfg.Defer, logger: cfg.Logger,
+		typingOff: make(map[boardsync.Key]bool),
 	}, nil
 }
 
@@ -270,8 +280,12 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 			}
 		}
 	}
+	if isPostEvent(job.Event.Type) {
+		w.showTyping(ctx, entry, job)
+	}
 	opts := boardsync.OutboundOptions{
 		Renderer: w.renderer,
+		Files:    w.files,
 		CopySink: func(ctx context.Context, req boardsync.CopyRequest) error {
 			saved := copyFromRequest(req)
 			if saved == nil {
@@ -404,6 +418,36 @@ func (w *OutboundWorker) recordSynced(ctx context.Context, job Delivery, copy Co
 		Message: &job.Message, External: &ref, ExternalMessage: copy.ExternalMessage,
 		Files: copy.Files, FilesSet: copy.FilesSet,
 	})
+}
+
+// showTyping asks the platform to show a short-lived status in the thread
+// before a post. It is best-effort: any failure is logged at debug and the
+// message goes out. A platform that answers unsupported is remembered, so the
+// worker doesn't ask again for that key.
+func (w *OutboundWorker) showTyping(ctx context.Context, entry boardsync.Entry, job Delivery) {
+	if job.Target.Kind != boardsync.TargetThread || job.Target.Thread == "" {
+		return
+	}
+	if !entry.Provider.Capabilities().Typing {
+		return
+	}
+	w.typingMu.Lock()
+	disabled := w.typingOff[job.Key]
+	w.typingMu.Unlock()
+	if disabled {
+		return
+	}
+	err := w.runner.Typing(ctx, entry, job.Target.Ref(), "", "")
+	if err == nil {
+		return
+	}
+	if boardsync.IsPermanent(err) {
+		w.typingMu.Lock()
+		w.typingOff[job.Key] = true
+		w.typingMu.Unlock()
+	}
+	w.logger.Debug("sync typing status skipped",
+		"tenant", w.tenant, "key", job.Key, "error", ErrorCode(err))
 }
 
 // recordFailure writes the board receipt an operator sees after the outbox

@@ -32,6 +32,8 @@ type syncFlags struct {
 	// "key=platformChannel".
 	mirrors []string
 	starts  []string
+	// fileHosts is the inbound file and link URL host allowlist.
+	fileHosts []string
 }
 
 // registerSyncFlags adds the sync flags to a serve flag set.
@@ -50,6 +52,10 @@ func registerSyncFlags(flags *flag.FlagSet) *syncFlags {
 	})
 	flags.Func("sync-start", "a platform channel a new board root may start a thread in, key=platformChannel (repeatable; defaults to the mirror channels)", func(value string) error {
 		cfg.starts = append(cfg.starts, value)
+		return nil
+	})
+	flags.Func("sync-file-host", "a host an inbound file or link URL may name (repeatable; empty refuses every URL)", func(value string) error {
+		cfg.fileHosts = append(cfg.fileHosts, value)
 		return nil
 	})
 	return cfg
@@ -366,6 +372,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 		store: store, closeStore: closeStore, registry: registry,
 		tenant: tenant, owned: owned, startChannels: startChannels,
 		bridgeSecrets: bridgeSecrets,
+		fileHosts:     append([]string(nil), flags.fileHosts...),
 	}, nil
 }
 
@@ -378,6 +385,7 @@ type serverSyncRuntime struct {
 	owned         []server.SyncKey
 	startChannels map[server.SyncKey][]string
 	bridgeSecrets map[boardsync.Key]boardsync.Secret
+	fileHosts     []string
 }
 
 // startSyncWorkers runs one inbound and one outbound worker per owned key and
@@ -426,7 +434,7 @@ func startSyncWorkers(ctx context.Context, logger *slog.Logger, runtime *serverS
 		outbound, err := syncstore.NewOutboundWorker(syncstore.OutboundWorkerConfig{
 			Store: runtime.store, Registry: runtime.registry, Runner: runner, Host: host,
 			Tenant: owned.Tenant, Keys: []boardsync.Key{owned.Key},
-			Owner: "board-outbound-" + string(owned.Key), Logger: logger,
+			Files: boardsync.FileLoader(host.LoadFiles), Owner: "board-outbound-" + string(owned.Key), Logger: logger,
 		})
 		if err != nil {
 			cleanup()
