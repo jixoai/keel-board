@@ -193,12 +193,16 @@ func (b *Board) Rebuild(ctx context.Context, tenantName string) (ProjectionRepor
 		ctx = context.Background()
 	}
 	// Report every completed attempt (successful or not) after the board lock
-	// the function may hold is released: the deferred unlock runs first.
+	// the function may hold is released: the deferred unlock runs first. A
+	// panicking observer is recovered; instrumentation never fails a rebuild.
 	started := time.Now()
 	defer func() {
-		if pointer := b.observer.Load(); pointer != nil {
-			(*pointer).Rebuilt(time.Since(started))
+		pointer := b.observer.Load()
+		if pointer == nil {
+			return
 		}
+		defer func() { _ = recover() }()
+		(*pointer).Rebuilt(time.Since(started))
 	}()
 	ctx, cancel := context.WithTimeout(ctx, projectionRebuildTimeout)
 	defer cancel()

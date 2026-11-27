@@ -671,17 +671,19 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The outbox is tenant-wide in the store's contract; a store that can
-	// break it down by key exports the per-key series. A store that can't
-	// leaves the outbox series unset rather than repeating one total under
-	// every key.
+	// break it down by key exports the per-key series. A store that can't, or
+	// that fails this optional read, leaves the outbox series unchanged rather
+	// than failing the status request: the answer's tenant-wide depth is
+	// already in hand.
 	if byKey, ok := s.sync.store.(syncstore.KeyOutboxDepth); ok {
 		depths, err := byKey.OutboxDepthByKey(req.ctx, req.tenant)
 		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		for key, depth := range depths {
-			s.observeOutboxDepth(key, depth)
+			s.logger.Warn("sync outbox depth by key failed; leaving depth metrics unchanged",
+				"tenant", req.tenant, "error", syncstore.ErrorCode(err))
+		} else {
+			for key, depth := range depths {
+				s.observeOutboxDepth(key, depth)
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, status)
@@ -791,9 +793,13 @@ func (s *Server) handleSyncRetryInbox(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	detail := map[string]any{}
+	if audit.SafeToken(id) {
+		detail["event"] = id
+	}
 	s.recordAudit(req.ctx, audit.Event{
 		Tenant: req.tenant, Kind: audit.KindInboxRetry, Key: string(key),
-		Status: audit.StatusRetried, Detail: map[string]any{"event": id},
+		Status: audit.StatusRetried, Detail: detail,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"retried": true})
 }
@@ -821,10 +827,14 @@ func (s *Server) handleSyncRetryOutbox(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	s.recordAudit(req.ctx, audit.Event{
+	event := audit.Event{
 		Tenant: req.tenant, Kind: audit.KindOutboxRetry,
-		DeliveryID: id, Status: audit.StatusRetried,
-	})
+		Status: audit.StatusRetried,
+	}
+	if audit.SafeDeliveryID(id) {
+		event.DeliveryID = id
+	}
+	s.recordAudit(req.ctx, event)
 	writeJSON(w, http.StatusOK, map[string]any{"retried": true})
 }
 

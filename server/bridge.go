@@ -14,6 +14,18 @@ import (
 // timestamp+nonce+body), the board claims the nonce durably, validates the
 // normalized batch, and stores it before answering. It never reads a platform
 // secret and never calls a URL named by the payload.
+//
+// Metric labels follow one rule: the path's key becomes a label only after the
+// entry belongs to the tenant and is registered in this process. Before that,
+// every failure lands on the fixed "unknown" series, so an unauthenticated
+// caller can't mint label values. Durable audit is narrower still: only a
+// verified request's failure is audited, and a key may add at most
+// auditFailureBurst rows per window (the request counter still counts every
+// attempt). A disabled entry answers 200 with no metric and no audit, matching
+// the webhook path's silent acknowledgement: a probe cannot tell it from an
+// absent connection. (The webhook path does count its pre-auth probes because
+// it has a request-duration metric; the bridge has no request metric, so a
+// disabled entry is deliberately uncounted here.)
 func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -22,57 +34,60 @@ func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	tenant, err := s.tenant(r)
 	if err != nil {
-		s.telemetry.bridgeRejected("", "", "", "tenant_refused", http.StatusUnauthorized)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		s.logger.Warn("sync bridge tenant refused", "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusUnauthorized)
 		return
 	}
 	if !boardsync.ValidTenant(tenant) {
-		s.telemetry.bridgeRejected(tenant, "", "", "invalid_tenant", http.StatusInternalServerError)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		s.logger.Warn("sync bridge tenant is not usable")
 		writeBridgeStatus(w, http.StatusInternalServerError)
 		return
 	}
 	key, ok := bridgeKey(r)
 	if !ok {
-		s.telemetry.bridgeRejected(tenant, "", "", "unknown_key", http.StatusNotFound)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		writeBridgeStatus(w, http.StatusNotFound)
 		return
 	}
 	entry, found, err := s.store.Entry(r.Context(), tenant, key)
 	if err != nil {
-		s.telemetry.bridgeRejected(tenant, key, "", "failed", http.StatusInternalServerError)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		s.logger.Error("sync bridge entry lookup failed", "tenant", tenant, "key", key, "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusInternalServerError)
 		return
 	}
 	if !found {
-		s.telemetry.bridgeRejected(tenant, key, "", "unknown_key", http.StatusNotFound)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		writeBridgeStatus(w, http.StatusNotFound)
 		return
 	}
 	if !entry.Enabled {
-		// A disabled entry is accepted without reading the body so the
-		// sidecar stops retrying a connection the operator switched off.
+		// Silent 200: the sidecar stops retrying a connection the operator
+		// switched off, and a probe learns nothing. No metric, no audit.
 		writeBridgeStatus(w, http.StatusOK)
 		return
 	}
 	registered, ok := s.registry.Get(tenant, key)
 	if !ok {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "unregistered", http.StatusServiceUnavailable)
+		s.telemetry.bridgeFailed(metricUnknownKey)
 		s.logger.Warn("sync bridge entry is not registered", "tenant", tenant, "key", key)
 		writeBridgeStatus(w, http.StatusServiceUnavailable)
 		return
 	}
+	// The tenant owns this enabled connection and this process serves it: the
+	// key is configuration, not attacker text, so it may label a series.
+	metricKey := string(key)
 	if registered.Platform != entry.Platform || registered.Provider.Platform() != entry.Platform {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "platform_mismatch", http.StatusInternalServerError)
+		s.telemetry.bridgeFailed(metricKey)
 		s.logger.Error("sync bridge platform mismatch", "tenant", tenant, "key", key,
 			"entryPlatform", entry.Platform, "providerPlatform", registered.Provider.Platform())
 		writeBridgeStatus(w, http.StatusInternalServerError)
 		return
 	}
 	if s.bridgeSecret == nil {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "missing_secret", http.StatusServiceUnavailable)
+		s.telemetry.bridgeFailed(metricKey)
 		s.logger.Error("sync bridge secret resolver is not configured", "tenant", tenant, "key", key)
 		writeBridgeStatus(w, http.StatusServiceUnavailable)
 		return
@@ -80,28 +95,31 @@ func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 	secret, ok := s.bridgeSecret(tenant, key)
 	if !ok || secret.Empty() {
 		// Fail closed: an entry without a secret must not accept events.
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "missing_secret", http.StatusServiceUnavailable)
+		s.telemetry.bridgeFailed(metricKey)
 		s.logger.Error("sync bridge secret is missing", "tenant", tenant, "key", key)
 		writeBridgeStatus(w, http.StatusServiceUnavailable)
 		return
 	}
 	request, err := boardsync.NewWebhookRequest(r, chatsdk.MaxBodyBytes)
 	if err != nil {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "too_large", http.StatusRequestEntityTooLarge)
+		s.telemetry.bridgeFailed(metricKey)
 		writeBridgeStatus(w, http.StatusRequestEntityTooLarge)
 		return
 	}
 	if err := chatsdk.VerifyRequestV1(secret, request.Header, request.Body, time.Now(), chatsdk.DefaultWindow); err != nil {
 		// The error text intentionally stays out of the log: it could quote a
-		// header. The status is the diagnosis.
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "signature", http.StatusUnauthorized)
+		// header. The status is the diagnosis. A refused signature is durable
+		// audit material, bounded per key.
+		s.telemetry.bridgeFailed(metricKey)
+		s.telemetry.bridgeAudit(tenant, key, entry.Platform, "signature", http.StatusUnauthorized)
 		s.logger.Warn("sync bridge event signature refused", "tenant", tenant, "key", key, "status", http.StatusUnauthorized)
 		writeBridgeStatus(w, http.StatusUnauthorized)
 		return
 	}
 	records, err := chatsdk.DecodeInbound(request.Body, key, entry.Platform)
 	if err != nil {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "bad_request", http.StatusBadRequest)
+		s.telemetry.bridgeFailed(metricKey)
+		s.telemetry.bridgeAudit(tenant, key, entry.Platform, "bad_request", http.StatusBadRequest)
 		s.logger.Warn("sync bridge batch refused", "tenant", tenant, "key", key, "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusBadRequest)
 		return
@@ -112,13 +130,15 @@ func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 	// outlive its nonce while its timestamp is still accepted.
 	claimed, err := s.store.ClaimNonce(r.Context(), tenant, key, nonce, 2*chatsdk.DefaultWindow)
 	if err != nil {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "failed", http.StatusInternalServerError)
+		s.telemetry.bridgeFailed(metricKey)
+		s.telemetry.bridgeAudit(tenant, key, entry.Platform, "failed", http.StatusInternalServerError)
 		s.logger.Error("sync bridge nonce claim failed", "tenant", tenant, "key", key, "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusInternalServerError)
 		return
 	}
 	if !claimed {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "replay", http.StatusConflict)
+		s.telemetry.bridgeFailed(metricKey)
+		s.telemetry.bridgeAudit(tenant, key, entry.Platform, "replay", http.StatusConflict)
 		s.logger.Warn("sync bridge nonce replayed", "tenant", tenant, "key", key, "status", http.StatusConflict)
 		writeBridgeStatus(w, http.StatusConflict)
 		return
@@ -133,7 +153,8 @@ func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	stored, err := s.registry.StoreRecords(r.Context(), tenant, key, records, syncstore.StoreGate{Store: s.store}, inbox)
 	if err != nil {
-		s.telemetry.bridgeRejected(tenant, key, entry.Platform, "failed", http.StatusInternalServerError)
+		s.telemetry.bridgeFailed(metricKey)
+		s.telemetry.bridgeAudit(tenant, key, entry.Platform, "failed", http.StatusInternalServerError)
 		s.logger.Error("sync bridge store failed", "tenant", tenant, "key", key, "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusInternalServerError)
 		return

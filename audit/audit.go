@@ -12,9 +12,17 @@
 // The board log (board_events) stays the domain audit: who changed what is a
 // fact there. This package is the operational trace beside it.
 //
+// Phase 0 writes: webhook acceptance and refusal, bridge failures, inbox and
+// outbox dead letters, and manual inbox/outbox retries. Per-attempt outbound
+// success and inbound-processed rows are deliberately not written: the board
+// log's message.synced/message.sync_failed receipts carry the delivery trace,
+// and per-attempt rows would grow with every delivery. Those remain a Phase 1
+// decision, not a claim this table makes.
+//
 // PostgreSQL rows are tenant-scoped twice: every statement filters tenant_id
 // and every transaction sets keel.tenant_id, which the table's FORCE RLS policy
-// checks. A transaction that loses its tenant setting sees nothing.
+// checks. A transaction that loses its tenant setting sees nothing. There is no
+// bypass setting on this table: the audit never needs a cross-tenant read.
 package audit
 
 import (
@@ -57,8 +65,9 @@ const (
 // maxDetailEntries bounds one row's detail object.
 const maxDetailEntries = 16
 
-// maxDetailString bounds one detail value.
-const maxDetailString = 256
+// maxDetailToken bounds one detail string value. A detail value is a token or
+// a closed code, never a sentence or a body.
+const maxDetailToken = 128
 
 // Event is one audit fact. Tenant scopes the row and is not exposed by the
 // read API; At is zero for "now".
@@ -163,18 +172,47 @@ func validToken(value string, max int) bool {
 	return true
 }
 
-// validTarget bounds an external target such as "slack:C123:T456". A target is
-// a platform identifier, never a body: control characters refuse it.
+// validTarget bounds an external target such as "slack:C123:T456" or
+// "github:acme/web#12". A target is a platform identifier: a whitespace or quote
+// makes it a body or a header, and it is refused.
 func validTarget(target string) bool {
-	if len(target) > 512 || !utf8.ValidString(target) {
+	return validBoundedToken(target, 512)
+}
+
+// validBoundedToken accepts an identifier-like token: letters, digits, '.', '_',
+// '-', ':', '/', '#' and '@', with at least one letter or digit. Whitespace,
+// quotes, '=', and anything that could be free text are refused. It is the
+// shape of a platform ID, a delivery ID, an error code, or a target.
+func validBoundedToken(value string, max int) bool {
+	if value == "" || len(value) > max || !utf8.ValidString(value) {
 		return false
 	}
-	for _, r := range target {
-		if r == 0 || r < 0x20 || r == 0x7f {
+	alnum := false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			alnum = true
+		case c == '.', c == '_', c == '-', c == ':', c == '/', c == '#', c == '@':
+		default:
 			return false
 		}
 	}
-	return true
+	return alnum
+}
+
+// SafeToken reports whether value has the bounded shape a detail string
+// accepts. A writer whose value comes from an external system uses it to omit
+// the field rather than have the whole row refused.
+func SafeToken(value string) bool {
+	return validBoundedToken(value, maxDetailToken)
+}
+
+// SafeDeliveryID reports whether value has the bounded shape the DeliveryID
+// field accepts. A delivery ID must start with a letter, so a numeric message
+// ID can never stand in for one.
+func SafeDeliveryID(value string) bool {
+	return validToken(value, 200)
 }
 
 func validDetailKey(key string) bool {
@@ -200,15 +238,16 @@ func validDetailKey(key string) bool {
 	return true
 }
 
-// validDetailValue accepts only bounded scalars: a short token-ish string, an
-// integer in a sane range, or a bool. Maps, slices, and long strings are
-// refused, so a caller can't smuggle a payload or a secret into detail.
+// validDetailValue accepts only bounded scalars: a short token or closed code,
+// an integer in a sane range, or a bool. Maps, slices, sentences, and long
+// strings are refused, so a caller can't smuggle a payload, a body, or a
+// secret into detail.
 func validDetailValue(value any) bool {
 	switch typed := value.(type) {
 	case nil:
 		return true
 	case string:
-		return len(typed) <= maxDetailString && !hasControl(typed)
+		return validBoundedToken(typed, maxDetailToken)
 	case bool:
 		return true
 	case int:
@@ -225,18 +264,6 @@ func validDetailValue(value any) bool {
 	default:
 		return false
 	}
-}
-
-func hasControl(value string) bool {
-	if !utf8.ValidString(value) {
-		return true
-	}
-	for _, r := range value {
-		if r == 0 || r < 0x20 || r == 0x7f {
-			return true
-		}
-	}
-	return false
 }
 
 // prepare normalizes an event before it is stored: fills the time, copies the

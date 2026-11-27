@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 	boardsync "github.com/jixoai/keel-board/sync"
+	"github.com/jixoai/keel-board/syncstore"
 )
 
 // metricsAt fetches GET /metrics from a harness base URL and returns the body.
@@ -167,7 +169,15 @@ func TestLeaseExpiryMetrics(t *testing.T) {
 func TestSyncMetricsAndAudit(t *testing.T) {
 	registry := metrics.NewRegistry()
 	auditStore := audit.NewMemory()
-	h := newSyncHarness(t, syncHarnessOptions{mirrorChannels: true, metrics: registry, audit: auditStore})
+	h := newSyncHarness(t, syncHarnessOptions{
+		mirrorChannels: true, metrics: registry, audit: auditStore,
+		bridgeSecret: func(tenant string, key boardsync.Key) (boardsync.Secret, bool) {
+			if tenant == "t1" && key == "slack" {
+				return "smoke-secret", true
+			}
+			return "", false
+		},
+	})
 	event := syncEvent("m1", "C0123:1727.9")
 	h.provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
 		return boardsync.Intake{
@@ -198,11 +208,11 @@ func TestSyncMetricsAndAudit(t *testing.T) {
 	waitForMetricAt(t, h.http.URL, `board_sync_dedupe_hits_total{key="slack"} 1`)
 	waitForMetricAt(t, h.http.URL, `board_sync_webhook_duration_ms_count{key="slack",platform="slack"} 2`)
 
-	// A bridge request with no configured secret fails closed; that is a
-	// counted bridge error and an audit row.
+	// An unsigned bridge request is refused after the entry and registration
+	// are confirmed: a counted bridge error and one durable audit row.
 	status, _ = h.request(http.MethodPost, server.APIPrefix+"/sync/bridge/slack/events", map[string]any{}, nil)
-	if status != http.StatusServiceUnavailable {
-		t.Fatalf("bridge without a secret = %d, want 503", status)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("unsigned bridge = %d, want 401", status)
 	}
 	waitForMetricAt(t, h.http.URL, `board_sync_bridge_errors_total{key="slack"} 1`)
 
@@ -313,11 +323,249 @@ func (failingAudit) Recent(context.Context, string, int) ([]audit.Event, error) 
 	return nil, errors.New("audit is down")
 }
 
-func TestAuditFailureDoesNotChangeTheRequest(t *testing.T) {
-	h := newHarness(t, server.Options{Audit: failingAudit{}})
-	status, data := h.request(http.MethodPost, "/channels", map[string]any{"path": "work"}, "", "", nil)
-	h.expect(status, data, http.StatusCreated)
-	status, data = h.request(http.MethodPost, "/messages", map[string]any{"channel": "work", "text": "still lands"},
-		"", "", nil)
-	h.expect(status, data, http.StatusCreated)
+// TestAuditFailureDoesNotChangeAResolvedRequest proves an audit outage cannot
+// fail an accepted webhook or a manual retry whose store change committed.
+func TestAuditFailureDoesNotChangeAResolvedRequest(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{
+		mirrorChannels: true, metrics: metrics.NewRegistry(), audit: failingAudit{},
+	})
+	event := syncEvent("m1", "C_UNROUTED:1727.9")
+	event.Channel = "C_UNROUTED"
+	h.provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+		return boardsync.Intake{
+			Records:  []boardsync.Record{{Dedupe: "d1", Event: event}},
+			Response: boardsync.OK(),
+		}, nil
+	}
+	status, body := h.request(http.MethodPost, "/webhooks/slack", map[string]any{"event": "message"}, nil)
+	if status != http.StatusOK {
+		t.Fatalf("accepted webhook with a failing audit = %d %s", status, body)
+	}
+	depth, err := h.store.InboxDepth(t.Context(), "t1", "slack")
+	if err != nil || depth.Pending != 0 {
+		t.Fatalf("an unrouted record should store nothing: %+v, %v", depth, err)
+	}
+
+	// A dead letter can still be retried when the audit write fails.
+	if _, err := h.store.PushInbox(t.Context(), "t1", "slack",
+		[]boardsync.Record{{Dedupe: "dead-1", Event: syncEvent("m2", "C0123:1728.1")}}); err != nil {
+		t.Fatalf("push dead candidate: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		items, err := h.store.LeaseInbox(t.Context(), "t1", "slack", 10, "test")
+		if err != nil {
+			t.Fatalf("lease %d: %v", attempt, err)
+		}
+		found := false
+		for _, item := range items {
+			if item.ID != "m2" {
+				continue
+			}
+			found = true
+			if _, err := h.store.AckInbox(t.Context(), "t1", "slack", item.ID, item.Lease, errors.New("import failed")); err != nil {
+				t.Fatalf("ack %d: %v", attempt, err)
+			}
+		}
+		if !found {
+			t.Fatalf("lease %d didn't return the dead candidate: %+v", attempt, items)
+		}
+	}
+	dead, err := h.store.DeadInbox(t.Context(), "t1", "slack", 10)
+	if err != nil || len(dead) != 1 {
+		t.Fatalf("dead rows = %+v, %v", dead, err)
+	}
+	status, body = h.request(http.MethodPost, server.APIPrefix+"/sync/inbox/m2/retry?key=slack", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("retry with a failing audit = %d %s", status, body)
+	}
+	depth, err = h.store.InboxDepth(t.Context(), "t1", "slack")
+	if err != nil || depth.Dead != 0 || depth.Pending != 1 {
+		t.Fatalf("retry didn't reach the store: %+v, %v", depth, err)
+	}
+}
+
+// TestBridgeUnknownKeysNeverBecomeLabels proves an unauthenticated bridge
+// caller can't mint metric labels: unknown keys land on one fixed series, and
+// only a configured, registered connection contributes its own key.
+func TestBridgeUnknownKeysNeverBecomeLabels(t *testing.T) {
+	registry := metrics.NewRegistry()
+	auditStore := audit.NewMemory()
+	h := newSyncHarness(t, syncHarnessOptions{mirrorChannels: true, metrics: registry, audit: auditStore})
+	attackers := []string{"attacker-one", "attacker-two", "attacker-three"}
+	for _, key := range attackers {
+		status, _ := h.request(http.MethodPost, server.APIPrefix+"/sync/bridge/"+key+"/events",
+			map[string]any{}, nil)
+		if status != http.StatusNotFound {
+			t.Fatalf("unknown bridge key %q = %d, want 404", key, status)
+		}
+	}
+	text := metricsAt(t, h.http.URL)
+	for _, key := range attackers {
+		if strings.Contains(text, `key="`+key+`"`) {
+			t.Fatalf("an unauthenticated key became a label:\n%s", text)
+		}
+	}
+	if !strings.Contains(text, `board_sync_bridge_errors_total{key="unknown"} 3`) {
+		t.Fatalf("unknown bridge keys weren't counted on the fixed series:\n%s", text)
+	}
+	rows, err := auditStore.Recent(t.Context(), "t1", 100)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("unauthenticated bridge probes wrote audit rows: %+v, %v", rows, err)
+	}
+
+	// A configured, registered key does contribute its own series (the harness
+	// has no bridge secret, so the request fails closed after resolution).
+	status, _ := h.request(http.MethodPost, server.APIPrefix+"/sync/bridge/slack/events", map[string]any{}, nil)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("known key without a secret = %d, want 503", status)
+	}
+	waitForMetricAt(t, h.http.URL, `board_sync_bridge_errors_total{key="slack"} 1`)
+	rows, err = auditStore.Recent(t.Context(), "t1", 100)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("a pre-signature failure wrote an audit row: %+v, %v", rows, err)
+	}
+}
+
+// TestUnauthenticatedRequestsProduceBoundedAudit proves a flood of
+// unauthenticated requests grows board_audit only within the per-key bound:
+// pre-authentication probes never write, and verified failures are capped.
+func TestUnauthenticatedRequestsProduceBoundedAudit(t *testing.T) {
+	const attempts = 60
+	const perKeyLimit = 10
+
+	t.Run("webhook", func(t *testing.T) {
+		registry := metrics.NewRegistry()
+		auditStore := audit.NewMemory()
+		h := newSyncHarness(t, syncHarnessOptions{mirrorChannels: true, metrics: registry, audit: auditStore})
+		h.provider.ReceiveFunc = func(context.Context, boardsync.Key, *boardsync.WebhookRequest) (boardsync.Intake, error) {
+			return boardsync.Intake{}, boardsync.ErrUnauthorized
+		}
+		for i := 0; i < attempts; i++ {
+			status, _ := h.request(http.MethodPost, "/webhooks/slack", map[string]any{}, nil)
+			if status != http.StatusUnauthorized {
+				t.Fatalf("rejected webhook %d = %d, want 401", i, status)
+			}
+		}
+		rows, err := auditStore.Recent(t.Context(), "t1", 500)
+		if err != nil {
+			t.Fatalf("audit recent: %v", err)
+		}
+		if len(rows) != perKeyLimit {
+			t.Fatalf("verified-failure audit rows = %d, want the per-key bound %d", len(rows), perKeyLimit)
+		}
+		waitForMetricAt(t, h.http.URL,
+			fmt.Sprintf(`board_sync_webhook_duration_ms_count{key="slack",platform="slack"} %d`, attempts))
+
+		// Unknown keys are pre-auth probes: counted on the fixed series, never
+		// durable.
+		for i := 0; i < 20; i++ {
+			status, _ := h.request(http.MethodPost, "/webhooks/attacker-"+string(rune('a'+i%26)), map[string]any{}, nil)
+			if status != http.StatusOK {
+				t.Fatalf("unknown webhook key = %d, want 200", status)
+			}
+		}
+		rows, err = auditStore.Recent(t.Context(), "t1", 500)
+		if err != nil || len(rows) != perKeyLimit {
+			t.Fatalf("unknown webhook probes grew the audit: %d rows, %v", len(rows), err)
+		}
+		// A disabled entry is a pre-auth outcome too: 200, counted on the
+		// fixed series, never durable.
+		if _, err := h.store.SetEntryEnabled(t.Context(), "t1", "slack", false); err != nil {
+			t.Fatalf("disable entry: %v", err)
+		}
+		for i := 0; i < 20; i++ {
+			status, _ := h.request(http.MethodPost, "/webhooks/slack", map[string]any{}, nil)
+			if status != http.StatusOK {
+				t.Fatalf("disabled webhook = %d, want 200", status)
+			}
+		}
+		rows, err = auditStore.Recent(t.Context(), "t1", 500)
+		if err != nil || len(rows) != perKeyLimit {
+			t.Fatalf("disabled webhook probes grew the audit: %d rows, %v", len(rows), err)
+		}
+		text := metricsAt(t, h.http.URL)
+		if !strings.Contains(text, `board_sync_webhook_duration_ms_count{key="unknown",platform="unknown"} 40`) {
+			t.Fatalf("pre-auth webhook probes weren't counted on the fixed series:\n%s", text)
+		}
+		if strings.Contains(text, `key="attacker-`) {
+			t.Fatalf("an unauthenticated webhook key became a label:\n%s", text)
+		}
+	})
+
+	t.Run("bridge", func(t *testing.T) {
+		registry := metrics.NewRegistry()
+		auditStore := audit.NewMemory()
+		h := newSyncHarness(t, syncHarnessOptions{
+			mirrorChannels: true, metrics: registry, audit: auditStore,
+			bridgeSecret: func(tenant string, key boardsync.Key) (boardsync.Secret, bool) {
+				return "smoke-secret", tenant == "t1" && key == "slack"
+			},
+		})
+		for i := 0; i < attempts; i++ {
+			status, _ := h.request(http.MethodPost, server.APIPrefix+"/sync/bridge/slack/events",
+				map[string]any{}, nil)
+			if status != http.StatusUnauthorized {
+				t.Fatalf("unsigned bridge %d = %d, want 401", i, status)
+			}
+		}
+		rows, err := auditStore.Recent(t.Context(), "t1", 500)
+		if err != nil {
+			t.Fatalf("audit recent: %v", err)
+		}
+		if len(rows) != perKeyLimit {
+			t.Fatalf("verified bridge-failure audit rows = %d, want the per-key bound %d", len(rows), perKeyLimit)
+		}
+		waitForMetricAt(t, h.http.URL,
+			fmt.Sprintf(`board_sync_bridge_errors_total{key="slack"} %d`, attempts))
+		// A disabled entry is a silent 200: no metric, no audit.
+		if _, err := h.store.SetEntryEnabled(t.Context(), "t1", "slack", false); err != nil {
+			t.Fatalf("disable entry: %v", err)
+		}
+		for i := 0; i < 20; i++ {
+			status, _ := h.request(http.MethodPost, server.APIPrefix+"/sync/bridge/slack/events",
+				map[string]any{}, nil)
+			if status != http.StatusOK {
+				t.Fatalf("disabled bridge = %d, want 200", status)
+			}
+		}
+		text := metricsAt(t, h.http.URL)
+		if !strings.Contains(text, fmt.Sprintf(`board_sync_bridge_errors_total{key="slack"} %d`, attempts)) {
+			t.Fatalf("disabled bridge attempts were counted as errors:\n%s", text)
+		}
+		rows, err = auditStore.Recent(t.Context(), "t1", 500)
+		if err != nil || len(rows) != perKeyLimit {
+			t.Fatalf("disabled bridge probes grew the audit: %d rows, %v", len(rows), err)
+		}
+	})
+}
+
+// failingDepthStore reports the optional per-key outbox depth as unavailable.
+type failingDepthStore struct{ *syncstore.Memory }
+
+func (failingDepthStore) OutboxDepthByKey(context.Context, string) (map[boardsync.Key]syncstore.OutboxDepth, error) {
+	return nil, errors.New("depth read failed")
+}
+
+// TestSyncStatusSurvivesOptionalDepthFailure proves the per-key metric read is
+// best-effort: the status answer still carries the tenant-wide depth.
+func TestSyncStatusSurvivesOptionalDepthFailure(t *testing.T) {
+	registry := metrics.NewRegistry()
+	h := newSyncHarness(t, syncHarnessOptions{
+		mirrorChannels: true, metrics: registry,
+		wrapStore: func(store syncstore.Store) syncstore.Store {
+			return failingDepthStore{store.(*syncstore.Memory)}
+		},
+	})
+	status, body := h.request(http.MethodGet, server.APIPrefix+"/sync/status", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("sync status with a failing optional depth = %d %s", status, body)
+	}
+	var view struct {
+		Outbox struct {
+			Pending int `json:"pending"`
+		} `json:"outbox"`
+	}
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatalf("decode status: %v (%s)", err, body)
+	}
 }

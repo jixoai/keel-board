@@ -101,6 +101,7 @@ type webhookState struct {
 	status   int
 	added    int
 	skipped  int
+	verified bool
 }
 
 // ServeHTTP implements http.Handler.
@@ -148,7 +149,8 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// A key this tenant doesn't own, and one it deliberately disabled, are
 		// both accepted without reading the body or storing anything. The
 		// platform stops retrying, and a caller can't probe which connections
-		// exist.
+		// exist. This is a pre-auth outcome: the observer counts it but never
+		// writes a durable audit row for it.
 		state.outcome, state.status = WebhookUnknownKey, http.StatusOK
 		if found {
 			state.outcome = WebhookDisabled
@@ -197,6 +199,9 @@ func (h *WebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.observer.WebhookDeduped(tenant, key, push.Skipped)
 		}
 	})
+	// From here the provider verifies the request. Only this half's result is
+	// durable-audit material; everything above is a pre-auth probe.
+	state.verified = true
 	response, err := h.registry.HandleWebhook(r.Context(), tenant, key, request, gate, inbox)
 	if err != nil {
 		status := response.Status
@@ -232,7 +237,7 @@ func (h *WebhookHandler) observe(state webhookState, started time.Time) {
 	}
 	h.observer.WebhookHandled(WebhookObservation{
 		Tenant: state.tenant, Key: state.key, Platform: state.platform,
-		Outcome: state.outcome, Status: state.status,
+		Outcome: state.outcome, Verified: state.verified, Status: state.status,
 		Added: state.added, Skipped: state.skipped,
 		Took: time.Since(started),
 	})

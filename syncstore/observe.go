@@ -42,6 +42,12 @@ type WebhookObservation struct {
 	Key      boardsync.Key
 	Platform boardsync.Platform
 	Outcome  WebhookOutcome
+	// Verified is true when the request reached the provider's verification
+	// (Registry.HandleWebhook). Only a verified result is durable-audit
+	// material: an unverified probe (an unknown key, a disabled entry, an
+	// unregistered process, an oversized body) is counted by metrics and must
+	// never grow the audit table.
+	Verified bool
 	// Status is the HTTP status the handler answered.
 	Status int
 	// Added and Skipped are what the inbox push did, when it ran.

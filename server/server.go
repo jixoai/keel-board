@@ -86,6 +86,10 @@ type Options struct {
 	// refusal, dead letters, retries, bridge failures). Nil answers the admin
 	// audit route with 501 and records nothing.
 	Audit audit.Store
+	// AuditTimeout bounds one operational-audit write. A request or worker
+	// blocks on an audit write at most this long; a timeout is logged and never
+	// changes the result. Default: one second.
+	AuditTimeout time.Duration
 }
 
 // New returns a server. It panics if no board is given: a server without a
@@ -112,6 +116,9 @@ func New(opts Options) *Server {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.AuditTimeout <= 0 {
+		opts.AuditTimeout = auditWriteTimeout
+	}
 	server := &Server{
 		board:     opts.Board,
 		authorize: opts.Authorize,
@@ -129,9 +136,12 @@ func New(opts Options) *Server {
 		server.counters = metrics.NewBoardMetrics(opts.Metrics)
 		// The board may be built outside the server; installing the observer
 		// here is the one wiring point a deployment needs.
-		opts.Board.SetObserver(newBoardObserver(server.counters))
+		opts.Board.SetObserver(newBoardObserver(server.counters, opts.Logger))
 	}
-	server.telemetry = &syncTelemetry{metrics: server.counters, audit: opts.Audit, logger: opts.Logger}
+	server.telemetry = &syncTelemetry{
+		metrics: server.counters, audit: opts.Audit,
+		logger: opts.Logger, timeout: opts.AuditTimeout,
+	}
 	if opts.Sync != nil {
 		if opts.Sync.Logger == nil {
 			opts.Sync.Logger = opts.Logger

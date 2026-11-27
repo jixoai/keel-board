@@ -327,7 +327,9 @@ func (b *Board) Update(ctx context.Context, tenantName string, opts UpdateOption
 }
 
 // notifyAppended hands one committed observation to the observer, outside the
-// board lock. It is silent when nothing landed or no observer is set.
+// board lock. It is silent when nothing landed or no observer is set. An
+// observer panic is recovered: instrumentation must never undo a committed
+// write.
 func (b *Board) notifyAppended(observed *appendObservation, took time.Duration) {
 	if observed == nil {
 		return
@@ -336,6 +338,7 @@ func (b *Board) notifyAppended(observed *appendObservation, took time.Duration) 
 	if pointer == nil {
 		return
 	}
+	defer func() { _ = recover() }()
 	(*pointer).Appended(observed.tenant, observed.kinds, observed.liveClaims, took)
 }
 
@@ -501,6 +504,12 @@ func (b *Board) update(ctx context.Context, tenantName string, current *tenant, 
 // liveClaims counts the tasks whose claim is still live at now. A claimed task
 // whose lease has run out is not counted: its expiry is a write a request will
 // fold in (or the optional sweeper will), not a live claim.
+//
+// The scan is O(tasks) and runs at most once per committed append while the
+// board lock is held. Board writes are claim/complete/log-rate (the design's
+// target is under 100 writes/s per tenant) and a board's task count is small;
+// BenchmarkLiveClaims records the cost. If that stops holding, this becomes an
+// incremental count in the task fold.
 func liveClaims(state *State, now time.Time) int {
 	count := 0
 	for _, message := range state.Messages {

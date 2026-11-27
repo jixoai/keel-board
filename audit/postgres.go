@@ -30,8 +30,9 @@ type Postgres struct {
 	pool *pgxpool.Pool
 }
 
-// OpenPostgres connects, applies the board's migrations (0009 creates
-// board_audit), and returns the store.
+// OpenPostgres connects and applies only the audit table's migration
+// (0009_audit.sql). An audit-only database therefore needs privileges for
+// board_audit and its sequence, not for the board's or sync's tables.
 func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("audit: a PostgreSQL DSN is required")
@@ -51,7 +52,7 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, fmt.Errorf("audit: connecting to PostgreSQL: %w", err)
 	}
-	if err := store.ApplyMigrations(ctx, pool); err != nil {
+	if err := store.ApplyAuditMigration(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("audit: applying migrations: %w", err)
 	}

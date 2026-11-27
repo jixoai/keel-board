@@ -91,8 +91,12 @@ func TestEventValidationRefusesUnboundedFields(t *testing.T) {
 		"kind is a sentence":    {Tenant: "t", Kind: "the webhook was accepted"},
 		"kind too long":         {Tenant: "t", Kind: strings.Repeat("a", 65)},
 		"target has newline":    {Tenant: "t", Kind: audit.KindOutboxDead, Target: "slack:C1\nbody"},
+		"target is a sentence":  {Tenant: "t", Kind: audit.KindOutboxDead, Target: "the deploy failed"},
+		"target has a quote":    {Tenant: "t", Kind: audit.KindOutboxDead, Target: `slack:"C1"`},
 		"detail nested":         {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"body": map[string]any{"text": "secret"}}},
-		"detail long string":    {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"body": strings.Repeat("x", 257)}},
+		"detail is a body":      {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"body": "the deploy failed for everyone"}},
+		"detail has a secret":   {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"body": "token=SECRET"}},
+		"detail long string":    {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"body": strings.Repeat("x", 129)}},
 		"detail bad key":        {Tenant: "t", Kind: audit.KindWebhookAccepted, Detail: map[string]any{"Message Body": "x"}},
 		"attempts out of range": {Tenant: "t", Kind: audit.KindOutboxDead, Attempts: -1},
 		"delivery is free text": {Tenant: "t", Kind: audit.KindOutboxRetry, DeliveryID: "two words"},
@@ -104,12 +108,21 @@ func TestEventValidationRefusesUnboundedFields(t *testing.T) {
 	}
 	valid := audit.Event{
 		Tenant: "tenant-a", Kind: audit.KindOutboxDead, Key: "slack",
-		Platform: "slack", Target: "slack:C1:T2", DeliveryID: "delivery_abcd",
+		Platform: "slack", Target: "github:acme/web#12", DeliveryID: "delivery_abcd",
 		Status: audit.StatusDead, Attempts: 5,
-		Detail: map[string]any{"code": "rate_limited", "http": 429},
+		Detail: map[string]any{
+			"code": "rate_limited", "http": 429,
+			"event": "slack:C0123:1727.9", "delivery": "8c1e2f3a-9527-4c31-ae42-7b30d1f09e55",
+		},
 	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("valid event refused: %v", err)
+	}
+	if !audit.SafeToken("slack:C0123:1727.9") || audit.SafeToken("the deploy failed") {
+		t.Fatal("SafeToken doesn't separate IDs from text")
+	}
+	if audit.SafeDeliveryID("123") || !audit.SafeDeliveryID("delivery_abcd") {
+		t.Fatal("SafeDeliveryID doesn't keep numeric message IDs out")
 	}
 }
 
@@ -269,14 +282,103 @@ func TestPostgresAuditRLSTenantIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin unset: %v", err)
 	}
-	defer tx.Rollback(ctx)
 	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+roleIdent); err != nil {
+		tx.Rollback(ctx)
 		t.Fatalf("set role unset: %v", err)
 	}
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM board_audit`).Scan(&visible); err != nil {
+		tx.Rollback(ctx)
 		t.Fatalf("count unset: %v", err)
 	}
 	if visible != 0 {
+		tx.Rollback(ctx)
 		t.Fatalf("unset tenant saw %d audit rows", visible)
+	}
+	tx.Rollback(ctx)
+
+	// board_audit has no bypass escape hatch: setting keel.bypass_rls still
+	// sees nothing without a tenant, and with tenant-a it sees tenant-a only.
+	tx, err = admin.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin bypass: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL ROLE `+roleIdent); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("set role bypass: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('keel.bypass_rls', 'on', true)`); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("set bypass: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM board_audit`).Scan(&visible); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("count bypass without tenant: %v", err)
+	}
+	if visible != 0 {
+		tx.Rollback(ctx)
+		t.Fatalf("bypass without a tenant saw %d audit rows", visible)
+	}
+	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', 'tenant-a', true)`); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("set tenant bypass: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM board_audit`).Scan(&visible); err != nil {
+		tx.Rollback(ctx)
+		t.Fatalf("count bypass with tenant: %v", err)
+	}
+	if visible != 1 {
+		tx.Rollback(ctx)
+		t.Fatalf("bypass with tenant-a saw %d audit rows, want 1", visible)
+	}
+	_, bypassInsertErr := tx.Exec(ctx, `
+		INSERT INTO board_audit (tenant_id, kind) VALUES ('tenant-b', 'forged')`)
+	if bypassInsertErr == nil {
+		tx.Rollback(ctx)
+		t.Fatal("bypass let a cross-tenant audit insert succeed")
+	}
+	tx.Rollback(ctx)
+}
+
+// TestOpenPostgresCreatesOnlyTheAuditTable proves an audit-only DSN doesn't
+// ask the role for ownership of the board's or sync's tables.
+func TestOpenPostgresCreatesOnlyTheAuditTable(t *testing.T) {
+	dsn := testDSN(t)
+	schema := newTestSchema(t, dsn)
+	store, err := audit.OpenPostgres(t.Context(), audit.PostgresOptions{DSN: dsn, SearchPath: schema})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(store.Close)
+	admin, err := pgx.Connect(t.Context(), dsn)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = admin.Close(cleanup)
+	})
+	rows, err := admin.Query(t.Context(), `
+		SELECT c.relname
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relkind = 'r'
+		ORDER BY c.relname`, schema)
+	if err != nil {
+		t.Fatalf("listing tables: %v", err)
+	}
+	defer rows.Close()
+	tables := make([]string, 0)
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("scan table: %v", err)
+		}
+		tables = append(tables, name)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("tables: %v", err)
+	}
+	if len(tables) != 1 || tables[0] != "board_audit" {
+		t.Fatalf("audit-only schema tables = %v, want [board_audit]", tables)
 	}
 }

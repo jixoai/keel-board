@@ -99,6 +99,10 @@ func migrationLockID(schema string) int64 {
 	return int64(hash.Sum64())
 }
 
+// AuditMigration is the migration that creates board_audit. It is the only
+// migration an audit-only database needs.
+const AuditMigration = "0009_audit.sql"
+
 // ApplyMigrations applies the embedded schema through pool. It is the same
 // run OpenPostgres performs, exported for a package that owns its own pool
 // (syncstore opens one for the sync tables). Migrations are idempotent, so
@@ -107,21 +111,39 @@ func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if pool == nil {
 		return errors.New("store: a PostgreSQL pool is required")
 	}
-	return migrate(ctx, pool)
+	names, err := migrationNames()
+	if err != nil {
+		return err
+	}
+	return applyMigrations(ctx, pool, names)
+}
+
+// ApplyAuditMigration applies only the audit table's migration through pool.
+// An audit store may share a database with the board, or have its own: on its
+// own, this creates board_audit without requiring ownership of the board's or
+// sync's tables.
+func ApplyAuditMigration(ctx context.Context, pool *pgxpool.Pool) error {
+	if pool == nil {
+		return errors.New("store: a PostgreSQL pool is required")
+	}
+	return applyMigrations(ctx, pool, []string{AuditMigration})
 }
 
 // migrate applies every embedded migration, in name order. Each file is
-// idempotent, so a second open changes nothing. One connection holds a session
-// advisory lock for the whole run; migrations each run in their own
-// transaction, so a failure leaves no half-migrated file.
+// idempotent, so a second open changes nothing.
 func (p *Postgres) migrate(ctx context.Context) error {
-	return migrate(ctx, p.pool)
+	names, err := migrationNames()
+	if err != nil {
+		return err
+	}
+	return applyMigrations(ctx, p.pool, names)
 }
 
-func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+// migrationNames lists the embedded migrations in apply order.
+func migrationNames() ([]string, error) {
 	entries, err := fs.ReadDir(migrations, "migrations")
 	if err != nil {
-		return fmt.Errorf("store: reading migrations: %w", err)
+		return nil, fmt.Errorf("store: reading migrations: %w", err)
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -130,6 +152,16 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	sort.Strings(names)
+	return names, nil
+}
+
+// applyMigrations applies the named embedded migrations. One connection holds a
+// session advisory lock for the whole run; migrations each run in their own
+// transaction, so a failure leaves no half-migrated file.
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("store: reserving a migration connection: %w", err)

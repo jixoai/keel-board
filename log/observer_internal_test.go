@@ -134,3 +134,44 @@ func TestObserverIsOptional(t *testing.T) {
 		t.Fatalf("observations after SetObserver = %d, want 1", len(kinds))
 	}
 }
+
+// panicObserver is a broken instrumentation implementation.
+type panicObserver struct{}
+
+func (panicObserver) Appended(string, []EventType, int, time.Duration) { panic("observer bug") }
+func (panicObserver) Rebuilt(time.Duration)                            { panic("observer bug") }
+
+// TestPanickingObserverDoesNotFailWork proves instrumentation cannot undo a
+// committed append or fail a rebuild.
+func TestPanickingObserverDoesNotFailWork(t *testing.T) {
+	board := New(Options{Observer: panicObserver{}})
+	ctx := t.Context()
+	if _, err := board.Append(ctx, AppendRequest{Events: []Event{{
+		Type:    EventMessagePosted,
+		Payload: &MessagePostedPayload{Channel: "general", Text: "hello"},
+	}}}); err != nil {
+		t.Fatalf("append with a panicking observer: %v", err)
+	}
+	if _, err := board.Rebuild(ctx, "default"); err != nil {
+		t.Fatalf("rebuild with a panicking observer: %v", err)
+	}
+}
+
+// BenchmarkLiveClaims records the per-append scan's cost on a board with
+// 10,000 tasks.
+func BenchmarkLiveClaims(b *testing.B) {
+	now := time.Now()
+	state := NewState()
+	for id := uint64(1); id <= 10000; id++ {
+		state.Messages[id] = &Message{ID: id, Task: &Task{
+			State: "claimed",
+			Claim: &Claim{Actor: "local:user:dev", Until: now.Add(time.Hour)},
+		}}
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := liveClaims(state, now); got != 10000 {
+			b.Fatalf("liveClaims = %d", got)
+		}
+	}
+}

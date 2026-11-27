@@ -4,10 +4,12 @@
 -- key/platform/target/delivery ID/status, an attempt count, and a small detail
 -- object of status and error codes.
 --
--- Tenant isolation matches 0003 and 0008: keel.tenant_id is set
--- transaction-locally by the audit package, and keel.bypass_rls='on' is the
--- operator escape hatch. FORCE makes even the table owner subject, so a query
--- that loses its tenant setting sees nothing instead of everything.
+-- Tenant isolation matches 0003 and 0008's tenant dimension, without the
+-- operator bypass: keel.tenant_id is set transaction-locally by the audit
+-- package, and board_audit has no cross-tenant read to serve, so a role cannot
+-- lift its scope by setting keel.bypass_rls. FORCE makes even the table owner
+-- subject, so a query that loses its tenant setting sees nothing instead of
+-- everything.
 
 CREATE TABLE IF NOT EXISTS board_audit (
     id          bigserial   PRIMARY KEY,
@@ -31,10 +33,8 @@ ALTER TABLE board_audit FORCE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS board_audit_tenant_isolation ON board_audit;
 CREATE POLICY board_audit_tenant_isolation ON board_audit
     USING (
-        current_setting('keel.bypass_rls', true) = 'on'
-        OR tenant_id = current_setting('keel.tenant_id', true)
+        tenant_id = current_setting('keel.tenant_id', true)
     )
     WITH CHECK (
-        current_setting('keel.bypass_rls', true) = 'on'
-        OR tenant_id = current_setting('keel.tenant_id', true)
+        tenant_id = current_setting('keel.tenant_id', true)
     );

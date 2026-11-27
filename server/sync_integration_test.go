@@ -130,6 +130,7 @@ func newSyncHarness(t *testing.T, opts syncHarnessOptions) *syncHarness {
 			Owned:         []server.SyncKey{{Tenant: "t1", Key: "slack"}},
 			StartChannels: map[server.SyncKey][]string{{Tenant: "t1", Key: "slack"}: {"C0123"}},
 			FileHosts:     []string{"files.example.test"},
+			BridgeSecret:  opts.bridgeSecret,
 			Logger:        logger,
 		},
 	})
@@ -223,6 +224,8 @@ type syncHarnessOptions struct {
 	// metrics and audit are the server's observability seams.
 	metrics *metrics.Registry
 	audit   audit.Store
+	// bridgeSecret enables the Chat SDK bridge route for a key.
+	bridgeSecret func(tenant string, key boardsync.Key) (boardsync.Secret, bool)
 }
 
 func (h *syncHarness) request(method, path string, body any, extra map[string]string) (int, []byte) {
