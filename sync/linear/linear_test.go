@@ -232,7 +232,7 @@ func TestAutomationUpdateDoesNotCreateRoot(t *testing.T) {
 }
 
 func TestDuplicateDelivery(t *testing.T) {
-	p := newProvider(t, "")
+	p, _ := commentServer(t, "ENG", false)
 	body := fixture(t, "comment_created.json")
 	first := receive(t, p, body)
 	second, err := p.Receive(context.Background(), "linear", requestWith(t, body, "delivery-2"))
@@ -295,17 +295,48 @@ func TestBodyLimit(t *testing.T) {
 	}
 }
 
+func commentServer(t *testing.T, teamKey string, refOnly bool) (*linear.Provider, *int) {
+	t.Helper()
+	calls := 0
+	server := graphServer(t, func(q string, vars map[string]any) any {
+		calls++
+		switch {
+		case strings.Contains(q, "query IssueRefByID"):
+			if vars["id"] != testIssueID {
+				t.Fatalf("issue ref id = %+v", vars)
+			}
+			issue := map[string]any{"id": testIssueID}
+			if !refOnly {
+				issue["identifier"] = "ENG-123"
+				issue["team"] = map[string]any{"key": teamKey}
+			}
+			return map[string]any{"issue": issue}
+		case strings.Contains(q, "query IssueByID"):
+			return map[string]any{"issue": map[string]any{
+				"id": testIssueID, "identifier": "ENG-123",
+				"team": map[string]any{"key": teamKey},
+			}}
+		default:
+			t.Fatalf("unexpected query %q", q)
+			return nil
+		}
+	})
+	t.Cleanup(server.Close)
+	return newProvider(t, server.URL), &calls
+}
+
 func TestCommentUnknownTeamDropped(t *testing.T) {
-	body := []byte(strings.ReplaceAll(string(fixture(t, "comment_created.json")), `"key": "ENG"`, `"key": "OTHER"`))
-	if records := receive(t, newProvider(t, ""), body); len(records) != 0 {
+	p, _ := commentServer(t, "OTHER", false)
+	if records := receive(t, p, fixture(t, "comment_created.json")); len(records) != 0 {
 		t.Fatalf("records = %+v", records)
 	}
 }
 
 func TestCommentParentGroupsThread(t *testing.T) {
+	p, _ := commentServer(t, "ENG", false)
 	body := []byte(strings.ReplaceAll(string(fixture(t, "comment_created.json")), `"id": "comment-1",`,
 		`"id": "comment-2", "parentId": "comment-1",`))
-	event := receive(t, newProvider(t, ""), body)[0].Event
+	event := receive(t, p, body)[0].Event
 	if event.Message != "comment-2" {
 		t.Fatalf("message = %s", event.Message)
 	}
@@ -314,11 +345,35 @@ func TestCommentParentGroupsThread(t *testing.T) {
 	}
 }
 
-func TestCommentWithoutIssueRefused(t *testing.T) {
-	body := []byte(`{"action":"create","type":"Comment","data":{"id":"comment-1","body":"hi","issueId":"` + testIssueID + `","user":{"id":"user-2","name":"Julian"}},"actor":{"id":"user-2","name":"julian","type":"user"},"webhookTimestamp":0}`)
-	_, err := newProvider(t, "").Receive(context.Background(), "linear", request(t, body))
-	if !errors.Is(err, boardsync.ErrBadRequest) {
-		t.Fatalf("comment without issue = %v", err)
+func TestCommentWithoutIssueFetchesIt(t *testing.T) {
+	p, calls := commentServer(t, "ENG", false)
+	event := receive(t, p, fixture(t, "comment_created.json"))[0].Event
+	if event.Channel != "ENG" || event.Thread != "ENG:"+testIssueID {
+		t.Fatalf("event = %+v", event)
+	}
+	if *calls != 1 {
+		t.Fatalf("issue lookups = %d, want one", *calls)
+	}
+}
+
+func TestCommentReferenceWithoutTeamRefetches(t *testing.T) {
+	p, calls := commentServer(t, "ENG", true)
+	event := receive(t, p, fixture(t, "comment_created.json"))[0].Event
+	if event.Channel != "ENG" || event.Thread != "ENG:"+testIssueID {
+		t.Fatalf("event = %+v", event)
+	}
+	if *calls != 2 {
+		t.Fatalf("issue lookups = %d, want a ref then a full issue", *calls)
+	}
+}
+
+func TestCommentOwnUserIDNeedsNoLookup(t *testing.T) {
+	p, calls := commentServer(t, "ENG", false)
+	if records := receive(t, p, fixture(t, "own_comment.json")); len(records) != 0 {
+		t.Fatalf("own comment imported: %+v", records)
+	}
+	if *calls != 0 {
+		t.Fatalf("own comment looked up its issue %d times", *calls)
 	}
 }
 
@@ -344,7 +399,8 @@ func contains(values []string, want string) bool {
 }
 
 func TestCommentCreated(t *testing.T) {
-	event := receive(t, newProvider(t, ""), fixture(t, "comment_created.json"))[0].Event
+	p, _ := commentServer(t, "ENG", false)
+	event := receive(t, p, fixture(t, "comment_created.json"))[0].Event
 	if event.Kind != boardsync.KindMessage || event.Type != boardsync.TypeComment {
 		t.Fatalf("event = %+v", event)
 	}
@@ -354,7 +410,7 @@ func TestCommentCreated(t *testing.T) {
 	if event.Subthread != "ENG:"+testIssueID+":c:comment-1" {
 		t.Fatalf("subthread = %s", event.Subthread)
 	}
-	if event.Author.ID != "linear:user:user-2" || event.Author.Handle != "julian" {
+	if event.Author.ID != "linear:user:user-2" || event.Author.Handle != "user-2" {
 		t.Fatalf("author = %+v", event.Author)
 	}
 	if event.Text != "I reproduced this on staging." {
@@ -363,19 +419,14 @@ func TestCommentCreated(t *testing.T) {
 }
 
 func TestCommentUpdatedAndRemoved(t *testing.T) {
-	updated := receive(t, newProvider(t, ""), fixture(t, "comment_updated.json"))[0].Event
+	p, _ := commentServer(t, "ENG", false)
+	updated := receive(t, p, fixture(t, "comment_updated.json"))[0].Event
 	if updated.Kind != boardsync.KindEdited || updated.Text != "I reproduced this on staging and in production." {
 		t.Fatalf("updated = %+v", updated)
 	}
-	removed := receive(t, newProvider(t, ""), fixture(t, "comment_removed.json"))[0].Event
+	removed := receive(t, p, fixture(t, "comment_removed.json"))[0].Event
 	if removed.Kind != boardsync.KindDeleted || removed.Message != "comment-1" {
 		t.Fatalf("removed = %+v", removed)
-	}
-}
-
-func TestOwnCommentSkipped(t *testing.T) {
-	if records := receive(t, newProvider(t, ""), fixture(t, "own_comment.json")); len(records) != 0 {
-		t.Fatalf("own comment imported: %+v", records)
 	}
 }
 
@@ -434,13 +485,17 @@ func TestPostComment(t *testing.T) {
 	})
 	defer server.Close()
 	p := newProvider(t, server.URL)
-	target := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID, Kind: boardsync.TargetThread}
+	target := boardsync.ResolvedTarget{Key: "linear", Platform: "linear", Channel: "ENG", Thread: "ENG:" + testIssueID,
+		Subthread: "ENG:" + testIssueID + ":c:comment-parent", Kind: boardsync.TargetThread}
 	posted, err := p.Post(context.Background(), "linear", target, boardsync.OutboundMessage{Markdown: "**Ada**: ship it"})
 	if err != nil {
 		t.Fatalf("Post: %v", err)
 	}
 	if !strings.Contains(query, "commentCreate") || variables["issueId"] != testIssueID || variables["body"] != "**Ada**: ship it" {
 		t.Fatalf("query = %q, variables = %+v", query, variables)
+	}
+	if variables["parentId"] != "comment-parent" {
+		t.Fatalf("parentId = %+v", variables["parentId"])
 	}
 	if posted.Thread != "ENG:"+testIssueID || posted.Message != "comment-9" {
 		t.Fatalf("posted = %+v", posted)
@@ -553,6 +608,9 @@ func TestFailureClassification(t *testing.T) {
 		{http.StatusBadRequest, boardsync.ErrBadRequest},
 		{http.StatusUnprocessableEntity, boardsync.ErrBadRequest},
 		{http.StatusTooManyRequests, boardsync.ErrRateLimited},
+		{http.StatusRequestTimeout, nil},
+		{http.StatusConflict, nil},
+		{http.StatusTooEarly, nil},
 	} {
 		t.Run(strconv.Itoa(test.status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -560,14 +618,28 @@ func TestFailureClassification(t *testing.T) {
 			}))
 			defer server.Close()
 			_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
-			if !errors.Is(err, test.want) {
+			if test.want != nil && !errors.Is(err, test.want) {
 				t.Fatalf("status %d = %v, want %v", test.status, err, test.want)
 			}
-			if boardsync.IsPermanent(err) != (test.status != http.StatusTooManyRequests) {
+			permanent := test.status == http.StatusUnauthorized || test.status == http.StatusForbidden ||
+				test.status == http.StatusNotFound || test.status == http.StatusBadRequest ||
+				test.status == http.StatusUnprocessableEntity
+			if boardsync.IsPermanent(err) != permanent {
 				t.Fatalf("status %d permanent = %v", test.status, boardsync.IsPermanent(err))
 			}
 		})
 	}
+	t.Run("retry after", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer server.Close()
+		_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+		if !errors.Is(err, boardsync.ErrRateLimited) || linear.RetryAfterSeconds(err) != 7 {
+			t.Fatalf("retry-after = %v, %d", err, linear.RetryAfterSeconds(err))
+		}
+	})
 	t.Run("server", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusBadGateway)
@@ -600,6 +672,20 @@ func TestFailureClassification(t *testing.T) {
 			}
 		})
 	}
+	t.Run("transient graphql error is retryable", func(t *testing.T) {
+		for _, code := range []string{"INTERNAL_SERVER_ERROR", "SERVICE_UNAVAILABLE", "TIMEOUT"} {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"errors": []any{
+					map[string]any{"message": "later", "extensions": map[string]any{"code": code}},
+				}})
+			}))
+			_, err := newProvider(t, server.URL).ResolveTarget(context.Background(), "linear", testIssueID)
+			server.Close()
+			if err == nil || boardsync.IsPermanent(err) {
+				t.Fatalf("%s = %v, permanent = %v", code, err, boardsync.IsPermanent(err))
+			}
+		}
+	})
 	t.Run("unknown graphql error is permanent", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []any{map[string]any{"message": "bad query"}}})

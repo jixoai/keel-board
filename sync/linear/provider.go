@@ -22,10 +22,9 @@ func New(cfg Config) (*Provider, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &Provider{
-		cfg:    cfg,
-		client: NewClient(cfg.baseURL(), cfg.httpClient(), cfg.APIToken),
-	}, nil
+	client := NewClient(cfg.baseURL(), cfg.httpClient(), cfg.APIToken)
+	client.scheme = cfg.tokenScheme()
+	return &Provider{cfg: cfg, client: client}, nil
 }
 
 // Platform implements boardsync.Provider.
@@ -69,15 +68,19 @@ func (p *Provider) Receive(ctx context.Context, key boardsync.Key, req *boardsyn
 	if err := json.Unmarshal(req.Body, &wh); err != nil {
 		return boardsync.Intake{}, fmt.Errorf("%w: linear payload: %v", boardsync.ErrBadRequest, err)
 	}
-	if err := VerifyTimestamp(wh.WebhookTimestamp, p.cfg.now(), p.cfg.tolerance()); err != nil {
+	timestamp := wh.WebhookTimestamp
+	if timestamp == 0 {
+		timestamp = timestampFromHeaders(req.Header.Get)
+	}
+	if err := VerifyTimestamp(timestamp, p.cfg.now(), p.cfg.tolerance()); err != nil {
 		return boardsync.Intake{}, err
 	}
-	records, err := p.normalize(key, req.Header.Get(DeliveryHeader), req.Body, wh)
+	records, err := p.normalize(ctx, key, req.Header.Get(DeliveryHeader), req.Body, wh)
 	if err != nil {
 		return boardsync.Intake{}, err
 	}
 	for i := range records {
-		records[i].Event.Raw = append([]byte(nil), req.Body...)
+		records[i].Event.Raw = clampRaw(req.Body)
 	}
 	return boardsync.Intake{Response: boardsync.OK(), Records: records}, nil
 }
@@ -193,6 +196,9 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	if target.Key != key {
 		return boardsync.Posted{}, fmt.Errorf("%w: target belongs to %q", boardsync.ErrBadRequest, target.Key)
 	}
+	if target.Platform != "linear" {
+		return boardsync.Posted{}, fmt.Errorf("%w: target platform %q isn't linear", boardsync.ErrBadRequest, target.Platform)
+	}
 	if len(msg.Files) > 0 {
 		return boardsync.Posted{}, fmt.Errorf("%w: linear file upload is not implemented", boardsync.ErrUnsupported)
 	}
@@ -209,7 +215,11 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 			return boardsync.Posted{}, err
 		}
 		title, description := splitTitle(msg.Markdown)
-		issue, err := p.client.CreateIssue(ctx, teamID, title, description)
+		update, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels)
+		if err != nil {
+			return boardsync.Posted{}, err
+		}
+		issue, err := p.client.CreateIssue(ctx, teamID, title, description, update)
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
@@ -225,16 +235,24 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 	if err := checkCommentBody(msg.Markdown); err != nil {
 		return boardsync.Posted{}, err
 	}
-	commentID, err := p.client.CreateComment(ctx, issueID, msg.Markdown)
+	parentID := ""
+	if target.Subthread != "" {
+		parentID, err = parseCommentSubthread(teamKey, issueID, target.Subthread)
+		if err != nil {
+			return boardsync.Posted{}, err
+		}
+	}
+	commentID, err := p.client.CreateComment(ctx, issueID, msg.Markdown, parentID)
 	if err != nil {
 		return boardsync.Posted{}, err
 	}
 	return boardsync.Posted{Thread: issueThread(teamKey, issueID), Message: commentID}, nil
 }
 
-// Edit replaces a delivered comment's body, or an issue the board opened.
+// Edit replaces a delivered comment's body, or an issue the board opened. An
+// issue edit also reconciles state, priority, project, tags, and assignee.
 func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message string, msg boardsync.OutboundMessage) error {
-	_, issueID, err := p.threadWhere(key, thread)
+	teamKey, issueID, err := p.threadWhere(key, thread)
 	if err != nil {
 		return err
 	}
@@ -242,7 +260,19 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 		return fmt.Errorf("%w: linear file upload is not implemented", boardsync.ErrUnsupported)
 	}
 	if message == IssueRootMessage {
-		return p.client.UpdateIssue(ctx, issueID, msg.Markdown)
+		update := issueUpdate{SetDescription: true, Description: msg.Markdown}
+		if msg.Labels != nil {
+			properties, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels)
+			if err != nil {
+				return err
+			}
+			update.SetState, update.StateID = properties.SetState, properties.StateID
+			update.SetPriority, update.Priority = properties.SetPriority, properties.Priority
+			update.SetProject, update.ProjectID = properties.SetProject, properties.ProjectID
+			update.SetAssignee, update.AssigneeID = properties.SetAssignee, properties.AssigneeID
+			update.SetLabels, update.LabelIDs = properties.SetLabels, properties.LabelIDs
+		}
+		return p.client.UpdateIssue(ctx, issueID, update)
 	}
 	if err := checkCommentBody(msg.Markdown); err != nil {
 		return err
@@ -298,8 +328,8 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 	if issueTeam == "" {
 		issueTeam = teamOfIdentifier(issue.Identifier)
 	}
-	if issueTeam != "" && !p.cfg.teamAllowed(issueTeam) {
-		return nil, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, issueTeam)
+	if issueTeam != "" && issueTeam != teamKey {
+		return nil, fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
 	}
 	return &boardsync.RootDraft{
 		Text:   issueRootText(&issue),
@@ -311,6 +341,9 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 func (p *Provider) threadWhere(key boardsync.Key, thread boardsync.ThreadRef) (string, string, error) {
 	if p.cfg.Key != "" && key != p.cfg.Key {
 		return "", "", fmt.Errorf("%w: entry %q isn't this linear app's %q", boardsync.ErrBadRequest, key, p.cfg.Key)
+	}
+	if thread.Platform != "linear" {
+		return "", "", fmt.Errorf("%w: thread platform %q isn't linear", boardsync.ErrBadRequest, thread.Platform)
 	}
 	if thread.Key != key {
 		return "", "", fmt.Errorf("%w: thread belongs to %q", boardsync.ErrBadRequest, thread.Key)
@@ -343,6 +376,20 @@ func parseIssueThread(native string) (teamKey, issueID string, err error) {
 		return "", "", fmt.Errorf("%w: not a linear issue thread: %s", boardsync.ErrBadRequest, native)
 	}
 	return teamKey, issueID, nil
+}
+
+// parseCommentSubthread reads the parent comment ID a board reply hangs under:
+// "ENG:<issue UUID>:c:<parent comment ID>".
+func parseCommentSubthread(teamKey, issueID, subthread string) (string, error) {
+	prefix := issueThread(teamKey, issueID) + ":c:"
+	if !strings.HasPrefix(subthread, prefix) {
+		return "", fmt.Errorf("%w: linear sub-thread %q doesn't extend its issue", boardsync.ErrBadRequest, subthread)
+	}
+	parent := strings.TrimPrefix(subthread, prefix)
+	if strings.TrimSpace(parent) == "" || strings.ContainsAny(parent, " \t\r\n:") {
+		return "", fmt.Errorf("%w: linear sub-thread %q has no parent comment", boardsync.ErrBadRequest, subthread)
+	}
+	return parent, nil
 }
 
 func checkCommentBody(markdown string) error {
@@ -388,4 +435,5 @@ var (
 	_ boardsync.Reactor     = (*Provider)(nil)
 	_ boardsync.RootFetcher = (*Provider)(nil)
 	_ boardsync.Permalinker = (*Provider)(nil)
+	_ boardsync.Labeler     = (*Provider)(nil)
 )

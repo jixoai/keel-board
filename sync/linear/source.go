@@ -62,7 +62,7 @@ type SourceRead struct {
 
 var (
 	issueURLPattern   = regexp.MustCompile(`(?i)^https://linear\.app/[^/\s]+/issue/([A-Z][A-Z0-9_]*-\d+)(?:[/?#].*)?$`)
-	projectURLPattern = regexp.MustCompile(`(?i)^https://linear\.app/[^/\s]+/project/(?:[^/?#\s]*-)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,})(?:[/?#].*)?$`)
+	projectURLPattern = regexp.MustCompile(`(?i)^https://linear\.app/[^/\s]+/project/(?:[^/?#\s]*?-)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{8,})(?:[/?#].*)?$`)
 	issueIDPattern    = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 )
 
@@ -88,7 +88,8 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 		bySlug := !issueIDPattern.MatchString(ref) && !strings.Contains(ref, "-")
 		return p.readProject(ctx, ref, bySlug, opts, limit)
 	case projectURLPattern.MatchString(target):
-		return p.readProject(ctx, projectURLPattern.FindStringSubmatch(target)[1], true, opts, limit)
+		ref := projectURLPattern.FindStringSubmatch(target)[1]
+		return p.readProject(ctx, ref, !issueIDPattern.MatchString(ref), opts, limit)
 	case issueURLPattern.MatchString(target):
 		return p.readIssueIdentifier(ctx, issueURLPattern.FindStringSubmatch(target)[1], opts, limit)
 	case teamKeyFromIdentifier.MatchString(strings.ToUpper(target)):
@@ -183,6 +184,12 @@ func (p *Provider) readIssueIdentifier(ctx context.Context, identifier string, o
 	if err != nil {
 		return SourceRead{}, err
 	}
+	if issue.ID == "" {
+		return SourceRead{}, fmt.Errorf("%w: linear issue %s has no ID", boardsync.ErrNotFound, identifier)
+	}
+	if got := strings.ToUpper(issue.Team.Key); got != "" && got != teamKey {
+		return SourceRead{}, fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, identifier, got, teamKey)
+	}
 	return p.readIssue(ctx, issue.ID, opts, limit)
 }
 
@@ -205,7 +212,7 @@ func (p *Provider) readIssue(ctx context.Context, issueID string, opts ReadOptio
 	for _, comment := range issue.Comments.Nodes {
 		read.Messages = append(read.Messages, SourceMessage{
 			ID: comment.ID, Thread: thread, Author: handleOf(comment.User),
-			Text: comment.Body, CreatedAt: comment.CreatedAt,
+			Text: clampText(comment.Body, MaxCommentChars), CreatedAt: comment.CreatedAt,
 		})
 	}
 	read.More = issue.Comments.PageInfo.HasNextPage
@@ -239,8 +246,8 @@ func (p *Provider) Permalink(ctx context.Context, key boardsync.Key, event board
 	if err != nil {
 		return "", err
 	}
-	if issueTeam := p.issueTeam(&issue); issueTeam != "" && !p.cfg.teamAllowed(issueTeam) {
-		return "", fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, issueTeam)
+	if issueTeam := p.issueTeam(&issue); issueTeam != "" && issueTeam != teamKey {
+		return "", fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
 	}
 	if issue.URL == "" {
 		return "", fmt.Errorf("%w: linear issue %s has no link", boardsync.ErrNotFound, issueID)
@@ -321,6 +328,7 @@ func sourceIssueMessage(issue *issueData, thread string, descriptionMax int) Sou
 	}
 	description := strings.TrimSpace(issue.Description)
 	if description != "" {
+		description = clampText(description, MaxTextChars)
 		if descriptionMax > 0 {
 			description = truncateRunes(description, descriptionMax)
 		}

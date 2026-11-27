@@ -1,6 +1,7 @@
 package linear
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -9,7 +10,7 @@ import (
 	boardsync "github.com/jixoai/keel-board/sync"
 )
 
-func (p *Provider) normalize(key boardsync.Key, delivery string, body []byte, wh webhook) ([]boardsync.Record, error) {
+func (p *Provider) normalize(ctx context.Context, key boardsync.Key, delivery string, body []byte, wh webhook) ([]boardsync.Record, error) {
 	if delivery == "" {
 		// webhookId names the subscription, not one occurrence, so the
 		// timestamp and body always join it.
@@ -23,7 +24,7 @@ func (p *Provider) normalize(key boardsync.Key, delivery string, body []byte, wh
 	case "Issue":
 		return p.normalizeIssue(key, delivery, body, wh)
 	case "Comment":
-		return p.normalizeComment(key, delivery, body, wh)
+		return p.normalizeComment(ctx, key, delivery, body, wh)
 	case "Reaction":
 		// Linear reaction webhooks don't say which issue they're on.
 		return nil, nil
@@ -54,9 +55,9 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 	properties := propertiesOf(&item)
 	lifecycle := boardsync.Lifecycle{
 		Type:   "issue.updated",
-		Title:  item.Identifier + ": " + item.Title,
+		Title:  clampText(item.Identifier+": "+item.Title, MaxTextChars),
 		URL:    firstNonEmpty(item.URL, wh.URL),
-		Body:   item.Description,
+		Body:   clampText(item.Description, MaxTextChars),
 		Labels: properties.Labels,
 		Unset:  properties.Unset,
 		Owns:   properties.Owns,
@@ -85,51 +86,47 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 		Kind: boardsync.KindLifecycle, Type: lifecycle.Type,
 		Channel: teamKey, Thread: issueThread(teamKey, item.ID),
 		Author: author, Lifecycle: &lifecycle,
-		Raw: append([]byte(nil), body...),
+		Raw: clampRaw(body),
 	}
 	event.ID = boardsync.LifecycleDedupe(key, delivery, lifecycle.Type, item.Identifier)
-	return []boardsync.Record{{Dedupe: event.ID, Event: event, Raw: body}}, nil
+	return []boardsync.Record{{Dedupe: event.ID, Event: event, Raw: clampRaw(body)}}, nil
 }
 
-func (p *Provider) normalizeComment(key boardsync.Key, delivery string, body []byte, wh webhook) ([]boardsync.Record, error) {
+func (p *Provider) normalizeComment(ctx context.Context, key boardsync.Key, delivery string, body []byte, wh webhook) ([]boardsync.Record, error) {
 	var item commentData
 	if err := json.Unmarshal(wh.Data, &item); err != nil {
 		return nil, fmt.Errorf("%w: linear comment data: %v", boardsync.ErrBadRequest, err)
 	}
-	if item.Issue == nil {
-		return nil, fmt.Errorf("%w: linear comment has no issue; fetch the issue or subscribe to issue data", boardsync.ErrBadRequest)
+	if item.ID == "" {
+		return nil, fmt.Errorf("%w: linear comment has no ID", boardsync.ErrBadRequest)
 	}
-	teamKey := strings.ToUpper(item.Issue.Team.Key)
-	if teamKey == "" {
-		teamKey = teamOfIdentifier(item.Issue.Identifier)
-	}
-	if teamKey == "" || !p.cfg.teamAllowed(teamKey) {
+	// Linear's real Comment webhook carries issueId and userId, not a full
+	// issue or user object. Identity is available before any lookup, so the
+	// app's own comment is dropped without a request.
+	if p.isOwnUser(item.User) || p.isOwnUserID(item.UserID) || p.isOwnActor(wh.Actor) {
 		return nil, nil
 	}
-	issueID := firstNonEmpty(item.Issue.ID, item.IssueID)
-	if item.ID == "" || issueID == "" {
-		return nil, fmt.Errorf("%w: linear comment has no ID or issue ID", boardsync.ErrBadRequest)
+	issue, err := p.resolveCommentIssue(ctx, &item)
+	if err != nil {
+		return nil, err
 	}
-	if p.isOwnUser(item.User) || p.isOwnActor(wh.Actor) {
+	if !p.cfg.teamAllowed(issue.TeamKey) {
 		return nil, nil
 	}
-	author := authorOf(item.User)
-	if author.ID == "" {
-		author = actorAuthor(wh.Actor)
-	}
+	author := p.commentAuthor(&item, wh.Actor)
 	if author.ID == "" && wh.Action != "remove" {
 		return nil, fmt.Errorf("%w: linear comment has no author", boardsync.ErrBadRequest)
 	}
-	thread := issueThread(teamKey, issueID)
+	thread := issueThread(issue.TeamKey, issue.ID)
 	// A reply groups under its parent comment's sub-thread; a top-level one is
 	// its own.
 	root := firstNonEmpty(item.ParentID, item.ID)
-	subthread := commentThread(teamKey, issueID, root)
+	subthread := commentThread(issue.TeamKey, issue.ID, root)
 	event := boardsync.Event{
 		Key: key, Platform: "linear",
-		Channel: teamKey, Thread: thread, Subthread: subthread,
+		Channel: issue.TeamKey, Thread: thread, Subthread: subthread,
 		Message: item.ID, Author: author,
-		Raw: append([]byte(nil), body...),
+		Raw: clampRaw(body),
 	}
 	switch wh.Action {
 	case "create":
@@ -147,11 +144,90 @@ func (p *Provider) normalizeComment(key boardsync.Key, delivery string, body []b
 	default:
 		return nil, nil
 	}
-	event.Text = boardsync.StorableText(item.Body, boardsync.MaxTextBytes)
+	event.Text = clampText(item.Body, MaxCommentChars)
 	if event.Kind == boardsync.KindMessage && event.Text == "" {
 		event.Text = "(no text)"
 	}
-	return []boardsync.Record{{Dedupe: event.ID, Event: event, Raw: body}}, nil
+	return []boardsync.Record{{Dedupe: event.ID, Event: event, Raw: clampRaw(body)}}, nil
+}
+
+// resolvedCommentIssue is the identity a comment needs: the issue's UUID, its
+// identifier, and its team key. Linear's real Comment webhook names only
+// issueId, so the adapter reads the issue before it can place the comment.
+type resolvedCommentIssue struct {
+	ID         string
+	Identifier string
+	TeamKey    string
+}
+
+func (p *Provider) resolveCommentIssue(ctx context.Context, item *commentData) (resolvedCommentIssue, error) {
+	issueID := firstNonEmpty(item.IssueID, issueIDOf(item.Issue))
+	if issueID == "" {
+		return resolvedCommentIssue{}, fmt.Errorf("%w: linear comment has no issue ID", boardsync.ErrBadRequest)
+	}
+	resolved := resolvedCommentIssue{ID: issueID}
+	if item.Issue != nil {
+		resolved.ID = firstNonEmpty(item.Issue.ID, issueID)
+		resolved.Identifier = item.Issue.Identifier
+		resolved.TeamKey = strings.ToUpper(item.Issue.Team.Key)
+	}
+	if resolved.TeamKey == "" {
+		resolved.TeamKey = teamOfIdentifier(resolved.Identifier)
+	}
+	if resolved.TeamKey != "" && resolved.Identifier != "" {
+		return resolved, nil
+	}
+	// A payload may name the issue with only an ID, and an issue reference may
+	// carry only the ID too. Ask Linear for the team and identifier; a second
+	// read fills in a reference that still lacks them.
+	ref, err := p.client.IssueRefByID(ctx, issueID)
+	if err != nil {
+		return resolvedCommentIssue{}, err
+	}
+	resolved.ID = firstNonEmpty(ref.ID, resolved.ID)
+	resolved.Identifier = firstNonEmpty(ref.Identifier, resolved.Identifier)
+	resolved.TeamKey = firstNonEmpty(strings.ToUpper(ref.Team.Key), resolved.TeamKey)
+	if resolved.TeamKey == "" {
+		resolved.TeamKey = teamOfIdentifier(resolved.Identifier)
+	}
+	if resolved.TeamKey != "" && resolved.Identifier != "" {
+		return resolved, nil
+	}
+	full, err := p.client.IssueByID(ctx, issueID)
+	if err != nil {
+		return resolvedCommentIssue{}, err
+	}
+	resolved.ID = firstNonEmpty(full.ID, resolved.ID)
+	resolved.Identifier = firstNonEmpty(full.Identifier, resolved.Identifier)
+	resolved.TeamKey = firstNonEmpty(strings.ToUpper(full.Team.Key), resolved.TeamKey)
+	if resolved.TeamKey == "" {
+		resolved.TeamKey = teamOfIdentifier(resolved.Identifier)
+	}
+	if resolved.TeamKey == "" {
+		return resolvedCommentIssue{}, fmt.Errorf("%w: linear issue %s has no team", boardsync.ErrBadRequest, issueID)
+	}
+	return resolved, nil
+}
+
+func issueIDOf(issue *issueData) string {
+	if issue == nil {
+		return ""
+	}
+	return issue.ID
+}
+
+func (p *Provider) commentAuthor(item *commentData, a *actor) boardsync.Author {
+	if item.User != nil {
+		if author := authorOf(item.User); author.ID != "" {
+			return author
+		}
+	}
+	if item.UserID != "" {
+		return boardsync.Author{
+			ID: "linear:user:" + item.UserID, Handle: item.UserID, Name: item.UserID,
+		}
+	}
+	return actorAuthor(a)
 }
 
 func (p *Provider) isOwnActor(a *actor) bool {
@@ -160,6 +236,10 @@ func (p *Provider) isOwnActor(a *actor) bool {
 
 func (p *Provider) isOwnUser(u *user) bool {
 	return u != nil && p.cfg.BotUserID != "" && u.ID == p.cfg.BotUserID
+}
+
+func (p *Provider) isOwnUserID(id string) bool {
+	return id != "" && p.cfg.BotUserID != "" && id == p.cfg.BotUserID
 }
 
 func updatedField(from map[string]any, name string) bool {

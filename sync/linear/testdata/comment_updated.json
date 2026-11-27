@@ -5,8 +5,7 @@
     "id": "comment-1",
     "body": "I reproduced this on staging and in production.",
     "issueId": "11111111-1111-1111-1111-111111111111",
-    "issue": { "id": "11111111-1111-1111-1111-111111111111", "identifier": "ENG-123", "team": { "key": "ENG" } },
-    "user": { "id": "user-2", "name": "Julian", "displayName": "julian" },
+    "userId": "user-2",
     "updatedAt": "2026-01-02T05:10:00Z"
   },
   "actor": { "id": "user-2", "name": "julian", "type": "user" },

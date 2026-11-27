@@ -107,8 +107,41 @@ func (f *fakeLinear) answer(query string, variables map[string]any) any {
 			}}}
 		}
 		return map[string]any{"issues": map[string]any{"nodes": []any{}}}
+	case strings.Contains(query, "query IssueRefByID"):
+		return map[string]any{"issue": map[string]any{
+			"id": testIssueID, "identifier": "ENG-123", "team": map[string]any{"id": testTeamID, "key": "ENG"},
+		}}
 	case strings.Contains(query, "query IssueByID"):
 		return map[string]any{"issue": f.issue(false)}
+	case strings.Contains(query, "query WorkflowStates"):
+		return map[string]any{"workflowStates": map[string]any{"nodes": []any{
+			map[string]any{"id": "state-started", "name": "In Progress", "type": "started"},
+			map[string]any{"id": "state-completed", "name": "Done", "type": "completed"},
+		}}}
+	case strings.Contains(query, "query ProjectByName"):
+		if variables["name"] != "Checkout" || variables["team"] != "ENG" {
+			f.t.Errorf("project query variables = %+v", variables)
+		}
+		return map[string]any{"projects": map[string]any{"nodes": []any{
+			map[string]any{"id": testProjectID, "name": "Checkout"},
+		}}}
+	case strings.Contains(query, "query IssueLabelByName"):
+		if variables["name"] == "Bug" {
+			return map[string]any{"issueLabels": map[string]any{"nodes": []any{
+				map[string]any{"id": "label-1", "name": "Bug", "team": map[string]any{"key": "ENG"}},
+			}}}
+		}
+		return map[string]any{"issueLabels": map[string]any{"nodes": []any{}}}
+	case strings.Contains(query, "mutation IssueLabelCreate"):
+		return map[string]any{"issueLabelCreate": map[string]any{"success": true, "issueLabel": map[string]any{"id": "label-new"}}}
+	case strings.Contains(query, "query UsersPage"):
+		return map[string]any{"users": map[string]any{
+			"nodes": []any{map[string]any{
+				"id": "user-1", "name": "Ada Lovelace", "displayName": "ada",
+				"url": "https://linear.app/acme/profiles/ada",
+			}},
+			"pageInfo": map[string]any{"hasNextPage": false, "endCursor": ""},
+		}}
 	case strings.Contains(query, "mutation CommentCreate"):
 		return map[string]any{"commentCreate": map[string]any{"success": true, "comment": map[string]any{"id": "comment-9"}}}
 	case strings.Contains(query, "mutation IssueCreate"):
@@ -208,6 +241,17 @@ func (f *fakeLinear) callsContaining(fragment string) int {
 		}
 	}
 	return count
+}
+
+func (f *fakeLinear) lastVariables(fragment string) map[string]any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if strings.Contains(f.calls[i], fragment) {
+			return f.variables[i]
+		}
+	}
+	return nil
 }
 
 func newFakeProvider(t *testing.T, fake *fakeLinear, server *httptest.Server) *linear.Provider {

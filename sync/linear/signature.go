@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -20,6 +21,10 @@ const LegacySignatureHeader = "X-Linear-Signature"
 
 // DeliveryHeader is Linear's webhook delivery ID.
 const DeliveryHeader = "Linear-Delivery"
+
+// TimestampHeader is Linear's send-time header, in milliseconds. It is not
+// signed; the body's webhookTimestamp is authoritative when present.
+const TimestampHeader = "Linear-Timestamp"
 
 // DefaultTolerance bounds a webhook's own timestamp. Linear sends
 // webhookTimestamp in milliseconds.
@@ -80,4 +85,22 @@ func signatureFromHeaders(get func(string) string) string {
 		return value
 	}
 	return get(LegacySignatureHeader)
+}
+
+// timestampFromHeaders reads Linear-Timestamp, in milliseconds (a seconds
+// value from an older sender is accepted too). The header is unsigned, so it
+// is only a fallback when the signed body omitted webhookTimestamp.
+func timestampFromHeaders(get func(string) string) int64 {
+	raw := get(TimestampHeader)
+	if raw == "" {
+		return 0
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	if value < 1_000_000_000_000 { // seconds, not milliseconds
+		value *= 1000
+	}
+	return value
 }

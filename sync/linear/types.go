@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -23,17 +25,34 @@ const MaxCommentChars = 10000
 // MaxTitleChars bounds an issue title. Linear's title field accepts 255.
 const MaxTitleChars = 255
 
+// MaxTextChars bounds normalized text and an issue description. It is a
+// code-point limit, not a byte limit, because Linear counts characters.
+const MaxTextChars = 10000
+
+// MaxRawBytes bounds the raw payload kept on a Record. A larger webhook is
+// represented by a small note rather than a truncated JSON document.
+const MaxRawBytes = 256 << 10
+
+// MaxLabelValueChars bounds a board label value; keys are bounded by slug.
+const MaxLabelValueChars = 256
+
 // Config configures a Linear app adapter.
 type Config struct {
 	Key           boardsync.Key
 	WebhookSecret boardsync.Secret
 	// APIToken authorizes GraphQL calls.
 	APIToken boardsync.Secret
+	// TokenScheme is "api_key" for a personal API key (Authorization: <key>),
+	// "bearer" for an OAuth/app token, or "auto" (the default) to decide from
+	// the token's prefix. Linear personal keys start with "lin_api_".
+	TokenScheme string
 	// TeamKeys is the inbound allowlist of team keys ("ENG"). It is required
 	// unless AllowAllTeams is set.
 	TeamKeys      []string
 	AllowAllTeams bool
-	// BotUserID is the app's own user ID; its comments are never imported.
+	// BotUserID is the app's own user ID; its comments and issues never open a
+	// second thread or import as someone else's. It is required: without it
+	// the adapter can't fail closed on its own events.
 	BotUserID string
 	// APIBaseURL defaults to https://api.linear.app/graphql.
 	APIBaseURL   string
@@ -50,6 +69,14 @@ func (c Config) Validate() error {
 	}
 	if c.WebhookSecret.Empty() {
 		return fmt.Errorf("%w: linear signing secret is unset", boardsync.ErrUnauthorized)
+	}
+	if c.BotUserID == "" {
+		return fmt.Errorf("%w: linear needs the app's own user ID (BotUserID) to fail closed", boardsync.ErrBadRequest)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.TokenScheme)) {
+	case "", "auto", "api_key", "bearer":
+	default:
+		return fmt.Errorf("%w: token scheme %q isn't api_key, bearer, or auto", boardsync.ErrBadRequest, c.TokenScheme)
 	}
 	if !c.AllowAllTeams && len(c.TeamKeys) == 0 {
 		return fmt.Errorf("%w: linear needs an inbound team allowlist (or AllowAllTeams)", boardsync.ErrBadRequest)
@@ -97,6 +124,13 @@ func (c Config) httpClient() *http.Client {
 		return c.HTTPClient
 	}
 	return &http.Client{Timeout: 15 * time.Second}
+}
+
+func (c Config) tokenScheme() string {
+	if scheme := strings.ToLower(strings.TrimSpace(c.TokenScheme)); scheme != "" {
+		return scheme
+	}
+	return "auto"
 }
 
 func (c Config) teamAllowed(key string) bool {
@@ -224,6 +258,7 @@ type commentData struct {
 	Body      string     `json:"body"`
 	IssueID   string     `json:"issueId"`
 	Issue     *issueData `json:"issue"`
+	UserID    string     `json:"userId"`
 	User      *user      `json:"user"`
 	ParentID  string     `json:"parentId"`
 	URL       string     `json:"url"`
@@ -331,10 +366,10 @@ type issueProperties struct {
 func propertiesOf(item *issueData) issueProperties {
 	out := issueProperties{Labels: map[string]string{}}
 	if item.Identifier != "" {
-		out.Labels["issue"] = item.Identifier
+		out.Labels["issue"] = clampLabelValue(item.Identifier)
 	}
 	if state := stateType(item.State); state != "" {
-		out.Labels["state"] = state
+		out.Labels["state"] = clampLabelValue(state)
 	} else {
 		out.Unset = append(out.Unset, "state")
 	}
@@ -347,24 +382,24 @@ func propertiesOf(item *issueData) issueProperties {
 		out.Labels["priority"] = strconv.Itoa(item.Priority)
 	}
 	if item.Project != nil && item.Project.Name != "" {
-		out.Labels["project"] = item.Project.Name
+		out.Labels["project"] = clampLabelValue(item.Project.Name)
 	} else if item.ProjectID == "" {
 		out.Unset = append(out.Unset, "project")
 	}
 	if item.Labels.Present {
 		out.Owns = append(out.Owns, "tag.")
 		for _, label := range item.Labels.Nodes {
-			key := slug(label.Name)
+			key := labelKey("tag.", label.Name)
 			if key != "" {
-				out.Labels["tag."+key] = label.Name
+				out.Labels[key] = clampLabelValue(label.Name)
 			}
 		}
 	}
 	if item.Assignee != nil {
 		out.Owns = append(out.Owns, "assignee.")
 		handle := handleOf(item.Assignee)
-		if key := slug(handle); key != "" {
-			out.Labels["assignee."+key] = handle
+		if key := labelKey("assignee.", handle); key != "" {
+			out.Labels[key] = clampLabelValue(handle)
 		}
 	} else if item.AssigneeID == "" {
 		// Linear leaves an empty assignee out of the payload, sometimes
@@ -379,15 +414,15 @@ func issueLabelsFor(item *issueData) map[string]string {
 }
 
 func issueRootText(item *issueData) string {
-	head := item.Title
+	head := clampText(item.Title, MaxTextChars)
 	if item.Identifier != "" {
-		head = item.Identifier + ": " + item.Title
+		head = item.Identifier + ": " + head
 	}
 	if item.URL != "" {
 		head += "\n" + item.URL
 	}
-	if strings.TrimSpace(item.Description) != "" {
-		head += "\n\n" + item.Description
+	if description := strings.TrimSpace(item.Description); description != "" {
+		head += "\n\n" + clampText(description, MaxTextChars)
 	}
 	return head
 }
@@ -421,12 +456,51 @@ func slug(name string) string {
 	return out
 }
 
+func labelKey(prefix, name string) string {
+	key := prefix + slug(name)
+	if len(key) > 64 {
+		key = key[:64]
+	}
+	return key
+}
+
+func clampLabelValue(value string) string {
+	value = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, value)
+	return clampRunes(value, MaxLabelValueChars)
+}
+
+func clampText(text string, max int) string {
+	return clampRunes(boardsync.StorableText(text, boardsync.MaxTextBytes), max)
+}
+
+func clampRunes(text string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(text) <= max {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:max])
+}
+
+func clampRaw(body []byte) json.RawMessage {
+	if len(body) <= MaxRawBytes {
+		return json.RawMessage(append([]byte(nil), body...))
+	}
+	note, _ := json.Marshal(map[string]any{"truncated": true, "bytes": len(body)})
+	return json.RawMessage(note)
+}
+
 // Client is Linear's GraphQL client. It is the only place the token is
 // revealed.
 type Client struct {
 	endpoint string
 	http     *http.Client
 	token    boardsync.Secret
+	scheme   string
 }
 
 // NewClient returns a GraphQL client. endpoint may be empty.
@@ -437,7 +511,24 @@ func NewClient(endpoint string, httpClient *http.Client, token boardsync.Secret)
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Client{endpoint: endpoint, http: httpClient, token: token}
+	return &Client{endpoint: endpoint, http: httpClient, token: token, scheme: "auto"}
+}
+
+// authorization is the header value for the configured token scheme. Linear
+// personal API keys go bare; OAuth and app tokens use Bearer.
+func (c *Client) authorization() string {
+	token := c.token.Reveal()
+	switch strings.ToLower(strings.TrimSpace(c.scheme)) {
+	case "api_key":
+		return token
+	case "bearer":
+		return "Bearer " + token
+	default:
+		if strings.HasPrefix(token, "lin_api_") {
+			return token
+		}
+		return "Bearer " + token
+	}
 }
 
 type graphqlRequest struct {
@@ -457,19 +548,43 @@ type graphqlResponse struct {
 	Errors []graphqlError  `json:"errors"`
 }
 
+// RateLimitedError is a 429 with its Retry-After, when Linear sent one.
+type RateLimitedError struct {
+	After int
+}
+
+func (e *RateLimitedError) Error() string {
+	if e.After > 0 {
+		return fmt.Sprintf("sync: rate limited: linear rate-limited (retry after %ds)", e.After)
+	}
+	return "sync: rate limited: linear rate-limited"
+}
+
+func (e *RateLimitedError) Unwrap() error { return boardsync.ErrRateLimited }
+
+// RetryAfterSeconds reads the Retry-After an error carries, or zero.
+func RetryAfterSeconds(err error) int {
+	var limited *RateLimitedError
+	if errors.As(err, &limited) {
+		return limited.After
+	}
+	return 0
+}
+
 // classifyStatus maps a non-2xx GraphQL HTTP answer to the sync error the
-// outbox and webhook path understand. A 5xx and anything unlisted stay plain,
-// so they are retried; 4xx answers are permanent.
-func classifyStatus(status int) error {
+// outbox and webhook path understand. 408, 409, 425, 429, and 5xx are
+// transient; other 4xx answers are permanent.
+func classifyStatus(status int, header http.Header) error {
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
 		return fmt.Errorf("%w: linear HTTP %d", boardsync.ErrUnauthorized, status)
 	case status == http.StatusNotFound:
 		return fmt.Errorf("%w: linear HTTP %d", boardsync.ErrNotFound, status)
 	case status == http.StatusTooManyRequests:
-		return fmt.Errorf("%w: linear rate-limited", boardsync.ErrRateLimited)
-	case status == http.StatusBadRequest || status == http.StatusConflict ||
-		status == http.StatusUnprocessableEntity:
+		return &RateLimitedError{After: boardsync.RetryAfter(header)}
+	case status == http.StatusRequestTimeout || status == http.StatusConflict || status == http.StatusTooEarly:
+		return fmt.Errorf("linear transient HTTP %d", status)
+	case status == http.StatusBadRequest || status == http.StatusUnprocessableEntity:
 		return fmt.Errorf("%w: linear refused the request (HTTP %d)", boardsync.ErrBadRequest, status)
 	case status >= 500 && status <= 599:
 		return fmt.Errorf("linear server error HTTP %d", status)
@@ -498,6 +613,9 @@ func classifyGraphQL(err graphqlError) error {
 		return fmt.Errorf("%w: linear resource not found", boardsync.ErrNotFound)
 	case "INVALID_INPUT", "BAD_USER_INPUT", "GRAPHQL_VALIDATION_FAILED":
 		return fmt.Errorf("%w: linear rejected the query (%s)", boardsync.ErrBadRequest, code)
+	case "INTERNAL_SERVER_ERROR", "INTERNAL", "SERVICE_UNAVAILABLE", "UNAVAILABLE",
+		"TIMEOUT", "DEADLINE_EXCEEDED", "TRANSIENT_ERROR", "TRY_AGAIN":
+		return fmt.Errorf("linear transient graphql error (%s)", code)
 	default:
 		if code == "" {
 			return boardsync.Permanent(errors.New("linear graphql error"))
@@ -519,7 +637,7 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		return err
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+c.token.Reveal())
+	request.Header.Set("Authorization", c.authorization())
 	response, err := c.http.Do(request)
 	if err != nil {
 		return boardsync.RedactError(err, c.token)
@@ -530,7 +648,7 @@ func (c *Client) do(ctx context.Context, query string, variables map[string]any,
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return classifyStatus(response.StatusCode)
+		return classifyStatus(response.StatusCode, response.Header)
 	}
 	var decoded graphqlResponse
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -562,12 +680,8 @@ const issueByIDQuery = `query IssueByID($id: String!) {
   }
 }`
 
-const commentCreateMutation = `mutation CommentCreate($issueId: String!, $body: String!) {
-  commentCreate(input: { issueId: $issueId, body: $body }) { success comment { id } }
-}`
-
-const issueCreateMutation = `mutation IssueCreate($teamId: String!, $title: String!, $description: String!) {
-  issueCreate(input: { teamId: $teamId, title: $title, description: $description }) { success issue { id identifier team { key } } }
+const commentCreateMutation = `mutation CommentCreate($issueId: String!, $body: String!, $parentId: String) {
+  commentCreate(input: { issueId: $issueId, body: $body, parentId: $parentId }) { success comment { id } }
 }`
 
 const commentUpdateMutation = `mutation CommentUpdate($id: String!, $body: String!) {
@@ -602,9 +716,23 @@ func (c *Client) IssueByKey(ctx context.Context, teamKey string, number int) (is
 	return out.Issues.Nodes[0], nil
 }
 
-const issueUpdateMutation = `mutation IssueUpdate($id: String!, $description: String!) {
-  issueUpdate(id: $id, input: { description: $description }) { success }
+const issueRefByIDQuery = `query IssueRefByID($id: String!) {
+  issue(id: $id) { id identifier team { id key } }
 }`
+
+// IssueRefByID reads the identity a comment needs without the issue's body.
+func (c *Client) IssueRefByID(ctx context.Context, id string) (issueRef, error) {
+	var out struct {
+		Issue issueRef `json:"issue"`
+	}
+	if err := c.do(ctx, issueRefByIDQuery, map[string]any{"id": id}, &out); err != nil {
+		return issueRef{}, err
+	}
+	if out.Issue.ID == "" {
+		return issueRef{}, fmt.Errorf("%w: no linear issue %s", boardsync.ErrNotFound, id)
+	}
+	return out.Issue, nil
+}
 
 // IssueByID reads one issue.
 func (c *Client) IssueByID(ctx context.Context, id string) (issueData, error) {
@@ -620,8 +748,8 @@ func (c *Client) IssueByID(ctx context.Context, id string) (issueData, error) {
 	return out.Issue, nil
 }
 
-// CreateComment comments on an issue.
-func (c *Client) CreateComment(ctx context.Context, issueID, body string) (string, error) {
+// CreateComment comments on an issue, or replies to a parent comment.
+func (c *Client) CreateComment(ctx context.Context, issueID, body, parentID string) (string, error) {
 	var out struct {
 		CommentCreate struct {
 			Success bool `json:"success"`
@@ -630,7 +758,11 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) (strin
 			} `json:"comment"`
 		} `json:"commentCreate"`
 	}
-	if err := c.do(ctx, commentCreateMutation, map[string]any{"issueId": issueID, "body": body}, &out); err != nil {
+	variables := map[string]any{"issueId": issueID, "body": body}
+	if parentID != "" {
+		variables["parentId"] = parentID
+	}
+	if err := c.do(ctx, commentCreateMutation, variables, &out); err != nil {
 		return "", err
 	}
 	if !out.CommentCreate.Success || out.CommentCreate.Comment.ID == "" {
@@ -639,15 +771,23 @@ func (c *Client) CreateComment(ctx context.Context, issueID, body string) (strin
 	return out.CommentCreate.Comment.ID, nil
 }
 
-// CreateIssue opens an issue in a team.
-func (c *Client) CreateIssue(ctx context.Context, teamID, title, description string) (issueRef, error) {
+// CreateIssue opens an issue in a team with its board properties.
+func (c *Client) CreateIssue(ctx context.Context, teamID, title, description string, update issueUpdate) (issueRef, error) {
+	input := newGraphqlInput(map[string]any{})
+	input.add("teamId", "String!", teamID)
+	input.add("title", "String!", title)
+	input.add("description", "String!", description)
+	update.SetDescription = false
+	input.addIssueProperties(update)
+	query := fmt.Sprintf("mutation IssueCreate(%s) { issueCreate(input: { %s }) { success issue { id identifier team { key } } } }",
+		strings.Join(input.defs, ", "), strings.Join(input.fields, ", "))
 	var out struct {
 		IssueCreate struct {
 			Success bool     `json:"success"`
 			Issue   issueRef `json:"issue"`
 		} `json:"issueCreate"`
 	}
-	if err := c.do(ctx, issueCreateMutation, map[string]any{"teamId": teamID, "title": title, "description": description}, &out); err != nil {
+	if err := c.do(ctx, query, input.variables, &out); err != nil {
 		return issueRef{}, err
 	}
 	if !out.IssueCreate.Success || out.IssueCreate.Issue.ID == "" {
@@ -668,22 +808,6 @@ func (c *Client) UpdateComment(ctx context.Context, id, body string) error {
 	}
 	if !out.CommentUpdate.Success {
 		return boardsync.Permanent(errors.New("linear commentUpdate failed"))
-	}
-	return nil
-}
-
-// UpdateIssue replaces an issue's description for a root the board opened.
-func (c *Client) UpdateIssue(ctx context.Context, id, description string) error {
-	var out struct {
-		IssueUpdate struct {
-			Success bool `json:"success"`
-		} `json:"issueUpdate"`
-	}
-	if err := c.do(ctx, issueUpdateMutation, map[string]any{"id": id, "description": description}, &out); err != nil {
-		return err
-	}
-	if !out.IssueUpdate.Success {
-		return boardsync.Permanent(errors.New("linear issueUpdate failed"))
 	}
 	return nil
 }
