@@ -585,7 +585,8 @@ func (h *SyncHost) importReaction(ctx context.Context, req boardsync.ImportReque
 }
 
 // importLifecycle applies a platform lifecycle event to a thread the board
-// syncs, or creates its root when the event says to.
+// syncs, or creates its root when the event says to. Root creation shares the
+// same per-thread lock as message roots.
 func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
 	mapping, mapped, err := h.lookupThread(ctx, req.Tenant, req.Key, event)
 	if err != nil {
@@ -595,64 +596,89 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 		if !event.Lifecycle.CreateRoot || req.Channel == "" {
 			return boardsync.ImportResult{}, nil
 		}
-		text := event.Lifecycle.Title
-		if event.Lifecycle.Body != "" {
-			text += "\n\n" + event.Lifecycle.Body
+		lockTarget := boardsync.ResolvedTarget{
+			Key: req.Key, Platform: event.Platform, Channel: event.Channel,
+			Thread: event.Thread, Kind: boardsync.TargetThread,
 		}
-		labels := sanitizeLabels(event.Lifecycle.Labels)
-		for key, value := range sanitizeLabels(req.Overrides.Labels) {
-			labels[key] = value
-		}
-		text, labels, err = overrideRoot(req, event, text)
+		release, err := h.store.LockTarget(ctx, req.Tenant, req.Key, lockTarget)
 		if err != nil {
 			return boardsync.ImportResult{}, err
 		}
-		key, digest := syncEventKey("lifecycle", req)
-		var result boardsync.ImportResult
-		err = h.board.Update(ctx, req.Tenant, log.UpdateOptions{Idempotency: &log.Idempotency{Key: key, Digest: digest}}, func(tx *log.Tx) error {
-			if replay, ok := tx.Replay(); ok {
-				result.Message = lastMessageID(replay.MessageIDs)
-				result.Root = result.Message
-				result.CreatedRoot = true
-				return nil
-			}
-			offset := h.emitActorSeen(tx, event)
-			id := tx.NextID(offset)
-			tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
-				ID: id, Channel: req.Channel, Text: text,
-				Thread: log.ThreadKey(id), Labels: nonNilLabels(labels),
-				By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
-				Origin: originOf(event), Links: h.lifecycleLinks(event.Lifecycle),
-			})
-			tx.RecordResult(id)
-			result = boardsync.ImportResult{Root: id, Message: id, CreatedRoot: true}
-			return nil
-		})
+		defer release()
+		mapping, mapped, err = h.lookupThread(ctx, req.Tenant, req.Key, event)
 		if err != nil {
-			return result, err
+			return boardsync.ImportResult{}, err
 		}
-		if result.CreatedRoot {
-			threads, threadErr := h.threadTargetsFor(req, event)
-			if threadErr != nil {
-				return result, threadErr
-			}
-			for _, target := range threads {
-				if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
-					Tenant: req.Tenant, BoardThread: result.Root, Key: target.Key,
-					Platform: target.Platform, Channel: target.Channel,
-					Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
-					Since: result.Root,
-				}); err != nil {
-					return result, err
-				}
-			}
+		if !mapped {
+			return h.importLifecycleRoot(ctx, req, event)
 		}
-		return result, nil
 	}
+	return h.importLifecycleMapped(ctx, req, event, mapping)
+}
 
-	key, digest := syncEventKey("lifecycle", req)
+// importLifecycleRoot opens a thread root from a lifecycle subject.
+func (h *SyncHost) importLifecycleRoot(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event) (boardsync.ImportResult, error) {
+	text := event.Lifecycle.Title
+	if event.Lifecycle.Body != "" {
+		text += "\n\n" + event.Lifecycle.Body
+	}
+	labels := sanitizeLabels(event.Lifecycle.Labels)
+	for key, value := range sanitizeLabels(req.Overrides.Labels) {
+		labels[key] = value
+	}
+	text, labels, err := overrideRoot(req, event, text)
+	if err != nil {
+		return boardsync.ImportResult{}, err
+	}
+	key, digest := syncRootKey(req, event), rootDigest(req, event)
 	var result boardsync.ImportResult
 	err = h.board.Update(ctx, req.Tenant, log.UpdateOptions{Idempotency: &log.Idempotency{Key: key, Digest: digest}}, func(tx *log.Tx) error {
+		if replay, ok := tx.Replay(); ok {
+			result.Message = lastMessageID(replay.MessageIDs)
+			result.Root = result.Message
+			result.CreatedRoot = true
+			return nil
+		}
+		offset := h.emitActorSeen(tx, event)
+		id := tx.NextID(offset)
+		tx.Emit(log.EventMessagePosted, &log.MessagePostedPayload{
+			ID: id, Channel: req.Channel, Text: text,
+			Thread: log.ThreadKey(id), Labels: nonNilLabels(labels),
+			By: boardsyncAuthor(event, req.Key), From: stringPtr(string(req.Key)),
+			Origin: originOf(event), Links: h.lifecycleLinks(event.Lifecycle),
+		})
+		tx.RecordResult(id)
+		result = boardsync.ImportResult{Root: id, Message: id, CreatedRoot: true}
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+	if result.CreatedRoot {
+		targets, targetErr := h.threadTargetsFor(req, event)
+		if targetErr != nil {
+			return result, targetErr
+		}
+		for _, target := range targets {
+			if _, err := h.store.UpsertThread(ctx, syncstore.Thread{
+				Tenant: req.Tenant, BoardThread: result.Root, Key: target.Key,
+				Platform: target.Platform, Channel: target.Channel,
+				Thread: target.Thread, Subthread: target.Subthread, Kind: target.Kind,
+				Since: result.Root,
+			}); err != nil {
+				return result, err
+			}
+		}
+	}
+	return result, nil
+}
+
+// importLifecycleMapped reconciles labels, a retitle, and a reply on an
+// existing board thread.
+func (h *SyncHost) importLifecycleMapped(ctx context.Context, req boardsync.ImportRequest, event boardsync.Event, mapping syncstore.Thread) (boardsync.ImportResult, error) {
+	key, digest := syncEventKey("lifecycle", req)
+	var result boardsync.ImportResult
+	err := h.board.Update(ctx, req.Tenant, log.UpdateOptions{Idempotency: &log.Idempotency{Key: key, Digest: digest}}, func(tx *log.Tx) error {
 		if replay, ok := tx.Replay(); ok {
 			result.Message = lastMessageID(replay.MessageIDs)
 			result.Root = mapping.BoardThread
@@ -666,8 +692,8 @@ func (h *SyncHost) importLifecycle(ctx context.Context, req boardsync.ImportRequ
 		if lifecycle := event.Lifecycle; lifecycle != nil {
 			set := sanitizeLabels(lifecycle.Labels)
 			unset := append(append([]string(nil), lifecycle.Unset...), req.Overrides.Unset...)
-			for key, value := range sanitizeLabels(req.Overrides.Labels) {
-				set[key] = value
+			for label, value := range sanitizeLabels(req.Overrides.Labels) {
+				set[label] = value
 			}
 			if len(set) > 0 || len(unset) > 0 {
 				offset += emitLabelChanges(tx, event, root, set, unset)
