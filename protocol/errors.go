@@ -50,6 +50,7 @@ const (
 	CodeTaskFinished       Code = "task_finished"
 	CodeClaimLost          Code = "claim_lost"
 	CodeConflict           Code = "conflict"
+	CodeSyncDisabled       Code = "sync_disabled"
 	CodeUnavailable        Code = "unavailable"
 	CodeInternal           Code = "internal"
 )
@@ -94,6 +95,7 @@ var statuses = map[Code]int{
 	CodeTaskFinished:       http.StatusConflict,
 	CodeClaimLost:          http.StatusConflict,
 	CodeConflict:           http.StatusConflict,
+	CodeSyncDisabled:       http.StatusConflict,
 	CodeUnavailable:        http.StatusServiceUnavailable,
 	CodeInternal:           http.StatusInternalServerError,
 }

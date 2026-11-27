@@ -996,6 +996,31 @@ func (p *Postgres) OutboxDepthByKey(ctx context.Context, tenant string) (map[boa
 	return out, nil
 }
 
+// OutboxDepthFor implements Store.
+func (p *Postgres) OutboxDepthFor(ctx context.Context, tenant string, key boardsync.Key) (OutboxDepth, error) {
+	if err := validTenant(tenant); err != nil {
+		return OutboxDepth{}, err
+	}
+	if err := expectKey(key); err != nil {
+		return OutboxDepth{}, err
+	}
+	var depth OutboxDepth
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT
+				count(*) FILTER (WHERE state = 'pending'),
+				count(*) FILTER (WHERE state = 'leased'),
+				count(*) FILTER (WHERE state = 'done'),
+				count(*) FILTER (WHERE state = 'dead')
+			FROM board_sync_outbox WHERE tenant_id = $1 AND sync_key = $2`, tenant, string(key)).
+			Scan(&depth.Pending, &depth.Leased, &depth.Done, &depth.Dead)
+	})
+	if err != nil {
+		return OutboxDepth{}, err
+	}
+	return depth, nil
+}
+
 const copyColumns = `id, board_message, board_thread, sync_key, platform, channel,
 	thread, subthread, kind, external_thread, external_message, files, files_set,
 	created_at, updated_at`

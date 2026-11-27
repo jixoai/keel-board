@@ -158,26 +158,59 @@ func optionalSecretFromEnv(key boardsync.Key, setting string) boardsync.Secret {
 	return boardsync.Secret(os.Getenv(envName(key, setting)))
 }
 
+// boolFromEnv reads an optional strict boolean. Only true and false are
+// accepted (in any case); empty means false, and anything else is a
+// configuration error so a typo never silently disables or enables a
+// capability.
+func boolFromEnv(key boardsync.Key, setting string) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(envName(key, setting)))
+	switch strings.ToLower(raw) {
+	case "":
+		return false, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("sync key %q: %s must be true or false", key, envName(key, setting))
+	}
+}
+
+// slackConfigFromEnv builds one Slack entry's configuration from its
+// documented KEEL_SYNC_<KEY>_* variables.
+func slackConfigFromEnv(key boardsync.Key) (slack.Config, error) {
+	if err := requireIdentity(key, "BOT_USER_ID", "BOT_ID"); err != nil {
+		return slack.Config{}, err
+	}
+	signing, err := secretFromEnv(key, "SIGNING_SECRET")
+	if err != nil {
+		return slack.Config{}, err
+	}
+	join, err := boolFromEnv(key, "JOIN_CHANNELS")
+	if err != nil {
+		return slack.Config{}, err
+	}
+	return slack.Config{
+		Key:           key,
+		SigningSecret: signing,
+		BotToken:      optionalSecretFromEnv(key, "BOT_TOKEN"),
+		BotUserID:     os.Getenv(envName(key, "BOT_USER_ID")),
+		BotID:         os.Getenv(envName(key, "BOT_ID")),
+		JoinChannels:  join,
+	}, nil
+}
+
 // buildProvider constructs the platform adapter for one connection from its
 // documented environment variables. Credentials never come from flags (which
 // are visible in a process list) or from the board log.
 func buildProvider(config *keyConfig) (boardsync.Provider, error) {
 	switch config.platform {
 	case "slack":
-		if err := requireIdentity(config.key, "BOT_USER_ID", "BOT_ID"); err != nil {
-			return nil, err
-		}
-		signing, err := secretFromEnv(config.key, "SIGNING_SECRET")
+		cfg, err := slackConfigFromEnv(config.key)
 		if err != nil {
 			return nil, err
 		}
-		return slack.New(slack.Config{
-			Key:           config.key,
-			SigningSecret: signing,
-			BotToken:      optionalSecretFromEnv(config.key, "BOT_TOKEN"),
-			BotUserID:     os.Getenv(envName(config.key, "BOT_USER_ID")),
-			BotID:         os.Getenv(envName(config.key, "BOT_ID")),
-		})
+		return slack.New(cfg)
 	case "github":
 		webhook, err := secretFromEnv(config.key, "WEBHOOK_SECRET")
 		if err != nil {

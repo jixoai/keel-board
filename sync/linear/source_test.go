@@ -300,6 +300,9 @@ func TestReadSourceTeam(t *testing.T) {
 	if read.Messages[0].Author != "ada" || read.Messages[0].Replies != 1 {
 		t.Fatalf("message = %+v", read.Messages[0])
 	}
+	if read.Messages[0].AuthorID != "linear:user:user-1" {
+		t.Fatalf("authorId = %q", read.Messages[0].AuthorID)
+	}
 	if _, err := p.ReadSource(context.Background(), "linear", "OPS", linear.ReadOptions{}); !errors.Is(err, boardsync.ErrNotFound) {
 		t.Fatalf("unlisted team = %v", err)
 	}
@@ -353,6 +356,9 @@ func TestReadSourceIssue(t *testing.T) {
 	}
 	if read.Messages[1].ID != testCommentID || read.Messages[1].Author != "julian" || read.Messages[1].Text != "I reproduced this." {
 		t.Fatalf("comment = %+v", read.Messages[1])
+	}
+	if read.Messages[0].AuthorID != "linear:user:user-1" || read.Messages[1].AuthorID != "linear:user:user-2" {
+		t.Fatalf("authorIds = %q / %q", read.Messages[0].AuthorID, read.Messages[1].AuthorID)
 	}
 	if fake.callsContaining("query IssueByKey") != 1 || fake.callsContaining("query ReadIssue") != 1 {
 		t.Fatalf("calls = %v", fake.calls)

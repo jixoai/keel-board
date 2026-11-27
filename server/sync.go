@@ -1003,7 +1003,7 @@ func syncFailureFor(err error) *protocol.Error {
 	}
 	switch boardsync.StatusCode(err) {
 	case http.StatusBadRequest:
-		return protocol.Invalid("target: the platform target isn't usable")
+		return protocol.Invalid("the platform target or cursor isn't usable")
 	case http.StatusNotFound:
 		return protocol.NotFound(protocol.CodeNotFound, "no such platform target")
 	case http.StatusUnauthorized:

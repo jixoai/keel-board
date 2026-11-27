@@ -57,24 +57,24 @@ func (p *Provider) ReadSource(ctx context.Context, key boardsync.Key, target str
 			return SourceRead{}, fmt.Errorf("%w: empty linear project", boardsync.ErrBadRequest)
 		}
 		bySlug := !issueIDPattern.MatchString(ref) && !strings.Contains(ref, "-")
-		return p.readProject(ctx, ref, bySlug, opts, limit)
+		return p.readProject(ctx, key, ref, bySlug, opts, limit)
 	case projectURLPattern.MatchString(target):
 		ref := projectURLPattern.FindStringSubmatch(target)[1]
-		return p.readProject(ctx, ref, !issueIDPattern.MatchString(ref), opts, limit)
+		return p.readProject(ctx, key, ref, !issueIDPattern.MatchString(ref), opts, limit)
 	case issueURLPattern.MatchString(target):
-		return p.readIssueIdentifier(ctx, issueURLPattern.FindStringSubmatch(target)[1], opts, limit)
+		return p.readIssueIdentifier(ctx, key, issueURLPattern.FindStringSubmatch(target)[1], opts, limit)
 	case teamKeyFromIdentifier.MatchString(strings.ToUpper(target)):
-		return p.readIssueIdentifier(ctx, strings.ToUpper(target), opts, limit)
+		return p.readIssueIdentifier(ctx, key, strings.ToUpper(target), opts, limit)
 	case issueIDPattern.MatchString(target):
-		return p.readIssue(ctx, target, opts, limit)
+		return p.readIssue(ctx, key, target, opts, limit)
 	case teamKeyPattern.MatchString(strings.ToUpper(target)):
-		return p.readTeam(ctx, strings.ToUpper(target), opts, limit)
+		return p.readTeam(ctx, key, strings.ToUpper(target), opts, limit)
 	default:
 		return SourceRead{}, fmt.Errorf("%w: can't read %q from linear; name a team (ENG), a project link, or an issue (ENG-123)", boardsync.ErrBadRequest, target)
 	}
 }
 
-func (p *Provider) readTeam(ctx context.Context, teamKey string, opts ReadOptions, limit int) (SourceRead, error) {
+func (p *Provider) readTeam(ctx context.Context, key boardsync.Key, teamKey string, opts ReadOptions, limit int) (SourceRead, error) {
 	if !p.cfg.teamAllowed(teamKey) {
 		return SourceRead{}, fmt.Errorf("%w: team %s is not in the allowlist", boardsync.ErrNotFound, teamKey)
 	}
@@ -82,7 +82,7 @@ func (p *Provider) readTeam(ctx context.Context, teamKey string, opts ReadOption
 	if err != nil {
 		return SourceRead{}, err
 	}
-	read, err := p.readIssues(ctx, map[string]any{"team": map[string]any{"key": map[string]any{"eq": teamKey}}}, opts, limit)
+	read, err := p.readIssues(ctx, key, map[string]any{"team": map[string]any{"key": map[string]any{"eq": teamKey}}}, opts, limit)
 	if err != nil {
 		return SourceRead{}, err
 	}
@@ -92,7 +92,7 @@ func (p *Provider) readTeam(ctx context.Context, teamKey string, opts ReadOption
 	return read, nil
 }
 
-func (p *Provider) readProject(ctx context.Context, ref string, bySlug bool, opts ReadOptions, limit int) (SourceRead, error) {
+func (p *Provider) readProject(ctx context.Context, key boardsync.Key, ref string, bySlug bool, opts ReadOptions, limit int) (SourceRead, error) {
 	ref = strings.TrimSpace(ref)
 	var (
 		project projectInfo
@@ -109,7 +109,7 @@ func (p *Provider) readProject(ctx context.Context, ref string, bySlug bool, opt
 	if !p.projectAllowed(project) {
 		return SourceRead{}, fmt.Errorf("%w: linear project %s isn't in the allowlist", boardsync.ErrNotFound, project.ID)
 	}
-	read, err := p.readIssues(ctx, map[string]any{"project": map[string]any{"id": map[string]any{"eq": project.ID}}}, opts, limit)
+	read, err := p.readIssues(ctx, key, map[string]any{"project": map[string]any{"id": map[string]any{"eq": project.ID}}}, opts, limit)
 	if err != nil {
 		return SourceRead{}, err
 	}
@@ -119,7 +119,7 @@ func (p *Provider) readProject(ctx context.Context, ref string, bySlug bool, opt
 	return read, nil
 }
 
-func (p *Provider) readIssues(ctx context.Context, filter map[string]any, opts ReadOptions, limit int) (SourceRead, error) {
+func (p *Provider) readIssues(ctx context.Context, key boardsync.Key, filter map[string]any, opts ReadOptions, limit int) (SourceRead, error) {
 	page, err := p.client.Issues(ctx, filter, limit, opts.After)
 	if err != nil {
 		return SourceRead{}, err
@@ -131,14 +131,14 @@ func (p *Provider) readIssues(ctx context.Context, filter map[string]any, opts R
 		if !p.cfg.teamAllowed(teamKey) {
 			continue
 		}
-		message := sourceIssueMessage(&issue.issueData, issueThread(teamKey, issue.ID), listedDescriptionBytes)
+		message := sourceIssueMessage(key, &issue.issueData, issueThread(teamKey, issue.ID), listedDescriptionBytes)
 		message.Replies = len(issue.Comments.Nodes)
 		messages = append(messages, message)
 	}
 	return SourceRead{Messages: messages, More: page.PageInfo.HasNextPage, Next: page.PageInfo.EndCursor}, nil
 }
 
-func (p *Provider) readIssueIdentifier(ctx context.Context, identifier string, opts ReadOptions, limit int) (SourceRead, error) {
+func (p *Provider) readIssueIdentifier(ctx context.Context, key boardsync.Key, identifier string, opts ReadOptions, limit int) (SourceRead, error) {
 	identifier = strings.ToUpper(identifier)
 	teamKey := teamOfIdentifier(identifier)
 	if teamKey == "" {
@@ -161,10 +161,10 @@ func (p *Provider) readIssueIdentifier(ctx context.Context, identifier string, o
 	if got := strings.ToUpper(issue.Team.Key); got != "" && got != teamKey {
 		return SourceRead{}, fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, identifier, got, teamKey)
 	}
-	return p.readIssue(ctx, issue.ID, opts, limit)
+	return p.readIssue(ctx, key, issue.ID, opts, limit)
 }
 
-func (p *Provider) readIssue(ctx context.Context, issueID string, opts ReadOptions, limit int) (SourceRead, error) {
+func (p *Provider) readIssue(ctx context.Context, key boardsync.Key, issueID string, opts ReadOptions, limit int) (SourceRead, error) {
 	issue, err := p.client.IssueWithComments(ctx, issueID, limit, opts.After)
 	if err != nil {
 		return SourceRead{}, err
@@ -176,14 +176,15 @@ func (p *Provider) readIssue(ctx context.Context, issueID string, opts ReadOptio
 	thread := issueThread(teamKey, issue.ID)
 	read := SourceRead{Kind: "issue", Channel: teamKey, Thread: thread}
 	if opts.After == "" {
-		root := sourceIssueMessage(&issue.issueData, thread, 0)
+		root := sourceIssueMessage(key, &issue.issueData, thread, 0)
 		root.Replies = len(issue.Comments.Nodes)
 		read.Messages = append(read.Messages, root)
 	}
 	for _, comment := range issue.Comments.Nodes {
 		read.Messages = append(read.Messages, SourceMessage{
 			ID: comment.ID, Thread: thread, Author: handleOf(comment.User),
-			Text: clampText(comment.Body, MaxCommentChars), CreatedAt: comment.CreatedAt,
+			AuthorID: sourceAuthorID(key, comment.User),
+			Text:     clampText(comment.Body, MaxCommentChars), CreatedAt: comment.CreatedAt,
 		})
 	}
 	read.More = issue.Comments.PageInfo.HasNextPage
@@ -255,7 +256,16 @@ func (p *Provider) projectAllowed(project projectInfo) bool {
 	return true
 }
 
-func sourceIssueMessage(issue *issueData, thread string, descriptionMax int) SourceMessage {
+// sourceAuthorID is the connection-prefixed identity the board would store
+// for a Linear user, matching sync.KeyedID's "key:user:<id>" shape.
+func sourceAuthorID(key boardsync.Key, u *user) string {
+	if u == nil || u.ID == "" {
+		return ""
+	}
+	return boardsync.KeyedID(key, "linear", "linear:user:"+u.ID)
+}
+
+func sourceIssueMessage(key boardsync.Key, issue *issueData, thread string, descriptionMax int) SourceMessage {
 	properties := make([]string, 0, 5)
 	if issue.State.Name != "" {
 		properties = append(properties, issue.State.Name)
@@ -297,7 +307,8 @@ func sourceIssueMessage(issue *issueData, thread string, descriptionMax int) Sou
 	}
 	return SourceMessage{
 		ID: issue.Identifier, Thread: thread, Author: handleOf(issue.Creator),
-		Text: head, CreatedAt: issue.CreatedAt,
+		AuthorID: sourceAuthorID(key, issue.Creator),
+		Text:     head, CreatedAt: issue.CreatedAt,
 	}
 }
 

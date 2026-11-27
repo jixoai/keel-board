@@ -76,7 +76,7 @@ fake 平台使用自签 CA/证书，只被 harness 注入的 client 信任；ada
 | automation watcher/schedule | 创建 watcher、匹配标签事件→bot post、delivery done；一次性 schedule 到点写入、status done/sent=1、视图不回显 text |
 | Chat SDK bridge | sidecar `/deliver` message/edit/reaction/delete；`PushInbound` root/edit；HMAC 坏签名/重放 nonce/过期 timestamp；self author 丢弃 |
 | typing | board 级：board reply → outbox worker → `assistant.threads.setStatus`；adapter 级直接调用另测 |
-| source read / join | `GET /sources/{key}/read`：Slack channel/thread（`conversations.info`/`history`/`replies`）与 Linear issue 归一化只读结果，board head 不变；`POST /sources/{key}/join`：Slack opt-in join 与幂等，Linear 未实现返回 501；缺失/未知/私有目标分别 400/404/501；单 entry status 与未知 key 404 |
+| source read / join | `GET /sources/{key}/read`：Slack channel/thread（`conversations.info`/`history`/`replies`）、Linear issue、GitHub PR/issue/comments（repo allowlist、Link 分页）归一化只读结果，board head 不变；`POST /sources/{key}/join`：Slack opt-in join 与幂等，Linear 未实现返回 501；缺失/未知/私有目标分别 400/404/501，disabled 409；单 entry status 含 per-key outbox 与 bounded failures/deadInbox；未知 key 404 |
 
 显式 SKIP 都是“本 harness 未覆盖/本期范围外”，不是“产品不存在”：
 只剩“真实 cmd/board 承载镜像链路”（无平台 endpoint 注入缝，改用 harness-hosted

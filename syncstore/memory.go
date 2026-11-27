@@ -758,6 +758,35 @@ func (m *Memory) OutboxDepthByKey(_ context.Context, tenant string) (map[boardsy
 	return out, nil
 }
 
+// OutboxDepthFor implements Store.
+func (m *Memory) OutboxDepthFor(_ context.Context, tenant string, key boardsync.Key) (OutboxDepth, error) {
+	if err := validTenant(tenant); err != nil {
+		return OutboxDepth{}, err
+	}
+	if err := expectKey(key); err != nil {
+		return OutboxDepth{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var depth OutboxDepth
+	for _, row := range m.tenantLocked(tenant).outbox {
+		if row.delivery.Key != key {
+			continue
+		}
+		switch row.state {
+		case StatePending:
+			depth.Pending++
+		case StateLeased:
+			depth.Leased++
+		case StateDone:
+			depth.Done++
+		case StateDead:
+			depth.Dead++
+		}
+	}
+	return depth, nil
+}
+
 // Copy implements Store.
 func (m *Memory) Copy(_ context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error) {
 	if err := validTenant(tenant); err != nil {

@@ -120,6 +120,7 @@ func (e *e2eEnv) scenarioSources() {
 				{"未知频道", "/sources/slack/read?target=C0UNKNOWN", http.StatusNotFound, protocol.CodeNotFound},
 				{"私有频道", "/sources/slack/read?target=" + slackPrivateChan, http.StatusNotImplemented, protocol.CodeUnsupported},
 				{"未注册 key", "/sources/missing/read?target=" + slackSourceChannel, http.StatusNotFound, protocol.CodeNotFound},
+				{"非法 cursor", "/sources/slack/read?target=" + slackSourceChannel + "&after=bad-cursor", http.StatusBadRequest, protocol.CodeInvalidRequest},
 			}
 			for _, tc := range cases {
 				status, body, err := e.api(step, tc.name, http.MethodGet, tc.path, nil)
@@ -233,9 +234,84 @@ func (e *e2eEnv) scenarioSources() {
 		return
 	}
 
+	if err := sc.Step("source read：GitHub issue/PR/comments（allowlist、分页、只读）",
+		"GET /sources/github/read?target=acme/www:issue:45&limit=1（再 after=2）、target=acme/www:42、other/repo#1",
+		"200 issue/PR 根+评论且 AuthorID key-prefixed；Link 分页 More/Next；非 allowlist 404；无写调用", func(step *Step) error {
+			e.fake.ResetGitHub()
+			status, body, err := e.api(step, "github issue read", http.MethodGet,
+				"/sources/github/read?target=acme/www:issue:45&limit=1", nil)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("issue read 状态", http.StatusOK, status)
+			var read boardsync.SourceRead
+			if err := json.Unmarshal(body, &read); err != nil {
+				return fmt.Errorf("decode github issue read: %w (%s)", err, clip(string(body), 500))
+			}
+			step.CheckEQ("issue kind", "issue", read.Kind)
+			step.CheckEQ("issue channel", "acme/www:issues", read.Channel)
+			step.CheckEQ("issue thread", "acme/www:issue:45", read.Thread)
+			step.CheckEQ("issue name", "fake issue", read.Name)
+			step.CheckBool("issue more", true, read.More)
+			step.CheckEQ("issue next", "2", read.Next)
+			step.CheckEQ("issue 消息数（根 + 1 评论）", 2, len(read.Messages))
+			if len(read.Messages) == 2 {
+				step.CheckEQ("issue 根 ID", "acme/www#45", read.Messages[0].ID)
+				step.CheckEQ("issue 根 AuthorID", "github:user:1001", read.Messages[0].AuthorID)
+				step.CheckEQ("issue 评论 AuthorID", "github:user:1002", read.Messages[1].AuthorID)
+			}
+			status, body, err = e.api(step, "github issue page 2", http.MethodGet,
+				"/sources/github/read?target=acme/www:issue:45&limit=1&after=2", nil)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("page 2 状态", http.StatusOK, status)
+			if err := json.Unmarshal(body, &read); err != nil {
+				return fmt.Errorf("decode github page 2: %w (%s)", err, clip(string(body), 500))
+			}
+			step.CheckBool("page 2 more", false, read.More)
+			step.CheckEQ("page 2 只有评论", 1, len(read.Messages))
+			if len(read.Messages) == 1 {
+				step.CheckEQ("page 2 评论 ID", "9301", read.Messages[0].ID)
+				step.CheckEQ("page 2 评论 AuthorID", "github:user:1003", read.Messages[0].AuthorID)
+			}
+			status, body, err = e.api(step, "github PR read", http.MethodGet,
+				"/sources/github/read?target=acme/www:42", nil)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("PR read 状态", http.StatusOK, status)
+			if err := json.Unmarshal(body, &read); err != nil {
+				return fmt.Errorf("decode github PR read: %w (%s)", err, clip(string(body), 500))
+			}
+			step.CheckEQ("PR kind", "pull_request", read.Kind)
+			step.CheckEQ("PR channel", "acme/www:pulls", read.Channel)
+			step.CheckEQ("PR thread", "acme/www:42", read.Thread)
+			step.CheckEQ("PR 消息数", 2, len(read.Messages))
+			if len(read.Messages) == 2 {
+				step.CheckEQ("PR 根 ID", "acme/www#42", read.Messages[0].ID)
+				step.CheckEQ("PR 评论 AuthorID", "github:user:1002", read.Messages[1].AuthorID)
+			}
+			status, body, err = e.api(step, "github unlisted repo", http.MethodGet,
+				"/sources/github/read?target=other/repo%231", nil)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("非 allowlist 状态", http.StatusNotFound, status)
+			var failure protocol.ErrorBody
+			if err := json.Unmarshal(body, &failure); err != nil {
+				return fmt.Errorf("decode unlisted repo: %w (%s)", err, clip(string(body), 300))
+			}
+			step.CheckEQ("非 allowlist code", protocol.CodeNotFound, failure.Error.Code)
+			step.CheckEQ("GitHub 写调用", 0, githubNonGet(e.fake.GitHubWrites()))
+			return nil
+		}); err != nil {
+		return
+	}
+
 	if err := sc.Step("entry status：单条 sync entry",
 		"GET /v1/board/sync/entries/slack/status；GET .../missing/status",
-		"200 单个 entry（key/platform/enabled/owned/inbox/outbox）；未知 key 404", func(step *Step) error {
+		"200 单个 entry（key/platform/enabled/owned/inbox/outbox/failures/deadInbox）；未知 key 404", func(step *Step) error {
 			status, body, err := e.api(step, "slack entry status", http.MethodGet,
 				"/sync/entries/slack/status", nil)
 			if err != nil {
@@ -243,15 +319,15 @@ func (e *e2eEnv) scenarioSources() {
 			}
 			step.CheckEQ("status 状态", http.StatusOK, status)
 			var view struct {
-				Keys []struct {
-					Key      string `json:"key"`
-					Platform string `json:"platform"`
-					Enabled  bool   `json:"enabled"`
-					Owned    bool   `json:"owned"`
-					Inbox    struct {
-						Done int `json:"done"`
-					} `json:"inbox"`
-				} `json:"keys"`
+				Key       string `json:"key"`
+				Platform  string `json:"platform"`
+				Enabled   bool   `json:"enabled"`
+				Owned     bool   `json:"owned"`
+				Failures  int    `json:"failures"`
+				DeadInbox int    `json:"deadInbox"`
+				Inbox     struct {
+					Done int `json:"done"`
+				} `json:"inbox"`
 				Outbox struct {
 					Pending int `json:"pending"`
 					Leased  int `json:"leased"`
@@ -260,13 +336,12 @@ func (e *e2eEnv) scenarioSources() {
 			if err := json.Unmarshal(body, &view); err != nil {
 				return fmt.Errorf("decode entry status: %w (%s)", err, clip(string(body), 300))
 			}
-			step.CheckEQ("entry 数", 1, len(view.Keys))
-			if len(view.Keys) == 1 {
-				step.CheckEQ("key", "slack", view.Keys[0].Key)
-				step.CheckEQ("platform", "slack", view.Keys[0].Platform)
-				step.CheckBool("enabled", true, view.Keys[0].Enabled)
-				step.CheckBool("owned", true, view.Keys[0].Owned)
-			}
+			step.CheckEQ("key", "slack", view.Key)
+			step.CheckEQ("platform", "slack", view.Platform)
+			step.CheckBool("enabled", true, view.Enabled)
+			step.CheckBool("owned", true, view.Owned)
+			step.Check("failures 有界计数存在", view.Failures >= 0, ">=0", fmt.Sprint(view.Failures))
+			step.Check("deadInbox 有界计数存在", view.DeadInbox >= 0, ">=0", fmt.Sprint(view.DeadInbox))
 			status, body, err = e.api(step, "unknown entry status", http.MethodGet,
 				"/sync/entries/missing/status", nil)
 			if err != nil {
@@ -317,6 +392,18 @@ func mutationCalls(writes []linearWrite) int {
 	count := 0
 	for _, write := range writes {
 		if strings.Contains(write.Query, "mutation") {
+			count++
+		}
+	}
+	return count
+}
+
+// githubNonGet counts GitHub requests that aren't reads, so a source read is
+// proven read-only.
+func githubNonGet(writes []githubWrite) int {
+	count := 0
+	for _, write := range writes {
+		if write.Method != http.MethodGet {
 			count++
 		}
 	}

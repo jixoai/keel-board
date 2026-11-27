@@ -324,6 +324,10 @@ func slackAPIError(method, code string) error {
 		}
 	case code == "channel_not_found" || code == "message_not_found" || code == "thread_not_found" || code == "user_not_found" || code == "file_not_found":
 		apiErr.Err = boardsync.ErrNotFound
+	case code == "invalid_cursor":
+		// A cursor the caller sent isn't one Slack issued; the request is
+		// malformed, not the platform failing.
+		apiErr.Err = boardsync.ErrBadRequest
 	case code == "ratelimited":
 		apiErr.Err = &RateLimitError{Method: method}
 	case fileRefusals[code] && strings.HasPrefix(method, "files."):

@@ -545,6 +545,10 @@ func (s *slackFake) serve(w http.ResponseWriter, r *http.Request) string {
 		}})
 		return method
 	case "conversations.history":
+		if r.Form.Get("cursor") == "bad-cursor" {
+			writeSlackError(w, "invalid_cursor")
+			return method + " invalid_cursor"
+		}
 		channel := r.Form.Get("channel")
 		limit := 100
 		_, _ = fmt.Sscanf(r.Form.Get("limit"), "%d", &limit)
@@ -908,13 +912,32 @@ func (g *githubFake) serve(w http.ResponseWriter, r *http.Request) string {
 			return "react review comment"
 		}
 	}
+	if r.Method == http.MethodGet && len(parts) == 6 && parts[3] == "issues" && parts[5] == "comments" {
+		// /repos/{o}/{r}/issues/{n}/comments: one page of conversation
+		// comments, with a Link next page when per_page is small.
+		page := r.URL.Query().Get("page")
+		comments := []map[string]any{
+			{"id": 9300, "body": "first source comment", "created_at": "2026-01-02T05:00:00Z",
+				"user": map[string]any{"login": "julian", "id": 1002}},
+		}
+		if page == "2" {
+			comments = []map[string]any{
+				{"id": 9301, "body": "second source comment", "created_at": "2026-01-02T06:00:00Z",
+					"user": map[string]any{"login": "grace", "id": 1003}},
+			}
+		} else if r.URL.Query().Get("per_page") == "1" {
+			w.Header().Set("Link", `<https://api.github.com/repos/`+repo+`/issues/`+parts[4]+`/comments?per_page=1&page=2>; rel="next"`)
+		}
+		respond(comments)
+		return "list issue comments"
+	}
 	if r.Method == http.MethodGet && len(parts) >= 5 {
 		if parts[3] == "issues" {
-			respond(map[string]any{"number": numberAt(parts, 4), "title": "fake issue", "body": "fake body", "html_url": "https://github.com/" + repo + "/issues/" + parts[4], "user": map[string]any{"login": "ada", "id": 1001}})
+			respond(map[string]any{"number": numberAt(parts, 4), "title": "fake issue", "body": "fake body", "html_url": "https://github.com/" + repo + "/issues/" + parts[4], "comments": 1, "created_at": "2026-01-02T03:04:05Z", "user": map[string]any{"login": "ada", "id": 1001}})
 			return "get issue"
 		}
 		if parts[3] == "pulls" {
-			respond(map[string]any{"number": numberAt(parts, 4), "title": "fake PR", "body": "fake body", "html_url": "https://github.com/" + repo + "/pull/" + parts[4], "user": map[string]any{"login": "ada", "id": 1001}})
+			respond(map[string]any{"number": numberAt(parts, 4), "title": "fake PR", "body": "fake body", "html_url": "https://github.com/" + repo + "/pull/" + parts[4], "comments": 1, "created_at": "2026-01-02T03:04:05Z", "user": map[string]any{"login": "ada", "id": 1001}})
 			return "get pull"
 		}
 	}

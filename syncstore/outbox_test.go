@@ -109,6 +109,38 @@ func TestOutboxDeterministicAndLaneOrder(t *testing.T) {
 	})
 }
 
+func TestOutboxDepthForIsPerKey(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		event := postedEvent(10, 100, 100)
+		message := boardMessage(100, 100, "root")
+		slack := channelTarget("C0123")
+		github := boardsync.ResolvedTarget{Key: "github", Platform: "github", Channel: "acme/www:pulls", Kind: boardsync.TargetChannel}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack", event, message, []boardsync.ResolvedTarget{slack}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "github", event, message, []boardsync.ResolvedTarget{github}); err != nil {
+			t.Fatal(err)
+		}
+		all, err := store.OutboxDepth(ctx, "t1")
+		if err != nil || all.Pending != 2 {
+			t.Fatalf("tenant depth = %+v, %v", all, err)
+		}
+		slackDepth, err := store.OutboxDepthFor(ctx, "t1", "slack")
+		if err != nil || slackDepth.Pending != 1 {
+			t.Fatalf("slack depth = %+v, %v", slackDepth, err)
+		}
+		githubDepth, err := store.OutboxDepthFor(ctx, "t1", "github")
+		if err != nil || githubDepth.Pending != 1 {
+			t.Fatalf("github depth = %+v, %v", githubDepth, err)
+		}
+		missing, err := store.OutboxDepthFor(ctx, "t1", "other")
+		if err != nil || missing != (syncstore.OutboxDepth{}) {
+			t.Fatalf("missing depth = %+v, %v", missing, err)
+		}
+	})
+}
+
 func TestOutboxPostCopyEditDeleteReact(t *testing.T) {
 	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
 		ctx := t.Context()

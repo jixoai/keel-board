@@ -29,24 +29,24 @@ type sourceErrorBody struct {
 }
 
 type entryStatusBody struct {
-	Keys []struct {
-		Key      string `json:"key"`
-		Platform string `json:"platform"`
-		Enabled  bool   `json:"enabled"`
-		Owned    bool   `json:"owned"`
-		Inbox    struct {
-			Pending int `json:"pending"`
-			Leased  int `json:"leased"`
-			Done    int `json:"done"`
-			Dead    int `json:"dead"`
-		} `json:"inbox"`
-	} `json:"keys"`
+	Key      string `json:"key"`
+	Platform string `json:"platform"`
+	Enabled  bool   `json:"enabled"`
+	Owned    bool   `json:"owned"`
+	Inbox    struct {
+		Pending int `json:"pending"`
+		Leased  int `json:"leased"`
+		Done    int `json:"done"`
+		Dead    int `json:"dead"`
+	} `json:"inbox"`
 	Outbox struct {
 		Pending int `json:"pending"`
 		Leased  int `json:"leased"`
 		Done    int `json:"done"`
 		Dead    int `json:"dead"`
 	} `json:"outbox"`
+	Failures  int `json:"failures"`
+	DeadInbox int `json:"deadInbox"`
 }
 
 // TestSourceSurfaceRequiresManage proves read, join, and entry status use the
@@ -193,8 +193,39 @@ func TestSourceReadAndJoinRejections(t *testing.T) {
 	if status, body := h.request(http.MethodGet, "/v1/board/sources/slack/read", nil, nil); status != http.StatusBadRequest {
 		t.Fatalf("missing target = %d %s", status, body)
 	}
-	if status, body := h.request(http.MethodGet, "/v1/board/sources/slack/read?target=C_SUPPORT&limit=201", nil, nil); status != http.StatusBadRequest {
-		t.Fatalf("limit 201 = %d %s", status, body)
+	for _, limit := range []string{"0", "-1", "201", "abc"} {
+		status, body := h.request(http.MethodGet,
+			"/v1/board/sources/slack/read?target=C_SUPPORT&limit="+limit, nil, nil)
+		if status != http.StatusBadRequest {
+			t.Fatalf("limit %q = %d %s", limit, status, body)
+		}
+		var failure sourceErrorBody
+		if err := json.Unmarshal(body, &failure); err != nil || failure.Error.Code != protocol.CodeInvalidRequest {
+			t.Fatalf("limit %q code: %v %s", limit, err, body)
+		}
+	}
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{Kind: "channel", Channel: "C_SUPPORT"}, nil
+	}
+	if status, body := h.request(http.MethodGet,
+		"/v1/board/sources/slack/read?target=C_SUPPORT&limit=200", nil, nil); status != http.StatusOK {
+		t.Fatalf("limit 200 = %d %s", status, body)
+	}
+	if calls := h.provider.SourceReads(); len(calls) != 1 || calls[0].Opts.Limit != 200 {
+		t.Fatalf("limit 200 call = %+v", calls)
+	}
+	// A provider that rejects a cursor maps to 400, not a platform outage.
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{}, fmt.Errorf("%w: invalid cursor", boardsync.ErrBadRequest)
+	}
+	status, body := h.request(http.MethodGet,
+		"/v1/board/sources/slack/read?target=C_SUPPORT&after=not-a-cursor", nil, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("invalid cursor = %d %s", status, body)
+	}
+	var failure sourceErrorBody
+	if err := json.Unmarshal(body, &failure); err != nil || failure.Error.Code != protocol.CodeInvalidRequest {
+		t.Fatalf("invalid cursor code: %v %s", err, body)
 	}
 	// A join needs a well-formed body and a target.
 	if status, body := h.request(http.MethodPost, "/v1/board/sources/slack/join", map[string]any{}, nil); status != http.StatusBadRequest {
@@ -208,14 +239,13 @@ func TestSourceReadAndJoinRejections(t *testing.T) {
 	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
 		return boardsync.SourceRead{}, fmt.Errorf("platform said: RAW_PLATFORM_BODY for secret-target")
 	}
-	status, body := h.request(http.MethodGet, "/v1/board/sources/slack/read?target=secret-target", nil, nil)
+	status, body = h.request(http.MethodGet, "/v1/board/sources/slack/read?target=secret-target", nil, nil)
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("raw platform failure = %d %s", status, body)
 	}
 	if strings.Contains(string(body), "RAW_PLATFORM_BODY") || strings.Contains(string(body), "secret-target") {
 		t.Fatalf("raw platform text leaked: %s", body)
 	}
-	var failure sourceErrorBody
 	if err := json.Unmarshal(body, &failure); err != nil || failure.Error.Code != protocol.CodeUnavailable {
 		t.Fatalf("raw failure code: %v %s", err, body)
 	}
@@ -311,15 +341,222 @@ func TestSyncEntryStatus(t *testing.T) {
 	if err := json.Unmarshal(body, &view); err != nil {
 		t.Fatalf("decode status: %v (%s)", err, body)
 	}
-	if len(view.Keys) != 1 {
-		t.Fatalf("keys = %+v", view.Keys)
-	}
-	key := view.Keys[0]
-	if key.Key != "slack" || key.Platform != "slack" || !key.Enabled || !key.Owned {
-		t.Fatalf("entry = %+v", key)
+	if view.Key != "slack" || view.Platform != "slack" || !view.Enabled || !view.Owned {
+		t.Fatalf("entry = %+v", view)
 	}
 	if status, body := h.request(http.MethodGet, "/v1/board/sync/entries/missing/status", nil, nil); status != http.StatusNotFound {
 		t.Fatalf("unknown status = %d %s", status, body)
+	}
+}
+
+// TestSourceDisabledEntry proves a disabled entry refuses read and join with a
+// stable 409 while its status stays readable for an operator.
+func TestSourceDisabledEntry(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{})
+	if _, err := h.store.SetEntryEnabled(t.Context(), "t1", "slack", false); err != nil {
+		t.Fatal(err)
+	}
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{Kind: "channel", Channel: "C_SUPPORT"}, nil
+	}
+	h.provider.JoinSourceFunc = func(context.Context, boardsync.Key, string) (boardsync.SourceJoin, error) {
+		return boardsync.SourceJoin{Channel: "C_SUPPORT", Joined: true}, nil
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{"read", http.MethodGet, "/v1/board/sources/slack/read?target=C_SUPPORT", nil},
+		{"join", http.MethodPost, "/v1/board/sources/slack/join", map[string]any{"target": "C_SUPPORT"}},
+	} {
+		status, body := h.request(tc.method, tc.path, tc.body, nil)
+		if status != http.StatusConflict {
+			t.Fatalf("%s status = %d %s", tc.name, status, body)
+		}
+		var failure sourceErrorBody
+		if err := json.Unmarshal(body, &failure); err != nil {
+			t.Fatalf("%s decode: %v", tc.name, err)
+		}
+		if failure.Error.Code != protocol.CodeSyncDisabled {
+			t.Fatalf("%s code = %q, want sync_disabled", tc.name, failure.Error.Code)
+		}
+	}
+	if len(h.provider.SourceReads()) != 0 || len(h.provider.SourceJoins()) != 0 {
+		t.Fatal("a disabled entry reached the provider")
+	}
+	status, body := h.request(http.MethodGet, "/v1/board/sync/entries/slack/status", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("disabled status = %d %s", status, body)
+	}
+	var view entryStatusBody
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatalf("decode disabled status: %v", err)
+	}
+	if view.Enabled {
+		t.Fatal("status hides the disabled flag")
+	}
+}
+
+// TestSourceProviderMismatch proves a stored entry whose platform disagrees
+// with the live provider is refused before either side runs, without leaking
+// the platform names in the response.
+func TestSourceProviderMismatch(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{})
+	if _, err := h.store.UpsertEntry(t.Context(), syncstore.Entry{
+		Tenant: "t1", Key: "slack", Platform: "linear", Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{Kind: "channel", Channel: "C_SUPPORT"}, nil
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{"read", http.MethodGet, "/v1/board/sources/slack/read?target=C_SUPPORT", nil},
+		{"join", http.MethodPost, "/v1/board/sources/slack/join", map[string]any{"target": "C_SUPPORT"}},
+	} {
+		status, body := h.request(tc.method, tc.path, tc.body, nil)
+		if status != http.StatusInternalServerError {
+			t.Fatalf("%s status = %d %s", tc.name, status, body)
+		}
+		if strings.Contains(string(body), "slack") || strings.Contains(string(body), "linear") {
+			t.Fatalf("%s leaked a platform name: %s", tc.name, body)
+		}
+		var failure sourceErrorBody
+		if err := json.Unmarshal(body, &failure); err != nil {
+			t.Fatalf("%s decode: %v", tc.name, err)
+		}
+		if failure.Error.Code != protocol.CodeInternal {
+			t.Fatalf("%s code = %q, want internal", tc.name, failure.Error.Code)
+		}
+	}
+	if len(h.provider.SourceReads()) != 0 || len(h.provider.SourceJoins()) != 0 {
+		t.Fatal("a mismatched entry reached the provider")
+	}
+}
+
+// TestSourceCrossTenant proves a connection is invisible to another tenant,
+// on every source route.
+func TestSourceCrossTenant(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{})
+	h.provider.ReadSourceFunc = func(context.Context, boardsync.Key, string, boardsync.ReadOptions) (boardsync.SourceRead, error) {
+		return boardsync.SourceRead{Kind: "channel", Channel: "C_SUPPORT"}, nil
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   any
+	}{
+		{"read", http.MethodGet, "/v1/board/sources/slack/read?target=C_SUPPORT", nil},
+		{"join", http.MethodPost, "/v1/board/sources/slack/join", map[string]any{"target": "C_SUPPORT"}},
+		{"status", http.MethodGet, "/v1/board/sync/entries/slack/status", nil},
+	} {
+		status, body := h.request(tc.method, tc.path, tc.body, map[string]string{"X-Board-Tenant": "t2"})
+		if status != http.StatusNotFound {
+			t.Fatalf("%s cross-tenant = %d %s", tc.name, status, body)
+		}
+	}
+	if len(h.provider.SourceReads()) != 0 || len(h.provider.SourceJoins()) != 0 {
+		t.Fatal("another tenant reached the provider")
+	}
+}
+
+// TestSyncEntryStatusCounts proves the single-entry status carries bounded
+// dead-letter counts and its own outbox depth, not the tenant total or another
+// connection's rows.
+func TestSyncEntryStatusCounts(t *testing.T) {
+	h := newSyncHarness(t, syncHarnessOptions{})
+	// One dead inbound event.
+	if _, err := h.store.PushInbox(t.Context(), "t1", "slack", []boardsync.Record{{
+		Dedupe: "dead-inbox-1", Event: syncEvent("m1", "C0123:T1"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	items, err := h.store.LeaseInbox(t.Context(), "t1", "slack", 1, "test")
+	if err != nil || len(items) != 1 {
+		t.Fatalf("lease inbox = %+v, %v", items, err)
+	}
+	for i := 0; i < 5; i++ {
+		ack, err := h.store.AckInbox(t.Context(), "t1", "slack", items[0].ID, items[0].Lease, fmt.Errorf("secret"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ack.Dead {
+			break
+		}
+		items, err = h.store.LeaseInbox(t.Context(), "t1", "slack", 1, fmt.Sprintf("test-%d", i))
+		if err != nil || len(items) == 0 {
+			t.Fatalf("lease retry = %+v, %v", items, err)
+		}
+	}
+	// One dead outbound delivery for slack, and one for another key that the
+	// slack status must not count.
+	enqueueDead := func(key boardsync.Key, channel string) {
+		t.Helper()
+		event := boardsync.BoardEvent{
+			Tenant: "t1", ID: 1, Type: boardsync.BoardMessagePosted, Thread: 1,
+		}
+		message := boardsync.Message{ID: 1, Thread: 1, Channel: "support", Text: "hello"}
+		target := boardsync.ResolvedTarget{Key: key, Platform: "slack", Channel: channel, Kind: boardsync.TargetChannel}
+		if _, err := h.store.EnqueueOutbox(t.Context(), "t1", key, event, message, []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatalf("enqueue %s: %v", key, err)
+		}
+	}
+	enqueueDead("slack", "C0999")
+	enqueueDead("github", "C0998")
+	for i := 0; i < 5; i++ {
+		jobs, err := h.store.LeaseOutbox(t.Context(), "t1", []boardsync.Key{"slack", "github"}, 10, fmt.Sprintf("worker-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		for _, job := range jobs {
+			if _, err := h.store.AckOutbox(t.Context(), "t1", job.ID, job.Lease, fmt.Errorf("secret platform body"), nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	status, body := h.request(http.MethodGet, "/v1/board/sync/entries/slack/status", nil, nil)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d %s", status, body)
+	}
+	var view entryStatusBody
+	if err := json.Unmarshal(body, &view); err != nil {
+		t.Fatalf("decode: %v (%s)", err, body)
+	}
+	if view.DeadInbox < 1 {
+		t.Fatalf("deadInbox = %d", view.DeadInbox)
+	}
+	if view.Failures < 1 {
+		t.Fatalf("failures = %d", view.Failures)
+	}
+	if view.Outbox.Dead != 1 {
+		t.Fatalf("slack outbox = %+v, want exactly its own dead row", view.Outbox)
+	}
+	// The tenant-wide status still reports both keys' dead rows.
+	tenantStatus, tenantBody := h.request(http.MethodGet, "/v1/board/sync/status", nil, nil)
+	if tenantStatus != http.StatusOK {
+		t.Fatalf("tenant status = %d %s", tenantStatus, tenantBody)
+	}
+	var tenant struct {
+		Outbox struct {
+			Dead int `json:"dead"`
+		} `json:"outbox"`
+	}
+	if err := json.Unmarshal(tenantBody, &tenant); err != nil {
+		t.Fatalf("decode tenant status: %v", err)
+	}
+	if tenant.Outbox.Dead != 2 {
+		t.Fatalf("tenant outbox = %+v, want 2", tenant.Outbox)
 	}
 }
 

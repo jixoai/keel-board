@@ -25,7 +25,7 @@ a code gap.
 | `sync/` core: `Provider`, `Registry`, normalized `Event`, `ThreadRef`, `OutboundMessage`, `SyncFunc`, `Call`, `Host`, `Runner` | Implemented and tested |
 | Dedupe keys and markers, retry policy, memory inbox (lanes, leases, dead letters), outbox (lane order, retries, dead letters) | Implemented and tested |
 | `sync/slack`: signature, webhook normalization (messages, edits, deletes, reactions, files, links), targets, post/edit/delete/react, files both ways, typing status, source read/join opt-in, channel lookup, permalink, root recovery | Implemented; Vercel deployment tables and full mrkdwn conversion are open |
-| `sync/github`: signature, delivery ID, repo and installation allowlists, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, viewer detection, root recovery, PR/issue/comment links | Implemented; reaction removal, review-thread URL variants beyond `#discussion_r`/`#r`, and review-conversation resolution are open |
+| `sync/github`: signature, delivery ID, repo and installation allowlists, comments, PRs, issues, reviews, workflow runs, comment marker, REST comments/edits/deletes/reactions, viewer detection, root recovery, PR/issue/comment links, PR/issue source read with page cursors | Implemented; reaction removal, review-thread URL variants beyond `#discussion_r`/`#r`, and review-conversation resolution are open |
 | `sync/linear`: signature, timestamp, team allowlist, issues, comments, GraphQL issue/comment/reaction calls, identifier resolution, root recovery, source reads (team/project/issue), permalinks, outbound labels/state/properties | Implemented and tested; non-issue comment payloads are ignored, links (`Locate`/`URL`) and reaction removal are open |
 | `sync/chatsdk`: signed HTTP bridge v1, HMAC/nonce/timestamp, self identity, inbound batch intake, resolve/deliver client, optional edit/delete/react/root/link hooks | Implemented and tested; reference Go sidecar fixture only, no third-party Chat SDK adapter bundled |
 | `sync/fake`: programmable `Provider` and `Host` | Implemented and used by tests |
@@ -638,7 +638,7 @@ Routes:
 | --- | --- |
 | `POST /webhooks/{key}` | `syncstore.WebhookHandler`: tenant, entry, gate, store-before-ack |
 | `GET /v1/board/sync/entries` | connections, enabled/owned, no secrets |
-| `GET /v1/board/sync/entries/{key}/status` | one connection's status view: enabled/owned, inbox depth, tenant outbox depth |
+| `GET /v1/board/sync/entries/{key}/status` | one connection's status: enabled/owned, its own inbox and outbox depth, and bounded (100) `failures`/`deadInbox` counts |
 | `GET /v1/board/sync/status` | per-key inbox depth and the tenant's outbox depth |
 | `GET /v1/board/sync/inbox?key=` | dead-lettered inbound events (IDs, thread, attempts) |
 | `GET /v1/board/sync/outbox/failures?key=` | dead deliveries (message, target, attempts, error class) |
@@ -656,7 +656,10 @@ platform credential (the store holds none), no message text and no raw
 payload. A source read answers `sync.SourceRead` and writes nothing: no board
 event, no projection row. A provider that doesn't implement `SourceReader` (or
 whose join isn't configured) answers a stable 501 `unsupported`; an unknown
-key is 404 whether or not it is well formed.
+key is 404 whether or not it is well formed; a disabled entry answers 409
+`sync_disabled` (its status stays readable). A page the provider had to trim
+locally may answer `more=true` with an empty `next`: that means "more exists,
+rerun with a larger limit", not "this was the end".
 
 The subscription follows each owned key's durable `board-events` cursor,
 delivers only `message.posted/edited/deleted`, `reaction.added/removed`, and
@@ -707,6 +710,13 @@ The subscription is supervised per key: a board/store error is logged with
 `--sync-start`. Credentials come from `KEEL_SYNC_<KEY>_*` environment
 variables. One process must own each key; a second process serving the same
 DSN must not be given the key.
+
+`/sources/{key}/join` is opt-in per Slack connection:
+`KEEL_SYNC_<KEY>_JOIN_CHANNELS=true` enables it (the app then needs
+`channels:join`); empty or `false` is the default and the route answers 501
+`unsupported`. The parser is strict: any value other than `true`/`false`
+(`1`, `yes`, a typo) fails `board serve` startup instead of silently choosing
+a mode.
 
 ## Adapters
 
@@ -789,6 +799,15 @@ github.New(github.Config{
 IDs: channels `github:acme/www:pulls` and `:issues`; PR `github:acme/www:123`;
 issue `github:acme/www:issue:45`; review thread
 `github:acme/www:123:rc:345` grouped under its PR.
+
+Source read (`sync.SourceReader`): a target is a native thread
+(`acme/www:123`, `acme/www:issue:45`), a PR/issue URL, or
+`acme/www#123`. The read uses only the entry's App token and only the `Repos`
+allowlist; an unlisted repo answers `ErrNotFound` before any request. It
+returns the PR/issue root plus one page of conversation comments (GitHub's
+`per_page` cap is 100); `after` is a 1-based page number and `Next` is the next
+page. Authors carry `key:user:<id>` when GitHub has a numeric ID, else
+`key:user:<login>`. Nothing is stored on the board.
 
 Webhook: `X-GitHub-Event` + `X-GitHub-Delivery` + `X-Hub-Signature-256`.
 The delivery ID is required and bounded; it is the replay identity. GitHub
@@ -969,7 +988,7 @@ calls and need no credentials.
 | --- | --- |
 | `sync/*_test.go` | Event/ThreadRef validation, dedupe keys, markers, secret redaction, retry policy, outbox lane order/retries/dead letters, inbox dedupe/order/lease/retry/dead letters, `Runner.Inbound` once semantics, `Runner.Outbound` receipts, mirror start, origin refusal, registry gate/drop/failure statuses |
 | `sync/slack` | Signature vector, stale timestamp, challenge, message/reply/edit/delete/reaction/file/link fixtures, own-bot and marker skip, stable and distinct dedupe, store-before-ack, target parsing, `#name` lookup and cache, `chat.postMessage` form and customize fallback, edit/delete/react paths, file retry/refusal/partial success, typing status, source read/join, permalink, API error and Retry-After classification, fake Slack end-to-end |
-| `sync/github` | Signature vector, delivery ID and duplicate-delivery dedupe, ping, issue/PR/review comments, PR/issue full lifecycle, review approval/dismissal, CI pass/fail, repo/installation allowlists, marker and bot/viewer echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, comment length and file limits, error classification, root recovery, links, fake-server end-to-end |
+| `sync/github` | Signature vector, delivery ID and duplicate-delivery dedupe, ping, issue/PR/review comments, PR/issue full lifecycle, review approval/dismissal, CI pass/fail, repo/installation allowlists, marker and bot/viewer echo skip, target parsing, comment/review-reply posting, edit/delete/react paths, comment length and file limits, error classification, root recovery, links, PR/issue source read (shorthand/URL/native, Link paging, allowlist), fake-server end-to-end |
 | `sync/linear` | Signature and timestamp, issue created/updated, comment created/updated/removed (real `issueId`-only payloads), team allowlist, own comment skip, identifier/native target resolution, comment/issue creation, edit/delete/react, labels/state/priority/project/assignee, source read (team/project/issue), permalinks, errors/limits, fake GraphQL end-to-end |
 | `sync/chatsdk` | Bridge v1 schema/wire, HMAC/timestamp/nonce replay, self identity, body/event caps, NUL/ID bounds, resolve/deliver retry, sidecar fixture, PG bridge intake, provider conformance |
 | `sync/conformance` | Shared provider suite for Slack, GitHub, Linear and a bridge-backed adapter |

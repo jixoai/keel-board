@@ -159,6 +159,26 @@ func TestReadSourceChannelPaginates(t *testing.T) {
 	}
 }
 
+func TestReadSourceInvalidCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.info":
+			_, _ = w.Write([]byte(`{"ok":true,"channel":{"id":"C0123ABC","name":"general","is_member":true}}`))
+		case "/conversations.history":
+			_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_cursor"}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p := newProvider(t, server.URL, nil, nil)
+	_, err := p.ReadSource(context.Background(), "slack", "C0123ABC",
+		boardsync.ReadOptions{Limit: 10, After: "not-a-slack-cursor"})
+	if !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("invalid cursor = %v, want ErrBadRequest", err)
+	}
+}
+
 func TestReadSourcePermissions(t *testing.T) {
 	cases := []struct {
 		name string

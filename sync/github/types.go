@@ -259,6 +259,7 @@ type issue struct {
 	Labels      []label   `json:"labels"`
 	Assignees   []user    `json:"assignees"`
 	PullRequest *struct{} `json:"pull_request,omitempty"`
+	Comments    int       `json:"comments"`
 	CreatedAt   string    `json:"created_at"`
 	UpdatedAt   string    `json:"updated_at"`
 }
@@ -281,6 +282,7 @@ type pullRequest struct {
 	Base struct {
 		Ref string `json:"ref"`
 	} `json:"base"`
+	Comments  int    `json:"comments"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
 }
@@ -611,24 +613,32 @@ func (e *RateLimitError) Error() string {
 // Unwrap makes errors.Is(err, boardsync.ErrRateLimited) true.
 func (e *RateLimitError) Unwrap() error { return boardsync.ErrRateLimited }
 
+// call is callWithHeaders without the response headers.
 func (c *Client) call(ctx context.Context, method, path string, input, output any) error {
+	_, err := c.callWithHeaders(ctx, method, path, input, output)
+	return err
+}
+
+// callWithHeaders performs one REST call and returns the response headers so a
+// paging caller can read GitHub's Link relation.
+func (c *Client) callWithHeaders(ctx context.Context, method, path string, input, output any) (http.Header, error) {
 	if c.setupErr != nil {
-		return c.setupErr
+		return nil, c.setupErr
 	}
 	if c.token.Empty() {
-		return fmt.Errorf("%w: github token is unset", boardsync.ErrUnauthorized)
+		return nil, fmt.Errorf("%w: github token is unset", boardsync.ErrUnauthorized)
 	}
 	var bodyReader io.Reader = http.NoBody
 	if input != nil {
 		data, err := jsonMarshal(input)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		bodyReader = strings.NewReader(string(data))
 	}
 	request, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("X-GitHub-Api-Version", "2022-11-28")
@@ -639,41 +649,41 @@ func (c *Client) call(ctx context.Context, method, path string, input, output an
 	}
 	response, err := c.doer.Do(request)
 	if err != nil {
-		return boardsync.RedactError(err, c.token)
+		return nil, boardsync.RedactError(err, c.token)
 	}
 	defer response.Body.Close()
 	body, err := readLimited(response.Body, 4<<20)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	switch response.StatusCode {
 	case http.StatusTooManyRequests:
-		return &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+		return nil, &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
 	case http.StatusForbidden:
 		if rateLimited(response, body) {
-			return &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
+			return nil, &RateLimitError{Status: response.StatusCode, RetryAfter: retryAfter(response.Header)}
 		}
-		return fmt.Errorf("%w: github refused the request (HTTP 403)", boardsync.ErrUnauthorized)
+		return nil, fmt.Errorf("%w: github refused the request (HTTP 403)", boardsync.ErrUnauthorized)
 	case http.StatusUnauthorized:
-		return fmt.Errorf("%w: github HTTP 401", boardsync.ErrUnauthorized)
+		return nil, fmt.Errorf("%w: github HTTP 401", boardsync.ErrUnauthorized)
 	case http.StatusNotFound, http.StatusGone:
-		return fmt.Errorf("%w: github HTTP %d", boardsync.ErrNotFound, response.StatusCode)
+		return nil, fmt.Errorf("%w: github HTTP %d", boardsync.ErrNotFound, response.StatusCode)
 	case http.StatusUnprocessableEntity:
-		return fmt.Errorf("%w: github refused the request (HTTP 422)", boardsync.ErrBadRequest)
+		return nil, fmt.Errorf("%w: github refused the request (HTTP 422)", boardsync.ErrBadRequest)
 	}
 	if response.StatusCode >= 500 {
 		// A 5xx is transport-shaped: the retry policy tries again.
-		return fmt.Errorf("github HTTP %d", response.StatusCode)
+		return nil, fmt.Errorf("github HTTP %d", response.StatusCode)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("%w: github HTTP %d", boardsync.ErrBadRequest, response.StatusCode)
+		return nil, fmt.Errorf("%w: github HTTP %d", boardsync.ErrBadRequest, response.StatusCode)
 	}
 	if output != nil && len(body) > 0 {
 		if err := jsonUnmarshal(body, output); err != nil {
-			return fmt.Errorf("github answered unreadable JSON: %w", err)
+			return nil, fmt.Errorf("github answered unreadable JSON: %w", err)
 		}
 	}
-	return nil
+	return response.Header, nil
 }
 
 // rateLimited recognizes GitHub's secondary rate limit, which arrives as a 403
@@ -782,6 +792,33 @@ func (c *Client) fetchPull(ctx context.Context, repo string, number int) (pullRe
 	var out pullRequest
 	err := c.call(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d", repo, number), nil, &out)
 	return out, err
+}
+
+// IssueComments reads one page of a PR's or issue's conversation comments.
+// Page is 1-based; a non-nil Link rel="next" sets more.
+func (c *Client) IssueComments(ctx context.Context, repo string, number, perPage, page int) ([]comment, bool, error) {
+	if !validRepo(repo) || number <= 0 || perPage <= 0 || page <= 0 {
+		return nil, false, fmt.Errorf("%w: github comment page needs a repo, number, and positive page", boardsync.ErrBadRequest)
+	}
+	var out []comment
+	path := fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=%d&page=%d", repo, number, perPage, page)
+	header, err := c.callWithHeaders(ctx, http.MethodGet, path, nil, &out)
+	if err != nil {
+		return nil, false, err
+	}
+	return out, hasNextPage(header), nil
+}
+
+// hasNextPage reads GitHub's Link header for a rel="next" relation.
+func hasNextPage(header http.Header) bool {
+	for _, value := range header.Values("Link") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.Contains(part, `rel="next"`) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func readLimited(reader io.Reader, max int64) ([]byte, error) {

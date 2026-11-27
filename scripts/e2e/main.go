@@ -250,7 +250,7 @@ func (e *e2eEnv) addCoverage() {
 	r.AddCoverage("Chat SDK bridge（sidecar fixture）", r.GroupStatus("chatsdk"),
 		"sidecar /deliver message/edit/reaction/delete；PushInbound 签名事件入站/编辑；HMAC/重放 nonce/时间窗；self 身份丢弃", r.StepsIn("chatsdk"))
 	r.AddCoverage("source read / join（§14.10）", r.GroupStatus("sources"),
-		"Slack conversations.info/history/replies 归一化只读结果（不写 board）；Slack opt-in join 幂等；Linear issue 读取只读；501/404/400 稳定错误", r.StepsIn("sources"))
+		"Slack conversations.info/history/replies、Linear issue、GitHub PR/issue/comments 归一化只读结果（不写 board）；Slack opt-in join 幂等；GitHub repo allowlist 与 comments 分页；501/404/400/409 稳定错误；单 entry status 含 per-key outbox 与 failures/deadInbox", r.StepsIn("sources"))
 }
 
 // scenarioRealServe exercises the actual board serve binary over PostgreSQL.

@@ -412,7 +412,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 			return nil, err
 		}
 		return &boardsync.RootDraft{
-			Text:   boardsync.StorableText(fmt.Sprintf("Issue #%d: %s\n%s\n\n%s", item.Number, item.Title, item.HTMLURL, boardMentions(item.Body, key)), boardsync.MaxTextBytes),
+			Text:   issueSourceText(key, &item),
 			Labels: issueLabels(&item, repo),
 			Author: authorOf(item.User),
 		}, nil
@@ -422,7 +422,7 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 		return nil, err
 	}
 	return &boardsync.RootDraft{
-		Text:   boardsync.StorableText(fmt.Sprintf("PR #%d: %s\n%s\n\n%s", pr.Number, pr.Title, pr.HTMLURL, boardMentions(pr.Body, key)), boardsync.MaxTextBytes),
+		Text:   pullSourceText(key, &pr),
 		Labels: prLabels(&pr, repo),
 		Author: authorOf(pr.User),
 	}, nil

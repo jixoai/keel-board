@@ -30,6 +30,12 @@ const (
 // ReadOptions page a source read. Limit defaults to DefaultSourceLimit and is
 // capped at MaxSourceLimit; After is an opaque cursor from a previous read's
 // Next, meaningful only to the provider that issued it.
+//
+// A provider must not synthesize a cursor. When it has to trim a page locally
+// and can't offer a safe continuation, it leaves Next empty; More=true with
+// Next=="" means "the platform has more, but restart with a larger limit"
+// rather than "this page was the end". Callers must not treat an empty Next as
+// the end while More is true.
 type ReadOptions struct {
 	Limit int
 	After string

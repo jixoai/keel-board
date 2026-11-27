@@ -35,11 +35,10 @@ func (s *Server) handleSourceRead(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	after := strings.TrimSpace(queryValue(r, "after"))
-	provider, found := s.sync.registry.Get(req.tenant, key)
-	if !found {
-		s.logSourceRead(req.tenant, key, entry.Platform, http.StatusNotImplemented, 0)
-		writeError(w, protocol.NewError(protocol.CodeUnsupported,
-			"this process doesn't host that sync connection"))
+	provider, perr := s.sourceProvider(req, entry, key)
+	if perr != nil {
+		s.logSourceRead(req.tenant, key, entry.Platform, perr.Status, 0)
+		writeError(w, perr)
 		return
 	}
 	reader, supported := provider.Provider.(boardsync.SourceReader)
@@ -84,11 +83,10 @@ func (s *Server) handleSourceJoin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.Invalid("target: a platform channel is required"))
 		return
 	}
-	provider, found := s.sync.registry.Get(req.tenant, key)
-	if !found {
-		s.logSourceJoin(req.tenant, key, entry.Platform, http.StatusNotImplemented)
-		writeError(w, protocol.NewError(protocol.CodeUnsupported,
-			"this process doesn't host that sync connection"))
+	provider, perr := s.sourceProvider(req, entry, key)
+	if perr != nil {
+		s.logSourceJoin(req.tenant, key, entry.Platform, perr.Status)
+		writeError(w, perr)
 		return
 	}
 	joiner, supported := provider.Provider.(boardsync.SourceJoiner)
@@ -109,8 +107,26 @@ func (s *Server) handleSourceJoin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, join)
 }
 
-// handleSyncEntryStatus answers GET /sync/entries/{key}/status: the tenant
-// status view filtered to one connection.
+// syncEntryStatusLimit bounds the dead-letter counts one entry status reads.
+// The counts saturate at this number; the list routes page the details.
+const syncEntryStatusLimit = 100
+
+// syncEntryStatusView is one connection's status. Outbox is this
+// connection's depth, not the tenant total; Failures and DeadInbox count this
+// connection's dead deliveries and dead inbound events, up to
+// syncEntryStatusLimit.
+type syncEntryStatusView struct {
+	syncEntryView
+	Inbox     syncstore.InboxDepth  `json:"inbox"`
+	Outbox    syncstore.OutboxDepth `json:"outbox"`
+	Failures  int                   `json:"failures"`
+	DeadInbox int                   `json:"deadInbox"`
+}
+
+// handleSyncEntryStatus answers GET /sync/entries/{key}/status: one
+// connection's status view, including its own outbox depth and bounded dead
+// letter counts. A disabled entry stays readable here so an operator can see
+// why source read/join answers 409.
 func (s *Server) handleSyncEntryStatus(w http.ResponseWriter, r *http.Request) {
 	req, entry, _, ok := s.resolveSyncSource(w, r)
 	if !ok {
@@ -121,20 +137,32 @@ func (s *Server) handleSyncEntryStatus(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	status := syncStatusView{Keys: []syncKeyStatus{{
+	outbox, err := s.sync.store.OutboxDepthFor(req.ctx, req.tenant, entry.Key)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	failures, err := s.sync.store.TargetFailures(req.ctx, req.tenant, entry.Key, syncEntryStatusLimit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	dead, err := s.sync.store.DeadInbox(req.ctx, req.tenant, entry.Key, syncEntryStatusLimit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, syncEntryStatusView{
 		syncEntryView: syncEntryView{
 			Key: string(entry.Key), Platform: string(entry.Platform), Enabled: entry.Enabled,
 			Owned:     s.sync.owns(req.tenant, entry.Key),
 			CreatedAt: protocol.FormatTime(entry.CreatedAt), UpdatedAt: protocol.FormatTime(entry.UpdatedAt),
 		},
-		Inbox: depth,
-	}}}
-	status.Outbox, err = s.sync.store.OutboxDepth(req.ctx, req.tenant)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, status)
+		Inbox:     depth,
+		Outbox:    outbox,
+		Failures:  len(failures),
+		DeadInbox: len(dead),
+	})
 }
 
 // resolveSyncSource resolves the caller, gates on board.manage, and reads the
@@ -164,6 +192,34 @@ func (s *Server) resolveSyncSource(w http.ResponseWriter, r *http.Request) (*req
 		return nil, syncstore.Entry{}, "", false
 	}
 	return req, entry, key, true
+}
+
+// sourceProvider returns this process's provider for a connection after the
+// entry-level checks: the entry must be enabled, this process must host it,
+// and the provider's platform must agree with the stored entry. A disabled
+// entry is a stable 409; a missing provider or a config mismatch is a stable
+// server-side refusal. No platform call is made on any of these paths.
+func (s *Server) sourceProvider(req *request, entry syncstore.Entry, key boardsync.Key) (boardsync.Entry, *protocol.Error) {
+	if !entry.Enabled {
+		return boardsync.Entry{}, protocol.NewError(protocol.CodeSyncDisabled,
+			"this sync connection is disabled")
+	}
+	provider, found := s.sync.registry.Get(req.tenant, key)
+	if !found {
+		return boardsync.Entry{}, protocol.NewError(protocol.CodeUnsupported,
+			"this process doesn't host that sync connection")
+	}
+	if provider.Platform != entry.Platform {
+		// A stored entry and a live provider that disagree about the platform
+		// are a deployment error. Log the names for an operator, answer with
+		// a stable message, and never call either side.
+		s.sync.logger.Error("sync source configuration mismatch",
+			"tenant", req.tenant, "key", key,
+			"storedPlatform", entry.Platform, "providerPlatform", provider.Platform)
+		return boardsync.Entry{}, protocol.NewError(protocol.CodeInternal,
+			"the sync connection's configuration doesn't match its stored entry")
+	}
+	return provider, nil
 }
 
 // logSourceRead records one bounded read audit line: connection, platform,

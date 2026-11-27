@@ -297,6 +297,9 @@ type Store interface {
 	DeadOutbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error)
 	RetryOutbox(ctx context.Context, tenant, deliveryID string) error
 	OutboxDepth(ctx context.Context, tenant string) (OutboxDepth, error)
+	// OutboxDepthFor is OutboxDepth for one connection, for the per-entry
+	// status view; the tenant total stays the tenant dashboard's number.
+	OutboxDepthFor(ctx context.Context, tenant string, key boardsync.Key) (OutboxDepth, error)
 	Copy(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error)
 	CopyForMessage(ctx context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error)
 	// CopyByExternal is the inbound reverse lookup: the board message a
