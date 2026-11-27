@@ -289,7 +289,7 @@ func (s *Sidecar) resolve(w http.ResponseWriter, body []byte) {
 }
 
 func (s *Sidecar) writeError(w http.ResponseWriter, err error) {
-	code := chatsdk.ErrorCodeOf(err)
+	var code chatsdk.ErrorCode
 	switch {
 	case errors.Is(err, boardsync.ErrUnauthorized):
 		code = chatsdk.ErrorAuth
@@ -298,8 +298,6 @@ func (s *Sidecar) writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, boardsync.ErrRateLimited):
 		code = chatsdk.ErrorRateLimited
 	case boardsync.IsPermanent(err):
-		code = chatsdk.ErrorPermanent
-	case errors.Is(err, boardsync.ErrBadRequest):
 		code = chatsdk.ErrorPermanent
 	default:
 		code = chatsdk.ErrorTransient

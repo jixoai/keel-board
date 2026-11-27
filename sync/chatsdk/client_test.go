@@ -39,7 +39,7 @@ func newClient(t *testing.T, baseURL string, mutate func(*chatsdk.ClientConfig))
 	return client
 }
 
-func signedSidecar(t *testing.T, handle func(body []byte) (int, any)) *httptest.Server {
+func signedSidecar(t *testing.T, handle func(r *http.Request, body []byte) (int, any)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -51,7 +51,7 @@ func signedSidecar(t *testing.T, handle func(body []byte) (int, any)) *httptest.
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		status, answer := handle(body)
+		status, answer := handle(r, body)
 		if status == 0 {
 			status = http.StatusOK
 		}
@@ -87,18 +87,22 @@ func TestNewClientValidation(t *testing.T) {
 
 func TestClientDeliverRetriesTransientWithFreshSignature(t *testing.T) {
 	var attempts atomic.Int64
-	var nonces, deliveries sync.Map
-	server := signedSidecar(t, func(body []byte) (int, any) {
+	var mu sync.Mutex
+	var nonces []string
+	var deliveries []string
+	server := signedSidecar(t, func(r *http.Request, body []byte) (int, any) {
 		n := attempts.Add(1)
 		var request chatsdk.DeliverRequest
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatalf("deliver body: %v", err)
 		}
-		deliveries.Store(n, request.DeliveryID)
+		mu.Lock()
+		nonces = append(nonces, r.Header.Get(chatsdk.HeaderNonce))
+		deliveries = append(deliveries, request.DeliveryID)
+		mu.Unlock()
 		if n < 3 {
 			return http.StatusServiceUnavailable, chatsdk.BridgeError{Code: chatsdk.ErrorTransient}
 		}
-		nonces.Store(n, request)
 		return http.StatusOK, boardsync.Posted{Thread: "-100:42", Message: "43"}
 	})
 	t.Cleanup(server.Close)
@@ -119,21 +123,25 @@ func TestClientDeliverRetriesTransientWithFreshSignature(t *testing.T) {
 	if attempts.Load() != 3 {
 		t.Fatalf("attempts = %d, want 3", attempts.Load())
 	}
-	if _, ok := nonces.Load(int64(3)); !ok {
-		t.Fatal("successful attempt wasn't recorded")
+	mu.Lock()
+	defer mu.Unlock()
+	if len(deliveries) != 3 {
+		t.Fatalf("deliveries = %v", deliveries)
 	}
-	var first, last string
-	deliveries.Range(func(key, value any) bool {
-		if key.(int64) == 1 {
-			first = value.(string)
+	for _, id := range deliveries {
+		if id != "delivery:1" {
+			t.Fatalf("retry changed the delivery ID: %v", deliveries)
 		}
-		if key.(int64) == 3 {
-			last = value.(string)
+	}
+	seen := make(map[string]struct{}, len(nonces))
+	for _, nonce := range nonces {
+		if nonce == "" {
+			t.Fatal("an attempt carried no nonce")
 		}
-		return true
-	})
-	if first != "delivery:1" || last != "delivery:1" {
-		t.Fatalf("delivery IDs = %q / %q; retries must reuse the ID", first, last)
+		if _, duplicate := seen[nonce]; duplicate {
+			t.Fatalf("retry reused a nonce: %v", nonces)
+		}
+		seen[nonce] = struct{}{}
 	}
 }
 
@@ -149,7 +157,7 @@ func TestClientDeliverRefusesPermanentAndAuth(t *testing.T) {
 	}
 	for _, tc := range cases {
 		var attempts atomic.Int64
-		server := signedSidecar(t, func([]byte) (int, any) {
+		server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
 			attempts.Add(1)
 			return tc.status, tc.answer
 		})
@@ -171,7 +179,7 @@ func TestClientDeliverRefusesPermanentAndAuth(t *testing.T) {
 }
 
 func TestClientResolve(t *testing.T) {
-	server := signedSidecar(t, func(body []byte) (int, any) {
+	server := signedSidecar(t, func(_ *http.Request, body []byte) (int, any) {
 		var request chatsdk.ResolveRequest
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatalf("resolve body: %v", err)
@@ -237,7 +245,7 @@ func TestClientTimeout(t *testing.T) {
 
 func TestRemoteAdapterOutboundShapes(t *testing.T) {
 	var requests []chatsdk.DeliverRequest
-	server := signedSidecar(t, func(body []byte) (int, any) {
+	server := signedSidecar(t, func(_ *http.Request, body []byte) (int, any) {
 		var request chatsdk.DeliverRequest
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatalf("deliver body: %v", err)
@@ -308,7 +316,7 @@ func TestRemoteAdapterOutboundShapes(t *testing.T) {
 }
 
 func TestRemoteAdapterResolveAndRawWebhookRefusal(t *testing.T) {
-	server := signedSidecar(t, func(body []byte) (int, any) {
+	server := signedSidecar(t, func(_ *http.Request, body []byte) (int, any) {
 		var request chatsdk.ResolveRequest
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatal(err)
@@ -348,7 +356,7 @@ func TestRemoteAdapterResolveAndRawWebhookRefusal(t *testing.T) {
 
 func TestRemoteAdapterDeliveryIDIsStable(t *testing.T) {
 	var ids []string
-	server := signedSidecar(t, func(body []byte) (int, any) {
+	server := signedSidecar(t, func(_ *http.Request, body []byte) (int, any) {
 		var request chatsdk.DeliverRequest
 		if err := json.Unmarshal(body, &request); err != nil {
 			t.Fatal(err)

@@ -214,6 +214,13 @@ func TestBridgeEventsRefusesBadAuthenticationAndSize(t *testing.T) {
 			req:  signedBridgeRequest(t, h.url("telegram"), batch, "other-secret", now, "nonce-0123456782"),
 			want: http.StatusUnauthorized,
 		},
+		{
+			// Verification happens before parsing: a bad signature on a
+			// non-JSON body is 401, never 400.
+			name: "bad signature before parse",
+			req:  signedBridgeBody(t, h.url("telegram"), []byte("not-json"), "other-secret", now, "nonce-0123456784"),
+			want: http.StatusUnauthorized,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,6 +238,10 @@ func TestBridgeEventsRefusesBadAuthenticationAndSize(t *testing.T) {
 	request := signedBridgeBody(t, h.url("telegram"), oversized, bridgeTestSecret, now, "nonce-0123456783")
 	if status, _ := doBridge(t, request); status != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized status = %d", status)
+	}
+	// A valid signature on malformed JSON reaches the decoder and is 400.
+	if status, _ := doBridge(t, signedBridgeBody(t, h.url("telegram"), []byte("not-json"), bridgeTestSecret, now, "nonce-0123456785")); status != http.StatusBadRequest {
+		t.Fatalf("malformed body status = %d", status)
 	}
 }
 
