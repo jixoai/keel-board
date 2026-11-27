@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -213,4 +214,33 @@ func freePort() (int, error) {
 	}
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
+// writeBoardBuildEvidence records what the E2E binary actually was, so a
+// report can prove the build without shipping a 90 MB binary.
+func writeBoardBuildEvidence(ctx context.Context, bin, logDir, commit string) (string, error) {
+	info, err := os.Stat(bin)
+	if err != nil {
+		return "", err
+	}
+	data, err := os.ReadFile(bin)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	version := "unknown"
+	command := exec.CommandContext(ctx, bin, "version")
+	if output, err := command.Output(); err == nil {
+		version = strings.TrimSpace(string(output))
+	}
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return "", err
+	}
+	content := fmt.Sprintf("go build ./cmd/board\nbinary: <temporary build; removed after the run>\nsize: %d\nmode: %s\nsha256: %x\ncommit: %s\nboard version: %s\n",
+		info.Size(), info.Mode(), sum, commit, version)
+	path := filepath.Join(logDir, "board-build.txt")
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return "logs/board-build.txt", nil
 }

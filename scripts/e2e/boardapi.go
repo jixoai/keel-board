@@ -93,6 +93,26 @@ func (e *e2eEnv) postMessage(step *Step, channel, text string) (protocol.Message
 	return posted.Message, nil
 }
 
+// postMessageLabels creates a board root with labels.
+func (e *e2eEnv) postMessageLabels(step *Step, channel, text string, labels map[string]string) (protocol.MessageView, error) {
+	status, body, err := e.api(step, "post labeled root", http.MethodPost, "/messages", map[string]any{
+		"channel": channel, "text": text, "labels": labels,
+	})
+	if err != nil {
+		return protocol.MessageView{}, err
+	}
+	var posted struct {
+		Message protocol.MessageView `json:"message"`
+	}
+	if err := json.Unmarshal(body, &posted); err != nil {
+		return protocol.MessageView{}, err
+	}
+	if status != http.StatusCreated {
+		return protocol.MessageView{}, fmt.Errorf("post root status %d: %s", status, clip(string(body), 500))
+	}
+	return posted.Message, nil
+}
+
 // replyMessage appends a board reply.
 func (e *e2eEnv) replyMessage(step *Step, re, text string) (protocol.MessageView, error) {
 	status, body, err := e.api(step, "post reply", http.MethodPost, "/messages", map[string]any{"re": re, "text": text})

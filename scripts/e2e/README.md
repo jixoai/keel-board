@@ -1,8 +1,9 @@
 # Keel-board E2E harness（task 9.2）
 
 这是 Phase 0 的端到端验收 harness：用真实 PostgreSQL、真实 `board serve` 二进制、
-真实 sync 栈（`server.New` + `syncstore` + Slack/GitHub/Linear adapter + workers），
-对一个本地 TLS fake 平台运行双向镜像场景，并由脚本生成 HTML 报告。
+真实 sync/automation 栈（`server.New` + `syncstore` + Slack/GitHub/Linear/ChatSDK
+adapter + sync workers + watcher/schedule workers），对一个本地 TLS fake 平台和
+Chat SDK sidecar fixture 运行双向镜像/自动化场景，并由脚本生成 HTML 报告。
 
 ## 运行
 
@@ -18,11 +19,14 @@ go run ./scripts/e2e -report-dir scripts/e2e/out/$(date +%Y%m%dT%H%M%SZ)
 go run ./scripts/e2e -keep-schemas
 ```
 
-- 退出码：0 = 全 PASS（允许显式 SKIP）；1 = 有 FAIL；2 = 前置条件/用法错误。
+- 退出码（二进制）：0 = 全 PASS（允许显式 SKIP）；1 = 有 FAIL；2 = 前置条件/用法错误。
+  注意 `go run` 会把程序的非零退出统一包装成自身的 `exit status`（`go run` 自身返回 1，
+  即使程序返回 2）；要精确判断 2 请先 `go build -o /tmp/keel-e2e ./scripts/e2e` 再运行。
 - 每次运行创建两个隔离 schema（`keel_e2e_<ns>_h` / `_s`），结束 `DROP SCHEMA ... CASCADE`
   （`-keep-schemas` 时保留）。
 - 临时端口全部由 `127.0.0.1:0` 分配；报告写入 `scripts/e2e/out/`（已 gitignore）。
-- CI 命令示例：`go run ./scripts/e2e`（CI 已有 `KEEL_BOARD_TEST_DSN`；不需要额外服务）。
+- CI 已把 `go run ./scripts/e2e` 作为门禁步骤，并 `always()` 上传报告 artifact；
+  CI 已有 `KEEL_BOARD_TEST_DSN`，不需要额外服务/Docker。
 
 ## 架构
 
@@ -32,7 +36,8 @@ cmd/board (真实二进制) ── board API / restart / sync boot ── Postgr
         │ 不能注入平台 endpoint（不改产品代码）
         │
 harness 进程
-  ├─ harness-hosted server: 真实 server.New + syncstore + adapters + workers + PG schema B
+  ├─ harness-hosted server: 真实 server.New + syncstore + adapters + sync/automation workers + PG schema B
+  ├─ Chat SDK sidecar fixture（reference sidecar，HMAC v1）
   ├─ fake TLS "internet": slack.com / files.slack.com / api.github.com / api.linear.app
   │     通过注入的 http.Client DialContext 指向 127.0.0.1，URL/hostname 校验保持真实
   └─ 场景 + 断言 + HTML/JSON 报告
@@ -42,9 +47,12 @@ harness 进程
 没有平台 endpoint/transport 注入缝。因此：
 
 - `real-serve` 场景直接跑 `go build ./cmd/board` + `board serve`，验证 PostgreSQL、
-  board API、sync 启用/条目持久化、未签名 webhook 401、SIGTERM 重启恢复；
-- 镜像全链路场景跑 harness-hosted server，使用与 `cmd/board/serve` 相同的产品包
-  和 worker 装配，只把 adapter 的 HTTP client 指向 fake。报告里明确标注该差异。
+  board API、sync 启用/条目持久化、未签名 webhook 401、SIGTERM 重启恢复；它不经过
+  fake 平台，因此不承载镜像链路；
+- 镜像/automation/bridge 场景跑 harness-hosted server，复制 `cmd/board/serve` 的
+  sync + automation worker 装配，只把 adapter 的 HTTP client 指向 fake/ sidecar。
+  这不是“逐行相同的 cmd/board 装配”：tenant、retry/poll/lease、HTTP 进程形态有明确
+  差异，见下表；`real-serve` 与 harness 使用不同 schema，互不影响。
 
 fake 平台使用自签 CA/证书，只被 harness 注入的 client 信任；adapter 看到的 URL 仍是
 `https://slack.com/api/...` 等，因此 Slack 文件域、GitHub base URL、Linear GraphQL
@@ -65,12 +73,28 @@ fake 平台使用自签 CA/证书，只被 harness 注入的 client 信任；ada
 | 重启恢复 | 阻塞投递中停服、独立 log handle 在停服期间写入、重启后两件事各成功一次 |
 | GitHub | `issue_comment` create/edit/delete 入站；comment/edit/reaction/delete 出站；marker；重复 delivery；签名 401 |
 | Linear | Comment create/update/remove 入站；commentCreate/commentUpdate/reactionCreate/commentDelete 出站；签名/时间窗 401 |
-| typing | adapter 级 `assistant.threads.setStatus`；board 级未接线（SKIP） |
+| automation watcher/schedule | 创建 watcher、匹配标签事件→bot post、delivery done；一次性 schedule 到点写入、status done/sent=1、视图不回显 text |
+| Chat SDK bridge | sidecar `/deliver` message/edit/reaction/delete；`PushInbound` root/edit；HMAC 坏签名/重放 nonce/过期 timestamp；self author 丢弃 |
+| typing | adapter 级 `assistant.threads.setStatus`；board 级未接线（本期范围外） |
 
-显式 SKIP（报告「未覆盖 / 跳过项」有原因与门禁）：ChatSDK sidecar（`cmd/board`
-无 chatsdk 平台入口，包级 bridge 由单测覆盖）、watchers（未合入 server/log）、
-source read/join/bridge events（管理 API 未挂载）、文件字节入站抓取/出站上传
-（`Host` 不抓取字节，`OutboundMessage.Files` 无来源）。
+显式 SKIP 都是“本 harness 未覆盖/本期范围外”，不是“产品不存在”：
+board 级 typing（只有 adapter 方法）、source read/join（本期范围外）、文件字节入站
+抓取/出站上传（产品 open item），以及“真实 cmd/board 承载镜像链路”（无平台
+endpoint 注入缝，改用 harness-hosted server；`real-serve` 只验证二进制 API/同步启动/
+重启）。报告「未覆盖 / 跳过项」逐条列出原因。
+
+## 装配与策略差异
+
+| 项 | harness-hosted | `cmd/board serve` |
+| --- | --- | --- |
+| tenant | `e2e` | `default`（本 harness 未传 tenant flags） |
+| sync 重试 | inbound 5 / outbound 3，30ms→120ms，lease 2s | inbound 10 / outbound 5，1s→30s+jitter，lease 1m |
+| automation 重试 | 3 次，20ms→120ms，lease 5s | 5 次，1s→30s+jitter，lease 5m |
+| poll / action timeout | 10ms / 2s | 1s / 2m |
+| HTTP | 进程内临端口 | 独立子进程 |
+
+缩短重试/轮询是为了让失败、重试、dead-letter、重启场景在 CI 内可测；生产默认值由
+`cmd/board` 的默认配置保持。
 
 ## 报告
 
@@ -81,11 +105,14 @@ source read/join/bridge events（管理 API 未挂载）、文件字节入站抓
 - 步骤表：name/action/expect/actual/状态/耗时；
 - 每步可展开：断言表（期望/实际）、关键日志、HTTP trace / JSON 视图；
 - 未覆盖/跳过项；产物清单（`report.json`、`logs/board-serve.log`、
-  `logs/harness-server.log`、`fake-platform.json`）。
+  `logs/harness-server.log`、`logs/board-build.txt`、`fake-platform.json`）。
+- `logs/board-build.txt` 记录真实二进制的 size/mode/sha256/commit/`board version`，
+  作为构建证据，避免在报告目录里带 90MB 二进制。
 
 board 本期没有产品 UI，因此不使用产品截图、也不伪造截图；证据是真实 API trace、
-fake 平台收到的请求、JSON 视图与进程日志。报告中的链接是 `local-*`（本机静态文件/
-127.0.0.1），不能从公网访问；需要公网曝光时整体发布 `report.html` 与同目录产物。
+fake 平台/sidecar 收到的请求、JSON 视图与进程日志。报告中的链接是 `local-*`
+（本机静态文件 / 127.0.0.1），**不可从公网访问**；需要公网曝光时请整体发布
+`report.html` 与同目录产物（不含二进制）。
 
 ## 增加场景
 

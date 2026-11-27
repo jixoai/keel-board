@@ -35,6 +35,15 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test -count=1 ./...
+      - name: e2e
+        run: go run ./scripts/e2e -report-dir "$RUNNER_TEMP/keel-e2e"
+      - name: upload e2e report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keel-e2e-report
+          path: ${{ runner.temp }}/keel-e2e
+          if-no-files-found: warn
       - name: race
         run: go test -race -count=1 ./...
       - name: cleanup go cache

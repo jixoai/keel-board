@@ -60,15 +60,24 @@ func (e *e2eEnv) scenarioSlackMirror() {
 			origin, _ := root.Origin.(map[string]any)
 			step.CheckEQ("origin.message", slackRootTS, fmt.Sprint(origin["message"]))
 			step.CheckEQ("origin.thread", "slack:C_SUPPORT:"+slackRootTS, fmt.Sprint(origin["thread"]))
-			statusBody, err := e.syncStatus(step)
+			var slackInbox int
+			err = waitFor(10*time.Second, func() error {
+				statusBody, statusErr := e.syncStatus(step)
+				if statusErr != nil {
+					return statusErr
+				}
+				for _, key := range statusBody.Keys {
+					if key.Key == "slack" {
+						slackInbox = key.Inbox.Done
+					}
+				}
+				if slackInbox < 1 {
+					return fmt.Errorf("inbox done=%d", slackInbox)
+				}
+				return nil
+			})
 			if err != nil {
 				return err
-			}
-			var slackInbox int
-			for _, key := range statusBody.Keys {
-				if key.Key == "slack" {
-					slackInbox = key.Inbox.Done
-				}
 			}
 			step.Check("slack inbox done ≥ 1", slackInbox >= 1, ">=1", fmt.Sprint(slackInbox))
 			step.CheckEQ("未向 Slack 回发 root（CameFrom 跳过）", 0, len(e.fake.SlackPosts()))
@@ -192,6 +201,24 @@ func (e *e2eEnv) scenarioSlackMirror() {
 				step.CheckEQ("附件大小", int64(2048), fileRoot.Attachments[0].Size)
 			}
 			step.CheckEQ("附件数（元数据都保留；非白名单 URL 在 adapter/Host 被剥离）", 2, len(fileRoot.Attachments))
+			// Parse the same payload through the real adapter once more and
+			// assert the unsafe URL is cleared before the Host ever sees it.
+			provider := e.harness.adapters["slack"]
+			headers := slackSignedHeaders(body)
+			webhook := &boardsync.WebhookRequest{Method: http.MethodPost, Header: http.Header{}, Body: body}
+			for name, value := range headers {
+				webhook.Header.Set(name, value)
+			}
+			intake, intakeErr := provider.Receive(e.ctx, "slack", webhook)
+			if intakeErr != nil {
+				return intakeErr
+			}
+			step.CheckEQ("adapter 归一化记录数", 1, len(intake.Records))
+			if len(intake.Records) == 1 && len(intake.Records[0].Event.Files) == 2 {
+				files := intake.Records[0].Event.Files
+				step.CheckEQ("安全文件 URL 保留", "https://files.slack.com/files-pri/T-F/run.log", files[0].URL)
+				step.CheckEQ("非白名单文件 URL 已清空", "", files[1].URL)
+			}
 			step.CheckEQ("未触发文件下载（Host 只存元数据）", 0, len(e.fake.CallsTo("files.slack.com", "/")))
 			step.CheckEQ("未向 Slack 回发", 0, len(e.fake.SlackPosts()))
 			step.Note("文件字节抓取是 SYNC.md 的 open item；本步骤只验证元数据/安全过滤。")
@@ -290,8 +317,13 @@ func (e *e2eEnv) scenarioSlackMirror() {
 func (e *e2eEnv) scenarioSlackChanges() {
 	sc := e.report.Scenario("slack-changes")
 	root, err := e.findThreadQuiet("support", "slack root inbound")
+	if err == nil {
+		if _, found := findReply(root, "slack reply inbound"); !found {
+			err = fmt.Errorf("slack-mirror 的 reply 未导入")
+		}
+	}
 	if err != nil {
-		sc.Skip("Slack 变更场景", "edit/delete/reaction", "找不到 slack-mirror 的 root："+err.Error())
+		sc.Skip("Slack 变更场景", "edit/delete/reaction", "前置 slack-mirror 未完成："+err.Error())
 		return
 	}
 
@@ -897,12 +929,13 @@ func (e *e2eEnv) scenarioSlackFailures() {
 			if err != nil {
 				return err
 			}
+			deadLettered := false
 			for _, item := range dead.Dead {
 				if strings.Contains(item.ID, "Ev-retry-react") {
-					return fmt.Errorf("瞬时失败的 reaction 被错误地 dead-letter")
+					deadLettered = true
 				}
 			}
-			step.Check("inbox 未把该 reaction 判死", true, "true", "true")
+			step.Check("inbox 未把该 reaction 判死", !deadLettered, "absent", fmt.Sprint(deadLettered))
 			return nil
 		}); err != nil {
 		return
@@ -1009,11 +1042,23 @@ func (e *e2eEnv) scenarioSlackRestart() {
 				return err
 			}
 			step.Check("停服写入的回复已回读到 board", countReplies(thread, "WRITTEN-WHILE-DOWN") == 1, "1", fmt.Sprint(countReplies(thread, "WRITTEN-WHILE-DOWN")))
-			statusBody, err := e.syncStatus(step)
+			var drained syncStatusResponse
+			err = waitFor(10*time.Second, func() error {
+				statusBody, statusErr := e.syncStatus(step)
+				if statusErr != nil {
+					return statusErr
+				}
+				drained = statusBody
+				if statusBody.Outbox.Pending+statusBody.Outbox.Leased != 0 {
+					return fmt.Errorf("outbox pending=%d leased=%d", statusBody.Outbox.Pending, statusBody.Outbox.Leased)
+				}
+				return nil
+			})
 			if err != nil {
 				return err
 			}
-			step.CheckEQ("重启后 outbox 排空", 0, statusBody.Outbox.Pending+statusBody.Outbox.Leased)
+			step.CheckEQ("重启后 outbox pending", 0, drained.Outbox.Pending)
+			step.CheckEQ("重启后 outbox leased", 0, drained.Outbox.Leased)
 			return nil
 		}); err != nil {
 		return

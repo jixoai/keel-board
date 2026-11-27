@@ -35,6 +35,7 @@ func run() int {
 	var (
 		reportDirFlag = flag.String("report-dir", "", "report directory (default scripts/e2e/out/<timestamp>)")
 		keepSchemas   = flag.Bool("keep-schemas", false, "do not drop the per-run PostgreSQL schemas (debugging)")
+		injectFailure = flag.Bool("inject-failure", false, "self-test: append a deliberately failing step (verifies non-zero exit and report)")
 	)
 	flag.Parse()
 
@@ -121,6 +122,7 @@ func run() int {
 	env := &e2eEnv{
 		ctx: ctx, report: report, fake: fake, root: root, outDir: outDir,
 		dsn: dsn, harnessSchema: harnessSchema, serveSchema: serveSchema,
+		injectFailure: *injectFailure,
 	}
 	env.run()
 
@@ -175,6 +177,7 @@ type e2eEnv struct {
 	serveSchema   string
 	harness       *harness
 	serveLogs     string
+	injectFailure bool
 }
 
 // run executes every scenario in dependency order.
@@ -182,6 +185,8 @@ func (e *e2eEnv) run() {
 	e.scenarioRealServe()
 	e.scenarioHarnessBoot()
 	if e.harness != nil {
+		e.scenarioAutomation()
+		e.scenarioChatSDK()
 		e.scenarioSlackMirror()
 		e.scenarioSlackChanges()
 		e.scenarioSlackAttach()
@@ -192,9 +197,16 @@ func (e *e2eEnv) run() {
 		e.scenarioAdapterTyping()
 		e.harness.Stop()
 	} else {
-		for _, group := range []string{"slack-mirror", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "adapter-typing"} {
+		for _, group := range []string{"automation", "chatsdk", "slack-mirror", "slack-changes", "slack-attach", "slack-failures", "slack-restart", "github", "linear", "adapter-typing"} {
 			e.report.Scenario(group).Skip("场景未执行", group, "harness 服务器未启动（前置步骤失败），按 SKIP 记录而非假通过")
 		}
+	}
+	if e.injectFailure {
+		sc := e.report.Scenario("self-test")
+		_ = sc.Step("失败注入（--inject-failure）", "故意失败的断言", "FAIL 并以非零退出；报告保留 Actual 与中止 SKIP", func(step *Step) error {
+			step.Check("故意失败", false, "PASS", "FAIL（注入）")
+			return nil
+		})
 	}
 	e.scenarioSkips()
 	e.addCoverage()
@@ -228,22 +240,41 @@ func (e *e2eEnv) addCoverage() {
 		"Comment create/update/remove 入站；commentCreate/commentUpdate/reactionCreate/commentDelete 出站；签名/时间窗 401", r.StepsIn("linear"))
 	r.AddCoverage("typing（adapter 级）", r.GroupStatus("adapter-typing"),
 		"真实 Slack adapter → fake assistant.threads.setStatus；board 无 wiring", r.StepsIn("adapter-typing"))
-	r.AddCoverage("Chat SDK sidecar", StatusSkip, "cmd/board 无 chatsdk 平台/sidecar 入口；包级 bridge 由单测覆盖", "skips")
-	r.AddCoverage("watchers", StatusSkip, "server/log 尚未合入 watcher 投影与路由", "skips")
-	r.AddCoverage("source read / join / bridge events", StatusSkip, "sync 管理 API 未挂载 sources/bridge 路由", "skips")
-	r.AddCoverage("文件字节（入站抓取 / 出站上传）", StatusSkip, "Host 不抓取字节；OutboundMessage.Files 无来源", "skips")
+	r.AddCoverage("watchers / schedules（automation）", r.GroupStatus("automation"),
+		"POST /watchers 后触发 board 事件 → bot post；一次性 schedule 到点写入 board；视图不回显 schedule text", r.StepsIn("automation"))
+	r.AddCoverage("Chat SDK bridge（sidecar fixture）", r.GroupStatus("chatsdk"),
+		"sidecar /deliver message/edit/reaction/delete；PushInbound 签名事件入站/编辑；HMAC/重放 nonce/时间窗；self 身份丢弃", r.StepsIn("chatsdk"))
+	r.AddCoverage("source read / join（本期范围外）", StatusSkip, "本 harness 未覆盖；非本期 Phase 0 E2E 范围，适配器单测覆盖", "skips")
+	r.AddCoverage("文件字节（入站抓取 / 出站上传，本期范围外）", StatusSkip, "本 harness 未覆盖文件字节；Host 不抓取字节、OutboundMessage.Files 无来源，属产品 open item", "skips")
 }
 
 // scenarioRealServe exercises the actual board serve binary over PostgreSQL.
 func (e *e2eEnv) scenarioRealServe() {
 	sc := e.report.Scenario("real-serve")
-	boardBin, err := buildBoardBinary(e.ctx, filepath.Join(e.outDir, "bin"))
+	binDir, tempErr := os.MkdirTemp("", "keel-e2e-bin-")
+	if tempErr != nil {
+		_ = sc.Step("准备二进制临时目录", "os.MkdirTemp", "成功", func(step *Step) error { return tempErr })
+		return
+	}
+	defer os.RemoveAll(binDir)
+	boardBin, err := buildBoardBinary(e.ctx, binDir)
 	if err := sc.Step("构建真实 board 二进制", "go build ./cmd/board", "编译成功", func(step *Step) error {
 		if err != nil {
 			return err
 		}
-		step.Check("二进制存在", true, "存在", "存在")
-		step.Note("binary: bin/board")
+		info, statErr := os.Stat(boardBin)
+		step.Check("二进制存在", statErr == nil, "文件存在", fmt.Sprint(statErr))
+		if statErr == nil {
+			step.Check("二进制大小 > 0", info.Size() > 0, ">0", fmt.Sprint(info.Size()))
+			step.Check("二进制可执行", info.Mode()&0o111 != 0, "可执行位", info.Mode().String())
+		}
+		artifact, evidenceErr := writeBoardBuildEvidence(e.ctx, boardBin, filepath.Join(e.outDir, "logs"), e.report.Commit)
+		if evidenceErr != nil {
+			return evidenceErr
+		}
+		e.report.Artifacts["board-build.txt"] = artifact
+		step.Check("构建证据已生成", artifact != "", "非空", artifact)
+		step.Note("binary: bin/board；证据: %s", artifact)
 		return nil
 	}); err != nil {
 		return
@@ -465,6 +496,7 @@ func (e *e2eEnv) scenarioHarnessBoot() {
 		step.CheckBool("slack owned", true, owned["slack"])
 		step.CheckBool("github owned", true, owned["github"])
 		step.CheckBool("linear owned", true, owned["linear"])
+		step.CheckBool("chatty bridge owned", true, owned[string(chattyKey)])
 		step.CheckEQ("outbox 深度为空", 0, statusBody.Outbox.Pending+statusBody.Outbox.Leased)
 		step.Actual = fmt.Sprintf("keys=%d，outbox pending=%d", len(statusBody.Keys), statusBody.Outbox.Pending)
 		return nil
@@ -477,19 +509,16 @@ func (e *e2eEnv) scenarioHarnessBoot() {
 // scenarioSkips records the explicitly missing product seams or changes.
 func (e *e2eEnv) scenarioSkips() {
 	sc := e.report.Scenario("skips")
-	sc.Skip("Chat SDK sidecar 进程", "fake ChatSDK sidecar + HMAC/nonce 全链路", "当前 cmd/board 没有 chatsdk 平台或 sidecar 进程入口；sync/chatsdk 包由 go test ./... 覆盖。harness 保留 KEEL_E2E_CHATSDK_SIDECAR_URL hook，待 bridge/4.7 合入后启用")
-	sc.Skip("watchers", "durable consumer/lease/ack/退避/死信", "server 路由与 log watcher 尚未出现在 main/本分支（phase 1 说明 watchers outside phase 1）")
-	sc.Skip("board 级 typing", "board 活动 → 平台 typing", "Typing 只存在于 adapter interface；server/worker 无调用缝。已用 adapter 级 HTTP 断言覆盖 fake Slack setStatus")
-	sc.Skip("4.7 source read/join/permalinks API", "source read/join/webhook bridge events", "server 仅挂载 entries/status/inbox/retry/failures/threads attach；sources/bridge 路由未合入")
-	sc.Skip("出站文件字节", "board attachment → 平台文件上传", "OutboundMessage.Files 在 sync/call 中没有填充路径（产品未实现 file bytes）；inbound 文件元数据已覆盖")
-	sc.Skip("入站文件字节抓取", "平台文件下载落盘", "SyncHost.Import 只保留附件元数据，不抓取字节（docs/SYNC.md 列为 open item）；fake 的 files.slack.com 下载端点已就绪")
-	sc.Skip("出站文件成功上传", "files.getUploadURLExternal → completeUploadExternal", "同上：board 无文件字节来源；适配器上传流程由 sync/slack 单测覆盖")
+	sc.Skip("board 级 typing", "board 活动 → 平台 typing", "本 harness 未覆盖 board 级 typing（本期范围外）：Typing 只有 adapter 方法，server/worker 无调用缝。adapter 级 setStatus 已单独覆盖")
+	sc.Skip("source read / join", "平台 source read/join", "本 harness 未覆盖（本期 Phase 0 E2E 范围外）：server 未挂载 sources/join 路由；适配器 source 单测覆盖")
+	sc.Skip("文件字节（入站抓取）", "平台文件下载落盘", "本 harness 未覆盖（产品 open item）：SyncHost.Import 只保留附件元数据，不抓取字节")
+	sc.Skip("文件字节（出站上传）", "board attachment → 平台文件上传", "本 harness 未覆盖（产品 open item）：OutboundMessage.Files 在 sync/call 中没有填充路径")
+	sc.Skip("真实 cmd/board 承载镜像链路", "cmd/board 进程 + fake 平台双向镜像", "本 harness 用 harness-hosted server 跑镜像：cmd/board 没有平台 endpoint/transport 注入缝且约束不改产品代码；real-serve 组只验证真实二进制的 API/sync boot/重启")
 
-	e.report.AddSkip("Chat SDK sidecar", "cmd/board 无 chatsdk 平台入口；包级 bridge 由 go test 覆盖", "port/chatsdk-bridge / task 4.7")
-	e.report.AddSkip("watchers", "server/log 尚无 watcher 投影与路由", "task 3.3")
-	e.report.AddSkip("typing（board 级）", "只有 adapter Typing 方法，无 server 调用缝", "task 4.7")
-	e.report.AddSkip("source read / join / bridge events", "sync 管理 API 未挂载 sources/bridge 路由", "task 4.6/4.7")
-	e.report.AddSkip("文件字节（双向）", "Host 不抓取入站字节；OutboundMessage.Files 无来源", "SYNC.md open items")
+	e.report.AddSkip("typing（board 级）", "本 harness 未覆盖/本期范围外；adapter 级已覆盖", "task 4.7")
+	e.report.AddSkip("source read / join", "本 harness 未覆盖/本期范围外", "task 4.6/4.7")
+	e.report.AddSkip("文件字节（双向）", "本 harness 未覆盖；Host 不抓取入站字节，OutboundMessage.Files 无来源", "SYNC.md open items")
+	e.report.AddSkip("真实 cmd/board 承载镜像链路", "cmd/board 无平台 endpoint 注入；mirror 场景使用 harness-hosted server，装配差异见 README", "设计约束：不修改产品代码")
 }
 
 // Helpers shared by scenarios.

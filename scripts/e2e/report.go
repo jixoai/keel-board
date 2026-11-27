@@ -168,10 +168,11 @@ func (r *Report) Scenario(group string) *Scenario {
 
 // Scenario is a named run of steps.
 type Scenario struct {
-	report  *Report
-	group   string
-	seq     int
-	aborted bool
+	report          *Report
+	group           string
+	seq             int
+	aborted         bool
+	abortedRecorded bool
 }
 
 // Step adds and runs one step. A returned error, a failed assertion, or a
@@ -204,7 +205,9 @@ func (sc *Scenario) Step(name, action, expect string, fn func(*Step) error) erro
 	case runErr != nil:
 		step.Status = StatusFail
 		if step.Actual == "" {
-			step.Actual = runErr.Error()
+			step.Actual = "错误：" + runErr.Error()
+		} else {
+			step.Actual += "；错误：" + runErr.Error()
 		}
 		step.Logs = append(step.Logs, "错误: "+runErr.Error())
 	case step.failed():
@@ -217,6 +220,16 @@ func (sc *Scenario) Step(name, action, expect string, fn func(*Step) error) erro
 	}
 	if step.Status == StatusFail {
 		sc.aborted = true
+		if !sc.abortedRecorded {
+			sc.abortedRecorded = true
+			sc.report.Steps = append(sc.report.Steps, &Step{
+				ID: sc.group + ".aborted", Group: sc.group,
+				Name: "场景中止：后续步骤未执行", Action: "不再执行剩余步骤",
+				Expect: "记录为 SKIP，不静默消失", Actual: "SKIP",
+				Status: StatusSkip, SkipReason: "上一步 " + step.ID + " 失败，场景中止",
+				Started: time.Now(),
+			})
+		}
 		return fmt.Errorf("%s: %s", step.ID, step.Actual)
 	}
 	return nil
@@ -447,7 +460,16 @@ footer { margin-top:40px; color:var(--muted); font-size:12px; border-top:1px sol
 报告链接形态为 <code>local-*</code>（本机静态文件 / 127.0.0.1），不可从公网访问；若需公网曝光，请把 <code>report.html</code> 与同目录产物整体发布。
 </div>
 <div class="note">
-<strong>运行形态：</strong><code>real-serve</code> 组跑真实 <code>board serve</code> 二进制；完整镜像链路跑 harness-hosted server（相同 <code>server.New</code> + <code>syncstore</code> + adapter + worker 装配），因为 <code>cmd/board</code> 没有平台 endpoint/transport 注入缝，而本次约束不修改产品代码。两者差异与原因见 <code>scripts/e2e/README.md</code>。
+<strong>运行形态：</strong><code>real-serve</code> 组跑真实 <code>board serve</code> 二进制；镜像/automation/bridge 组跑 harness-hosted server（<code>server.New</code> + <code>syncstore</code> + Slack/GitHub/Linear/ChatSDK adapter + sync workers + watcher/schedule workers），因为 <code>cmd/board</code> 没有平台 endpoint/transport 注入缝，而本次约束不修改产品代码。<code>real-serve</code> 不经过 fake 平台，因此只覆盖 API、sync 启动面和进程重启。
+</div>
+<div class="note">
+<strong>装配与策略差异（审阅重点）：</strong>
+<ul>
+<li>tenant：harness 固定 <code>e2e</code>；<code>board serve</code> 默认 <code>default</code>（本 harness 未传 <code>--sync-tenant/--automation-tenant</code>）。</li>
+<li>sync 重试：harness <code>Inbound 5 次 / Outbound 3 次，30ms→120ms，lease 2s</code>；<code>cmd/board</code> 用默认 <code>Inbound 10 次 / Outbound 5 次，1s→30s+jitter，lease 1m</code>。E2E 缩短是为了让失败/重试/dead-letter 可测。</li>
+<li>automation 重试：harness <code>3 次，20ms→120ms，lease 5s，poll 10ms，action timeout 2s</code>；<code>cmd/board</code> 默认 <code>5 次，1s→30s+jitter，lease 5m，poll 1s，action timeout 2m</code>。</li>
+<li>HTTP surface：harness 在进程内监听临端口；<code>real-serve</code> 是独立子进程。两者都使用产品 <code>server.New</code> 路由。</li>
+</ul>
 </div>
 
 <h2>覆盖矩阵</h2>

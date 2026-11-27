@@ -220,26 +220,39 @@ func (e *e2eEnv) scenarioGitHub() {
 		return
 	}
 
-	if err := sc.Step("重复 delivery：同一条 comment 只导入一次",
-		"同一 signed issue_comment 投两次（相同 X-GitHub-Delivery）", "board 只有 1 条匹配回复", func(step *Step) error {
+	if err := sc.Step("重复投递与 comment 身份去重（delivery vs comment）",
+		"同一 delivery 重投；再换一个 delivery 投同一条 comment", "两种重投都只有 1 条回复", func(step *Step) error {
 			body := githubCommentBody("created", 9300, "github duplicate comment", "")
-			headers := githubSignedHeaders(body, "issue_comment", "gh-delivery-dup")
-			status, _, err := e.webhook(step, "duplicate first", "github", body, headers)
+			sameDelivery := githubSignedHeaders(body, "issue_comment", "gh-delivery-dup")
+			status, _, err := e.webhook(step, "same delivery first", "github", body, sameDelivery)
 			if err != nil {
 				return err
 			}
 			step.CheckEQ("第一次状态", http.StatusOK, status)
-			status, _, err = e.webhook(step, "duplicate second", "github", body, headers)
+			status, _, err = e.webhook(step, "same delivery second", "github", body, sameDelivery)
 			if err != nil {
 				return err
 			}
-			step.CheckEQ("第二次状态", http.StatusOK, status)
+			step.CheckEQ("同 delivery 重投状态", http.StatusOK, status)
+			time.Sleep(300 * time.Millisecond)
+			afterSameDelivery, err := e.getThread(step, root.ID)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("同 delivery 重投只 1 条回复", 1, countReplies(afterSameDelivery, "github duplicate comment"))
+			otherDelivery := githubSignedHeaders(body, "issue_comment", "gh-delivery-dup-different")
+			status, _, err = e.webhook(step, "same comment, new delivery", "github", body, otherDelivery)
+			if err != nil {
+				return err
+			}
+			step.CheckEQ("换 delivery 重投状态", http.StatusOK, status)
 			time.Sleep(400 * time.Millisecond)
 			thread, err := e.getThread(step, root.ID)
 			if err != nil {
 				return err
 			}
-			step.CheckEQ("匹配回复数", 1, countReplies(thread, "github duplicate comment"))
+			step.CheckEQ("匹配回复数（同 comment 换 delivery 仍去重）", 1, countReplies(thread, "github duplicate comment"))
+			step.Note("GitHub comment 的去重键是 comment ID（MessageDedupe），不是 X-GitHub-Delivery；同 delivery 重投与同 comment 换 delivery 都只入库一次。")
 			return nil
 		}); err != nil {
 		return

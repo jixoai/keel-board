@@ -16,12 +16,14 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/jixoai/keel-board/automation"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
+	"github.com/jixoai/keel-board/sync/chatsdk/sidecartest"
 	"github.com/jixoai/keel-board/sync/github"
 	"github.com/jixoai/keel-board/sync/linear"
 	"github.com/jixoai/keel-board/sync/slack"
@@ -39,21 +41,26 @@ type harness struct {
 	schema string
 	tenant string
 
-	fake       *fakePlatform
-	board      *log.Board
-	boardStore *store.Postgres
-	syncStore  *syncstore.Postgres
-	server     *server.Server
-	http       *http.Server
-	listener   net.Listener
-	baseURL    string
-	registry   *boardsync.Registry
-	adapters   map[boardsync.Key]boardsync.Provider
+	fake               *fakePlatform
+	board              *log.Board
+	boardStore         *store.Postgres
+	syncStore          *syncstore.Postgres
+	automationStore    *automation.Postgres
+	automationRegistry *automation.Registry
+	server             *server.Server
+	http               *http.Server
+	listener           net.Listener
+	baseURL            string
+	registry           *boardsync.Registry
+	adapters           map[boardsync.Key]boardsync.Provider
 
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	logBuf *syncBuffer
-	logger *slog.Logger
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	automationCancel context.CancelFunc
+	automationWG     sync.WaitGroup
+	sidecar          *sidecartest.Sidecar
+	logBuf           *syncBuffer
+	logger           *slog.Logger
 }
 
 // newHarness returns an unstarted harness over schema and the fake platform.
@@ -89,20 +96,47 @@ func (h *harness) Start(ctx context.Context) error {
 	}
 	h.syncStore = syncStore
 
-	registry, adapters, err := h.buildEntries(ctx)
+	automationStore, err := automation.OpenPostgres(ctx, automation.PostgresOptions{
+		DSN: h.dsn, SearchPath: h.schema,
+		Config: automation.Config{
+			Retry:    automation.RetryPolicy{MaxAttempts: 3, BaseDelay: 20 * time.Millisecond, MaxDelay: 120 * time.Millisecond},
+			LeaseTTL: 5 * time.Second,
+		},
+	})
 	if err != nil {
+		syncStore.Close()
+		boardStore.Close()
+		return fmt.Errorf("open automation store: %w", err)
+	}
+	h.automationStore = automationStore
+	automationRegistry, err := automation.NewRegistryWith(automation.PostAction{})
+	if err != nil {
+		automationStore.Close()
+		syncStore.Close()
+		boardStore.Close()
+		return fmt.Errorf("automation registry: %w", err)
+	}
+	h.automationRegistry = automationRegistry
+
+	registry, adapters, sidecar, err := h.buildEntries(ctx)
+	if err != nil {
+		automationStore.Close()
 		syncStore.Close()
 		boardStore.Close()
 		return err
 	}
 	h.registry = registry
 	h.adapters = adapters
+	h.sidecar = sidecar
 
 	api := server.New(server.Options{
 		Board:  h.board,
 		Logger: h.logger,
 		Blobs:  blob.NewMemory(),
 		Tenant: func(*http.Request) (string, error) { return h.tenant, nil },
+		Automation: &server.AutomationOptions{
+			Store: h.automationStore, Actions: h.automationRegistry, Logger: h.logger,
+		},
 		Sync: &server.SyncOptions{
 			Store: syncStore, Registry: registry,
 			Tenant: func(*http.Request) (string, error) { return h.tenant, nil },
@@ -110,6 +144,13 @@ func (h *harness) Start(ctx context.Context) error {
 				{Tenant: h.tenant, Key: "slack"},
 				{Tenant: h.tenant, Key: "github"},
 				{Tenant: h.tenant, Key: "linear"},
+				{Tenant: h.tenant, Key: chattyKey},
+			},
+			BridgeSecret: func(tenant string, key boardsync.Key) (boardsync.Secret, bool) {
+				if tenant == h.tenant && key == chattyKey {
+					return chattyBridgeSecret, true
+				}
+				return "", false
 			},
 			StartChannels: map[server.SyncKey][]string{
 				{Tenant: h.tenant, Key: "slack"}: {"C_SUPPORT"},
@@ -120,6 +161,11 @@ func (h *harness) Start(ctx context.Context) error {
 	})
 	h.server = api
 	if err := api.PrepareSync(ctx); err != nil {
+		if h.sidecar != nil {
+			h.sidecar.Close()
+			h.sidecar = nil
+		}
+		automationStore.Close()
 		syncStore.Close()
 		boardStore.Close()
 		return fmt.Errorf("prepare sync: %w", err)
@@ -138,19 +184,20 @@ func (h *harness) Start(ctx context.Context) error {
 	workerCtx, cancel := context.WithCancel(ctx)
 	h.cancel = cancel
 	h.startWorkers(workerCtx)
+	h.startAutomation(workerCtx)
 	h.logger.Info("harness server started", "addr", h.baseURL, "schema", h.schema)
 	return nil
 }
 
 // buildEntries constructs the adapters exactly as cmd/board does, but with the
 // fake platform's HTTP client.
-func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[boardsync.Key]boardsync.Provider, error) {
+func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[boardsync.Key]boardsync.Provider, *sidecartest.Sidecar, error) {
 	slackProvider, err := slack.New(slack.Config{
 		Key: "slack", SigningSecret: "slack-e2e-signing", BotToken: "xoxb-e2e",
 		BotUserID: "UBOT", BotID: "BBOT", HTTPClient: h.fake.HTTPClient(),
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("slack adapter: %w", err)
+		return nil, nil, nil, fmt.Errorf("slack adapter: %w", err)
 	}
 	githubProvider, err := github.New(github.Config{
 		Key: "github", WebhookSecret: "github-e2e-secret", Token: "ghp_e2e",
@@ -158,14 +205,14 @@ func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[bo
 		Doer: h.fake.HTTPClient(),
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("github adapter: %w", err)
+		return nil, nil, nil, fmt.Errorf("github adapter: %w", err)
 	}
 	linearProvider, err := linear.New(linear.Config{
 		Key: "linear", WebhookSecret: "linear-e2e-secret", APIToken: "lin_api_e2e",
 		TeamKeys: []string{"ENG"}, BotUserID: "bot-linear", HTTPClient: h.fake.HTTPClient(),
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("linear adapter: %w", err)
+		return nil, nil, nil, fmt.Errorf("linear adapter: %w", err)
 	}
 
 	slackFn, slackRoutes := boardsync.Channels(map[string]boardsync.SyncFunc{
@@ -180,25 +227,35 @@ func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[bo
 	linearFn, linearRoutes := boardsync.Channels(map[string]boardsync.SyncFunc{
 		"ENG": boardsync.Mirror("linear"),
 	})
+	chattyProvider, sidecar, err := newChattyProvider()
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("chatsdk bridge: %w", err)
+	}
+	chattyFn, chattyRoutes := boardsync.Channels(map[string]boardsync.SyncFunc{
+		"C_CHAT": boardsync.Mirror("chatty-board"),
+	})
 	entries := []boardsync.Entry{
 		{Tenant: h.tenant, Key: "slack", Platform: "slack", Provider: slackProvider, Sync: slackFn, Routes: slackRoutes},
 		{Tenant: h.tenant, Key: "github", Platform: "github", Provider: githubProvider, Sync: githubFn, Routes: githubRoutes},
 		{Tenant: h.tenant, Key: "linear", Platform: "linear", Provider: linearProvider, Sync: linearFn, Routes: linearRoutes},
+		{Tenant: h.tenant, Key: chattyKey, Platform: "chatty", Provider: chattyProvider, Sync: chattyFn, Routes: chattyRoutes},
 	}
 	registry := boardsync.NewRegistry()
 	for _, entry := range entries {
 		if err := registry.Add(entry); err != nil {
-			return nil, nil, err
+			sidecar.Close()
+			return nil, nil, nil, err
 		}
 		if _, err := h.syncStore.UpsertEntry(ctx, syncstore.Entry{
 			Tenant: h.tenant, Key: entry.Key, Platform: entry.Platform, Enabled: true,
 		}); err != nil {
-			return nil, nil, fmt.Errorf("upsert entry %s: %w", entry.Key, err)
+			sidecar.Close()
+			return nil, nil, nil, fmt.Errorf("upsert entry %s: %w", entry.Key, err)
 		}
 	}
 	return registry, map[boardsync.Key]boardsync.Provider{
-		"slack": slackProvider, "github": githubProvider, "linear": linearProvider,
-	}, nil
+		"slack": slackProvider, "github": githubProvider, "linear": linearProvider, chattyKey: chattyProvider,
+	}, sidecar, nil
 }
 
 // startWorkers runs one inbound and one outbound worker per key and the board
@@ -206,7 +263,7 @@ func (h *harness) buildEntries(ctx context.Context) (*boardsync.Registry, map[bo
 func (h *harness) startWorkers(ctx context.Context) {
 	runner := h.server.SyncRunner()
 	host := h.server.SyncHost()
-	for _, key := range []boardsync.Key{"slack", "github", "linear"} {
+	for _, key := range []boardsync.Key{"slack", "github", "linear", chattyKey} {
 		inbound, err := syncstore.NewInboundWorker(syncstore.InboundWorkerConfig{
 			Store: h.syncStore, Registry: h.registry, Runner: runner,
 			Tenant: h.tenant, Key: key, Owner: "e2e-inbound-" + string(key),
@@ -234,6 +291,35 @@ func (h *harness) startWorkers(ctx context.Context) {
 	go func() { defer h.wg.Done(); _ = h.server.RunSync(ctx) }()
 }
 
+// startAutomation runs the same watcher and schedule workers cmd/board starts,
+// over the harness's automation store. It uses server.AllowAll like the
+// development serve binary.
+func (h *harness) startAutomation(ctx context.Context) {
+	watchers, err := automation.NewWatcherWorker(automation.WatcherWorkerConfig{
+		Store: h.automationStore, Board: h.board, Actions: h.automationRegistry,
+		Authorize: server.AllowAll{}, Tenant: h.tenant, Owner: "e2e-watcher",
+		PollInterval: 10 * time.Millisecond, ActionTimeout: 2 * time.Second, Logger: h.logger,
+	})
+	if err != nil {
+		h.logger.Error("watcher worker", "error", err)
+		return
+	}
+	schedules, err := automation.NewScheduleWorker(automation.ScheduleWorkerConfig{
+		Store: h.automationStore, Board: h.board, Authorize: server.AllowAll{},
+		Tenant: h.tenant, Owner: "e2e-scheduler", PollInterval: 10 * time.Millisecond, Logger: h.logger,
+	})
+	if err != nil {
+		h.logger.Error("schedule worker", "error", err)
+		return
+	}
+	workerCtx, cancel := context.WithCancel(ctx)
+	h.automationCancel = cancel
+	h.automationWG.Add(1)
+	go func() { defer h.automationWG.Done(); _ = watchers.Run(workerCtx) }()
+	h.automationWG.Add(1)
+	go func() { defer h.automationWG.Done(); _ = schedules.Run(workerCtx) }()
+}
+
 // Stop cancels workers, shuts the HTTP server, and closes both stores, leaving
 // only PostgreSQL rows behind — exactly what a process restart leaves.
 func (h *harness) Stop() {
@@ -250,6 +336,25 @@ func (h *harness) Stop() {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		h.logger.Warn("harness workers did not stop in time")
+	}
+	if h.automationCancel != nil {
+		h.automationCancel()
+		h.automationCancel = nil
+	}
+	automationDone := make(chan struct{})
+	go func() { h.automationWG.Wait(); close(automationDone) }()
+	select {
+	case <-automationDone:
+	case <-time.After(10 * time.Second):
+		h.logger.Warn("automation workers did not stop in time")
+	}
+	if h.sidecar != nil {
+		h.sidecar.Close()
+		h.sidecar = nil
+	}
+	if h.automationStore != nil {
+		h.automationStore.Close()
+		h.automationStore = nil
 	}
 	if h.http != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
