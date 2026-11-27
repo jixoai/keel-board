@@ -31,16 +31,17 @@ const Version = "0.1.0-phase1"
 
 // Server is the board's HTTP handler.
 type Server struct {
-	board     *log.Board
-	authorize Authorizer
-	actorFn   ActorFunc
-	tenantFn  TenantFunc
-	version   string
-	mux       *http.ServeMux
-	logger    *slog.Logger
-	blobs     blob.Store
-	now       func() time.Time
-	sync      *syncService
+	board      *log.Board
+	authorize  Authorizer
+	actorFn    ActorFunc
+	tenantFn   TenantFunc
+	version    string
+	mux        *http.ServeMux
+	logger     *slog.Logger
+	blobs      blob.Store
+	now        func() time.Time
+	sync       *syncService
+	automation *automationService
 }
 
 // Options configure a Server.
@@ -68,6 +69,10 @@ type Options struct {
 	// Sync mounts the platform webhook route, the board-event subscription and
 	// the sync management API. nil serves no sync.
 	Sync *SyncOptions
+	// Automation mounts the watcher and schedule management API. nil serves
+	// no automation routes; the workers that consume the durable rows are a
+	// deployment's to run (cmd/board does).
+	Automation *AutomationOptions
 }
 
 // New returns a server. It panics if no board is given: a server without a
@@ -114,6 +119,16 @@ func New(opts Options) *Server {
 			panic("server: " + err.Error())
 		}
 		server.sync = service
+	}
+	if opts.Automation != nil {
+		if opts.Automation.Logger == nil {
+			opts.Automation.Logger = opts.Logger
+		}
+		service, err := newAutomationService(*opts.Automation)
+		if err != nil {
+			panic("server: " + err.Error())
+		}
+		server.automation = service
 	}
 	server.routes()
 	return server
@@ -170,6 +185,29 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("POST "+base+"/sync/outbox/{id}/retry", s.handleSyncRetryOutbox)
 		s.mux.HandleFunc("GET "+base+"/sync/threads", s.handleSyncThreads)
 		s.mux.HandleFunc("POST "+base+"/sync/threads", s.handleSyncAttach)
+	}
+	if s.automation != nil {
+		s.mux.HandleFunc("GET "+base+"/watchers", s.handleWatchers)
+		s.mux.HandleFunc("POST "+base+"/watchers", s.handleCreateWatcher)
+		s.mux.HandleFunc("GET "+base+"/watchers/{id}", s.handleWatcher)
+		s.mux.HandleFunc("POST "+base+"/watchers/{id}", s.handleUpdateWatcher)
+		s.mux.HandleFunc("PUT "+base+"/watchers/{id}", s.handleUpdateWatcher)
+		s.mux.HandleFunc("DELETE "+base+"/watchers/{id}", s.handleDeleteWatcher)
+		s.mux.HandleFunc("POST "+base+"/watchers/{id}/enable", s.handleEnableWatcher)
+		s.mux.HandleFunc("POST "+base+"/watchers/{id}/disable", s.handleDisableWatcher)
+		s.mux.HandleFunc("GET "+base+"/watchers/{id}/deliveries", s.handleWatcherDeliveries)
+		s.mux.HandleFunc("POST "+base+"/watchers/{id}/deliveries/{seq}/retry", s.handleRetryDelivery)
+		s.mux.HandleFunc("POST "+base+"/watchers/{id}/deliveries/clear", s.handleClearDeliveries)
+		s.mux.HandleFunc("GET "+base+"/schedules", s.handleSchedules)
+		s.mux.HandleFunc("POST "+base+"/schedules", s.handleCreateSchedule)
+		s.mux.HandleFunc("GET "+base+"/schedules/{id}", s.handleSchedule)
+		s.mux.HandleFunc("POST "+base+"/schedules/{id}", s.handleUpdateSchedule)
+		s.mux.HandleFunc("PUT "+base+"/schedules/{id}", s.handleUpdateSchedule)
+		s.mux.HandleFunc("DELETE "+base+"/schedules/{id}", s.handleDeleteSchedule)
+		s.mux.HandleFunc("POST "+base+"/schedules/{id}/enable", s.handleEnableSchedule)
+		s.mux.HandleFunc("POST "+base+"/schedules/{id}/disable", s.handleDisableSchedule)
+		s.mux.HandleFunc("POST "+base+"/schedules/{id}/retry", s.handleRetrySchedule)
+		s.mux.HandleFunc("POST "+base+"/schedules/{id}/clear", s.handleClearSchedule)
 	}
 	// Anything else answers the board's own error shape.
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

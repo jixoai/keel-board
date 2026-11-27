@@ -68,6 +68,8 @@ func newHarness(t *testing.T, options ...server.Options) *harness {
 		if supplied.Tenant != nil {
 			opts.Tenant = supplied.Tenant
 		}
+		opts.Sync = supplied.Sync
+		opts.Automation = supplied.Automation
 	}
 	api := server.New(opts)
 	httpServer := httptest.NewServer(api)
