@@ -346,8 +346,10 @@ upstream:
 
 Known deviations and deferred work:
 
-- The idempotency digest in `server/messages.go` and `server/tasks.go` is coarse
-  (`channel`/`re`); it is not content-addressed yet. port/messages owns this.
+- The idempotency digest in `server/messages.go` and `server/tasks.go` names the
+  write's place (`channel`/`re`), not its text. That is deliberate: a retry of
+  the same request key answers the first write even if the text differs; a
+  different place under the same key is `409 duplicate_id`.
 - The HTTP task-adopt route (`POST /tasks` with `re`) refuses `id` in this
   snapshot, so a keyed adopt is exercised through `Board.Update`; the replay
   path and store contract are ready if the handler allows the key later.
