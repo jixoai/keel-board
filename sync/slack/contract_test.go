@@ -346,7 +346,7 @@ func fakeMessagesJSON(messages []*fakeMessage) []map[string]any {
 }
 
 // fakeTextError mirrors Slack's text/markdown contract: one of the two, and
-// at most 12000 characters.
+// at most 12000 Unicode characters (runes), matching the adapter's limit.
 func fakeTextError(text, markdown string) string {
 	if text != "" && markdown != "" {
 		return "markdown_text_conflict"

@@ -558,3 +558,46 @@ func TestLocateRejectsDMPermalink(t *testing.T) {
 		t.Fatalf("ResolveTarget = %v", err)
 	}
 }
+
+func TestNonSlackKeySourceAndFetchRoot(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/conversations.info":
+			_, _ = w.Write([]byte(`{"ok":true,"channel":{"id":"C0123ABC","name":"support","is_member":true}}`))
+		case "/conversations.history":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1727000000.123456","user":"U0456ABC","text":"hi <@U0999XYZ>"}]}`))
+		case "/conversations.replies":
+			_, _ = w.Write([]byte(`{"ok":true,"messages":[{"ts":"1727000000.123456","user":"U0456ABC","text":"root"}]}`))
+		default:
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	p, err := slack.New(slack.Config{
+		Key: "support-slack", SigningSecret: testSecret, BotToken: testToken,
+		BotUserID: "UAPP123", APIBaseURL: server.URL, Now: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := p.ReadSource(context.Background(), "support-slack", "C0123ABC", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read.Messages[0].AuthorID != "support-slack:user:U0456ABC" || !strings.Contains(read.Messages[0].Text, "@[support-slack:user:U0999XYZ]") {
+		t.Fatalf("read = %+v", read.Messages)
+	}
+	if _, err := p.ReadSource(context.Background(), "slack", "C0123ABC", 10); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("wrong key ReadSource = %v", err)
+	}
+	root, err := p.FetchRoot(context.Background(), "support-slack", "C0123ABC:1727000000.123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root.Author.ID != "support-slack:user:U0456ABC" {
+		t.Fatalf("root = %+v", root)
+	}
+	if _, err := p.FetchRoot(context.Background(), "slack", "C0123ABC:1727000000.123456"); !errors.Is(err, boardsync.ErrBadRequest) {
+		t.Fatalf("wrong key FetchRoot = %v", err)
+	}
+}

@@ -211,6 +211,9 @@ func TestFileFailureEditsNotes(t *testing.T) {
 			if cap.posts.Load() != 1 || cap.updates.Load() != 1 {
 				t.Fatalf("posts=%d updates=%d", cap.posts.Load(), cap.updates.Load())
 			}
+			if cap.update.Get("text") != "" || cap.update.Get("markdown_text") == "" {
+				t.Fatalf("update fields = %v", cap.update)
+			}
 			if !strings.Contains(formBody(cap.update), "📎 a.png") || !strings.Contains(formBody(cap.update), "on the board: #812") {
 				t.Fatalf("text = %q", formBody(cap.update))
 			}

@@ -28,27 +28,80 @@ func outboundText(markdown string) string {
 	return truncateSlackText(cleanText(markdown), maxSlackText)
 }
 
-// truncateSlackText cuts text to Slack's character limit. It backs off an
-// incomplete mention (<@U…>), board mention (@[key:user:U…]), or entity
-// (&…;) at the cut, so the visible tail is never half a token.
+// truncateSlackText cuts text to Slack's character limit. It backs off only
+// an unclosed token that touches the cut and has Slack's shape, so a bare
+// "R&D" or "5 < 6" stays whole. An unclosed angle token is handled before an
+// entity inside it, so a cut link never leaves half a "<…>".
 func truncateSlackText(text string, max int) string {
 	runes := []rune(text)
 	if len(runes) <= max {
 		return text
 	}
 	cut := string(runes[:max])
-	for _, token := range []struct{ open, close string }{
-		{"@[", "]"}, {"<", ">"}, {"&", ";"},
-	} {
-		at := strings.LastIndex(cut, token.open)
-		if at < 0 {
-			continue
-		}
-		if !strings.Contains(cut[at+len(token.open):], token.close) {
-			cut = cut[:at]
+	for attempt := 0; attempt < 3; attempt++ {
+		next, changed := trimUnclosedSlackToken(cut)
+		cut = next
+		if !changed {
+			break
 		}
 	}
 	return cut
+}
+
+// trimUnclosedSlackToken removes at most one token that begins before the
+// cut and does not close: <@…>, <#…>, <!…>, <http…>, an HTML entity &…,
+// or a board mention @[….
+func trimUnclosedSlackToken(cut string) (string, bool) {
+	// Angle tokens first: an & inside an unclosed <...> is part of the link,
+	// not an entity to trim separately.
+	if at := lastUnclosed(cut, '<', '>'); at >= 0 {
+		rest := cut[at+1:]
+		lower := strings.ToLower(rest)
+		if strings.HasPrefix(rest, "@") || strings.HasPrefix(rest, "#") || strings.HasPrefix(rest, "!") ||
+			strings.HasPrefix(lower, "http") || strings.HasPrefix(lower, "mailto:") {
+			return cut[:at], true
+		}
+	}
+	if at := lastUnclosed(cut, '&', ';'); at >= 0 {
+		rest := cut[at+1:]
+		if rest != "" && entityShape(rest) {
+			return cut[:at], true
+		}
+	}
+	if at := strings.LastIndex(cut, "@["); at >= 0 && !strings.Contains(cut[at:], "]") {
+		rest := cut[at+2:]
+		if rest != "" && !strings.ContainsAny(rest, " \t\r\n") {
+			return cut[:at], true
+		}
+	}
+	return cut, false
+}
+
+// lastUnclosed returns the last opener with no closer after it, or -1.
+func lastUnclosed(text string, open, close byte) int {
+	at := strings.LastIndexByte(text, open)
+	if at < 0 {
+		return -1
+	}
+	if strings.IndexByte(text[at+1:], close) >= 0 {
+		return -1
+	}
+	return at
+}
+
+// entityShape is a complete HTML entity name without its semicolon:
+// [A-Za-z#][A-Za-z0-9]*.
+func entityShape(rest string) bool {
+	for i, r := range rest {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z':
+		case r >= '0' && r <= '9' && i > 0:
+		case r == '#' && i == 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // slackControlEscaper neutralizes Slack's control markup: a cross-platform

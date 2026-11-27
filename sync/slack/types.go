@@ -421,6 +421,9 @@ func (c *Client) PostMessage(ctx context.Context, req PostMessageRequest) (strin
 	if req.Channel == "" {
 		return "", fmt.Errorf("%w: slack post has no channel", boardsync.ErrBadRequest)
 	}
+	if req.Text != "" && req.MarkdownText != "" {
+		return "", fmt.Errorf("%w: slack post has both text and markdown_text", boardsync.ErrBadRequest)
+	}
 	form := url.Values{
 		"channel":      {req.Channel},
 		"unfurl_links": {"false"},
@@ -462,6 +465,9 @@ func (c *Client) UpdateMessage(ctx context.Context, channel, ts, text, markdown 
 	}
 	if text == "" && markdown == "" {
 		return fmt.Errorf("%w: slack update has no text", boardsync.ErrBadRequest)
+	}
+	if text != "" && markdown != "" {
+		return fmt.Errorf("%w: slack update has both text and markdown_text", boardsync.ErrBadRequest)
 	}
 	form := url.Values{"channel": {channel}, "ts": {ts}}
 	// Slack accepts text or markdown_text, not both (markdown_text_conflict).

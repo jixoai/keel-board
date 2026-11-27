@@ -585,7 +585,7 @@ board.
 
 Outbound: `chat.postMessage` with `channel`, optional `thread_ts`, one of
 `text` (external content, escaped) or `markdown_text` (board content, at most
-12000 characters), `username`/`icon_url` only for a verified sender, and
+12000 Unicode characters), `username`/`icon_url` only for a verified sender, and
 unfurls off. A channel target starts a root; a thread target replies. `chat.update`,
 `chat.delete`, and `reactions.add/remove` cover changes. `#name` resolves
 through one cached `conversations.list`; IDs never wait. `Locate` reads
