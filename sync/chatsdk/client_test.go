@@ -539,3 +539,16 @@ func TestClientRejectsCrossKeyOversizedRequestAndInvalidPosted(t *testing.T) {
 		t.Fatalf("invalid posted attempts = %d", attempts.Load())
 	}
 }
+
+func TestClientRefusesForeignResolvedTarget(t *testing.T) {
+	server := signedSidecar(t, func(*http.Request, []byte) (int, any) {
+		return http.StatusOK, chatsdk.ResolveResponse{Target: &boardsync.ResolvedTarget{
+			Key: "other", Platform: "telegram", Channel: "-100", Thread: "-100:42", Kind: boardsync.TargetThread,
+		}}
+	})
+	t.Cleanup(server.Close)
+	client := newClient(t, server.URL, nil)
+	if _, err := client.Resolve(context.Background(), chatsdk.ResolveRequest{Target: "-100:42"}); err == nil || !boardsync.IsPermanent(err) {
+		t.Fatalf("foreign target = %v, want permanent", err)
+	}
+}

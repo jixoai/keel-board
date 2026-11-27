@@ -318,11 +318,13 @@ func TestInboundCrashAfterImportBeforeAck(t *testing.T) {
 
 type pruneCounter struct {
 	syncstore.Store
-	count atomic.Int64
+	count      atomic.Int64
+	lastTenant string
 }
 
 func (p *pruneCounter) PruneNonces(ctx context.Context, tenant string, before time.Time) (int64, error) {
 	p.count.Add(1)
+	p.lastTenant = tenant
 	return p.Store.PruneNonces(ctx, tenant, before)
 }
 
@@ -354,5 +356,8 @@ func TestInboundWorkerPrunesBridgeNonces(t *testing.T) {
 	}
 	if store.count.Load() == 0 {
 		t.Fatal("the inbound worker never pruned bridge nonces")
+	}
+	if store.lastTenant != "t1" {
+		t.Fatalf("pruned tenant = %q", store.lastTenant)
 	}
 }

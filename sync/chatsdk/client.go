@@ -217,6 +217,12 @@ func (c *Client) Resolve(ctx context.Context, req ResolveRequest) (ResolveRespon
 	if response.Target.Platform == "" && c.platform != "" {
 		response.Target.Platform = c.platform
 	}
+	if response.Target.Key != c.key {
+		return ResolveResponse{}, boardsync.Permanent(fmt.Errorf("%w: sidecar target belongs to %q, not %q", boardsync.ErrBadRequest, response.Target.Key, c.key))
+	}
+	if c.platform != "" && response.Target.Platform != c.platform {
+		return ResolveResponse{}, boardsync.Permanent(fmt.Errorf("%w: sidecar target is for %q, not %q", boardsync.ErrBadRequest, response.Target.Platform, c.platform))
+	}
 	if err := response.Target.Validate(); err != nil {
 		return ResolveResponse{}, boardsync.Permanent(fmt.Errorf("chatsdk: sidecar target: %w", err))
 	}
