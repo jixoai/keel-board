@@ -56,16 +56,18 @@ func rebuild(args []string) error {
 	if err != nil {
 		return err
 	}
-	problems := 0
+	failed := 0
 	for _, report := range reports {
 		fmt.Printf("%s: head=%d digest=%s consistent=%t\n", report.Tenant, report.LogHead, report.Digest, report.Consistent)
 		for _, problem := range report.Problems {
 			fmt.Printf("  - %s\n", problem)
-			problems++
+		}
+		if len(report.Problems) > 0 {
+			failed++
 		}
 	}
-	if problems > 0 {
-		return fmt.Errorf("board rebuild: %d tenant(s) are not consistent; events are intact, so restore the log or head row and retry", problems)
+	if failed > 0 {
+		return fmt.Errorf("board rebuild: %d tenant(s) are not consistent; events are intact, so restore the log or head row and retry", failed)
 	}
 	return nil
 }
