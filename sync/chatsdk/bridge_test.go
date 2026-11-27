@@ -222,6 +222,11 @@ func TestDecodeInboundRejectsUnstorableIDs(t *testing.T) {
 		{name: "nul dedupe", dedupe: "m\x001"},
 		{name: "nul raw", mutate: func(e *boardsync.Event) { e.Raw = json.RawMessage(`{"x":"\u0000"}`) }},
 		{name: "nul file name", mutate: func(e *boardsync.Event) { e.Files = []boardsync.File{{Name: "a\x00b"}} }},
+		{name: "deleted without author", mutate: func(e *boardsync.Event) {
+			e.Kind = boardsync.KindDeleted
+			e.Type = boardsync.TypeMessageDeleted
+			e.Author = boardsync.Author{}
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -334,6 +334,12 @@ func DecodeInbound(body []byte, key boardsync.Key, platform boardsync.Platform) 
 		if strings.TrimSpace(event.Type) == "" {
 			return nil, fmt.Errorf("%w: event %d has no type", boardsync.ErrBadRequest, i)
 		}
+		if event.Author.ID == "" {
+			// Deletion events in particular may omit an author in the
+			// platform payload. Without one the bridge can't tell whether the
+			// event is its own, so it refuses rather than risking an echo.
+			return nil, fmt.Errorf("%w: event %d has no author", boardsync.ErrBadRequest, i)
+		}
 		if err := checkEventStrings(&event); err != nil {
 			return nil, fmt.Errorf("%w: event %d: %v", boardsync.ErrBadRequest, i, err)
 		}

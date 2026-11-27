@@ -129,8 +129,10 @@ X-Keel-Board-Signature: v1=...
   tenant/key isolation.
 - The event shape is `sync.Event`: `kind` is one of `message`, `edited`,
   `deleted`, `reaction`, `lifecycle`; the narrow `type` is the platform's
-  name for it. A reaction needs `message` and `emoji`; a lifecycle needs
-  `lifecycle.type`, an author, and a title/body/label.
+  name for it. Every event needs `author.id`, including a deletion: without
+  it the board cannot tell whether the event is the bridge's own and refuses
+  the batch. A reaction needs `message` and `emoji`; a lifecycle needs
+  `lifecycle.type` and a title/body/label.
 - The board answers `{"stored": n}` after the inbox commit. It never answers
   2xx before storing: a store failure is `500` and the sidecar retries.
 - A disabled entry answers `200` without reading the body, so a sidecar can
