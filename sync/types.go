@@ -487,6 +487,10 @@ type OutboundMessage struct {
 	// the same state and properties (Linear). A provider that doesn't mirror
 	// labels ignores the field.
 	Labels map[string]string `json:"labels,omitempty"`
+	// LabelsBefore is the labels before a labels.changed event. A provider
+	// applies only the difference, so a text edit or one property change
+	// doesn't rewrite the rest.
+	LabelsBefore map[string]string `json:"labelsBefore,omitempty"`
 }
 
 // Posted is a provider's answer to Post: native IDs, without the sync key.

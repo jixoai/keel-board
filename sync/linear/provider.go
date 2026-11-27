@@ -215,7 +215,7 @@ func (p *Provider) Post(ctx context.Context, key boardsync.Key, target boardsync
 			return boardsync.Posted{}, err
 		}
 		title, description := splitTitle(msg.Markdown)
-		update, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels)
+		update, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels, nil, "")
 		if err != nil {
 			return boardsync.Posted{}, err
 		}
@@ -262,7 +262,15 @@ func (p *Provider) Edit(ctx context.Context, key boardsync.Key, thread boardsync
 	if message == IssueRootMessage {
 		update := issueUpdate{SetDescription: true, Description: msg.Markdown}
 		if msg.Labels != nil {
-			properties, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels)
+			currentStateID := ""
+			if stateMayChange(msg.Labels, msg.LabelsBefore) {
+				issue, err := p.client.IssueByID(ctx, issueID)
+				if err != nil {
+					return err
+				}
+				currentStateID = issue.State.ID
+			}
+			properties, err := p.resolveIssueUpdate(ctx, teamKey, msg.Labels, msg.LabelsBefore, currentStateID)
 			if err != nil {
 				return err
 			}
@@ -328,8 +336,8 @@ func (p *Provider) FetchRoot(ctx context.Context, key boardsync.Key, thread stri
 	if issueTeam == "" {
 		issueTeam = teamOfIdentifier(issue.Identifier)
 	}
-	if issueTeam != "" && issueTeam != teamKey {
-		return nil, fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
+	if issueTeam == "" || issueTeam != teamKey {
+		return nil, fmt.Errorf("%w: linear issue %s is in %q, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
 	}
 	return &boardsync.RootDraft{
 		Text:   issueRootText(&issue),

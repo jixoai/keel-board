@@ -15,6 +15,23 @@ import (
 	"github.com/jixoai/keel-board/sync/linear"
 )
 
+func TestCommentAuthorUsesEnvelopeActor(t *testing.T) {
+	p, _ := commentServer(t, "ENG", false)
+	body := []byte(strings.ReplaceAll(string(fixture(t, "comment_created.json")), `"name": "julian"`, `"name": "ada"`))
+	event := receive(t, p, body)[0].Event
+	if event.Author.Handle != "ada" {
+		t.Fatalf("author = %+v", event.Author)
+	}
+}
+
+func TestNonIssueCommentIgnored(t *testing.T) {
+	body := []byte(`{"action":"create","type":"Comment","data":{"id":"comment-p1","body":"on a project","projectId":"project-1","userId":"user-2"},"actor":{"id":"user-2","name":"julian","type":"user"},"webhookTimestamp":0}`)
+	intake, err := newProvider(t, "").Receive(context.Background(), "linear", request(t, body))
+	if err != nil || len(intake.Records) != 0 {
+		t.Fatalf("non-issue comment = %+v, %v", intake, err)
+	}
+}
+
 func TestLegacySignatureHeader(t *testing.T) {
 	body := fixture(t, "issue_created.json")
 	header := http.Header{}
@@ -110,6 +127,15 @@ func TestCommentEditDeleteDedupe(t *testing.T) {
 	}
 }
 
+func TestOwnIssueCreateChecksCreator(t *testing.T) {
+	body := []byte(strings.Replace(string(fixture(t, "issue_created.json")),
+		`"creator": { "id": "user-1"`, `"creator": { "id": "app-1"`, 1))
+	records := receive(t, newProvider(t, ""), body)
+	if len(records) != 1 || records[0].Event.Lifecycle.CreateRoot {
+		t.Fatalf("own creator opened a root: %+v", records)
+	}
+}
+
 func TestOwnIssueUpdateDoesNotCreateRoot(t *testing.T) {
 	body := []byte(strings.ReplaceAll(string(fixture(t, "issue_updated.json")), `"id": "user-1"`, `"id": "app-1"`))
 	body = []byte(strings.ReplaceAll(string(body), `"type": "user"`, `"type": "application"`))
@@ -147,6 +173,24 @@ func TestCrossTeamFetchRootAndPermalinkRefused(t *testing.T) {
 	event := boardsync.Event{Key: "linear", Platform: "linear", Kind: boardsync.KindLifecycle, Thread: "ENG:" + testIssueID}
 	if _, err := p.Permalink(ctx, "linear", event); !errors.Is(err, boardsync.ErrNotFound) {
 		t.Fatalf("cross-team permalink = %v", err)
+	}
+}
+
+func TestMissingTeamFetchRootAndPermalinkRefused(t *testing.T) {
+	server := graphServer(t, func(q string, vars map[string]any) any {
+		return map[string]any{"issue": map[string]any{
+			"id": testIssueID, "identifier": "", "url": testIssueURL,
+		}}
+	})
+	defer server.Close()
+	p := newProviderWith(t, server.URL, func(cfg *linear.Config) { cfg.TeamKeys = []string{"ENG", "OPS"} })
+	ctx := context.Background()
+	if _, err := p.FetchRoot(ctx, "linear", "ENG:"+testIssueID); !errors.Is(err, boardsync.ErrNotFound) {
+		t.Fatalf("missing-team root = %v", err)
+	}
+	event := boardsync.Event{Key: "linear", Platform: "linear", Kind: boardsync.KindLifecycle, Thread: "ENG:" + testIssueID}
+	if _, err := p.Permalink(ctx, "linear", event); !errors.Is(err, boardsync.ErrNotFound) {
+		t.Fatalf("missing-team permalink = %v", err)
 	}
 }
 

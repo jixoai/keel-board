@@ -524,7 +524,7 @@ func TestOutboxCopyIsDurableBeforeReceipt(t *testing.T) {
 	})
 }
 
-func TestOutboxLabelsChangedWithRenderer(t *testing.T) {
+func TestOutboxLabelsChangedLabelerWinsOverRenderer(t *testing.T) {
 	renderer := func(in boardsync.RenderInput) (string, error) {
 		return "rendered:" + in.Message.Text, nil
 	}
@@ -552,8 +552,57 @@ func TestOutboxLabelsChangedWithRenderer(t *testing.T) {
 		if err != nil || result.Dead != 0 || result.Acked != 1 {
 			t.Fatalf("labels pass = %+v, %v", result, err)
 		}
-		if edits := provider.Edits(); len(edits) != 1 || edits[0].Message != "posted-101" {
-			t.Fatalf("rendered label edit = %+v", edits)
+		if edits := provider.Edits(); len(edits) != 0 {
+			t.Fatalf("renderer overwrote the issue: %+v", edits)
+		}
+		if calls := provider.LabelsCalls(); len(calls) != 1 || calls[0].Thread.External() != "slack:C0123:T1" {
+			t.Fatalf("label calls = %+v", calls)
+		}
+	})
+}
+
+func TestOutboxLabelsChangedChannelRootReachesLabeler(t *testing.T) {
+	withStores(t, testConfig(), func(t *testing.T, store syncstore.Store) {
+		ctx := t.Context()
+		provider, _, worker := outboundFixture(t, store, testConfig())
+		provider.PostFunc = func(_ context.Context, _ boardsync.Key, target boardsync.ResolvedTarget, msg boardsync.OutboundMessage) (boardsync.Posted, error) {
+			thread := target.Thread
+			if target.Kind == boardsync.TargetChannel {
+				thread = target.Channel + ":root"
+			}
+			return boardsync.Posted{Thread: thread, Message: "posted-101"}, nil
+		}
+		target := channelTarget("C0123")
+		root := boardMessage(101, 101, "root")
+		root.Labels = map[string]string{"state": "started"}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
+			postedEvent(10, 101, 101), root, []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatalf("enqueue post: %v", err)
+		}
+		if result, err := worker.Process(ctx); err != nil || result.Acked != 1 {
+			t.Fatalf("post pass = %+v, %v", result, err)
+		}
+		changed := root
+		changed.Labels = map[string]string{"state": "completed"}
+		if _, err := store.EnqueueOutbox(ctx, "t1", "slack",
+			boardsync.BoardEvent{ID: 11, Type: boardsync.BoardLabelsChanged, Thread: 101,
+				Before: &boardsync.Message{ID: 101, Thread: 101, Labels: root.Labels}},
+			changed, []boardsync.ResolvedTarget{target}); err != nil {
+			t.Fatalf("enqueue labels: %v", err)
+		}
+		result, err := worker.Process(ctx)
+		if err != nil || result.Dead != 0 || result.Acked != 1 {
+			t.Fatalf("labels pass = %+v, %v", result, err)
+		}
+		calls := provider.LabelsCalls()
+		if len(calls) != 1 {
+			t.Fatalf("label calls = %+v", calls)
+		}
+		if calls[0].Thread.External() != "slack:C0123:root" {
+			t.Fatalf("channel root thread = %+v", calls[0].Thread)
+		}
+		if calls[0].Labels["state"] != "completed" || calls[0].Before["state"] != "started" {
+			t.Fatalf("labels/before = %+v / %+v", calls[0].Labels, calls[0].Before)
 		}
 	})
 }

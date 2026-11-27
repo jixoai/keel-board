@@ -30,7 +30,7 @@ type Provider struct {
 	ReactFunc          func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, message, emoji string, added bool) error
 	PermalinkFunc      func(ctx context.Context, key boardsync.Key, event boardsync.Event) (string, error)
 	FetchRootFunc      func(ctx context.Context, key boardsync.Key, thread string) (*boardsync.RootDraft, error)
-	LabelsFunc         func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels map[string]string) error
+	LabelsFunc         func(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels, before map[string]string) error
 	LocateFunc         func(url string) (thread string, message string, ok bool)
 	URLFunc            func(thread, message string) (string, error)
 
@@ -101,6 +101,7 @@ type LabelsCall struct {
 	Key    boardsync.Key
 	Thread boardsync.ThreadRef
 	Labels map[string]string
+	Before map[string]string
 }
 
 // PermalinkCall records one permalink lookup.
@@ -213,12 +214,12 @@ func (p *Provider) React(ctx context.Context, key boardsync.Key, thread boardsyn
 }
 
 // Labels implements boardsync.Labeler.
-func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels map[string]string) error {
+func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels, before map[string]string) error {
 	p.mu.Lock()
-	p.labels = append(p.labels, LabelsCall{Key: key, Thread: thread, Labels: labels})
+	p.labels = append(p.labels, LabelsCall{Key: key, Thread: thread, Labels: labels, Before: before})
 	p.mu.Unlock()
 	if p.LabelsFunc != nil {
-		return p.LabelsFunc(ctx, key, thread, labels)
+		return p.LabelsFunc(ctx, key, thread, labels, before)
 	}
 	return nil
 }

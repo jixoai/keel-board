@@ -127,13 +127,13 @@ func TestRunnerOutboundDeliversOnceAndReceipts(t *testing.T) {
 }
 
 func TestRunnerLabelsChangeReachesLabeler(t *testing.T) {
-	var got map[string]string
+	var got, before map[string]string
 	entry, provider, host := testEntry(t, func(ctx context.Context, call *boardsync.Call) error {
 		_, err := call.Deliver(ctx, boardsync.DeliverOptions{})
 		return err
 	})
-	provider.LabelsFunc = func(_ context.Context, _ boardsync.Key, _ boardsync.ThreadRef, labels map[string]string) error {
-		got = labels
+	provider.LabelsFunc = func(_ context.Context, _ boardsync.Key, _ boardsync.ThreadRef, labels, old map[string]string) error {
+		got, before = labels, old
 		return nil
 	}
 	runner := boardsync.NewRunner(host)
@@ -144,19 +144,26 @@ func TestRunnerLabelsChangeReachesLabeler(t *testing.T) {
 	target := boardsync.ResolvedTarget{
 		Key: "slack", Platform: "slack", Channel: "C0123", Thread: "C0123:1727.9", Kind: boardsync.TargetThread,
 	}
-	if _, err := runner.Outbound(context.Background(), entry,
-		boardsync.BoardEvent{Type: boardsync.BoardLabelsChanged, Thread: 812},
-		message, &target, ""); err != nil {
+	renderer := func(in boardsync.RenderInput) (string, error) { return "rendered:" + in.Message.Text, nil }
+	event := boardsync.BoardEvent{
+		Type: boardsync.BoardLabelsChanged, Thread: 812,
+		Before: &boardsync.Message{Labels: map[string]string{"state": "started", "priority": "high"}},
+	}
+	if _, err := runner.OutboundWithOptions(context.Background(), entry, event,
+		message, &target, "", boardsync.OutboundOptions{Renderer: renderer}); err != nil {
 		t.Fatalf("Outbound: %v", err)
 	}
 	if got["state"] != "completed" || got["priority"] != "high" {
 		t.Fatalf("labels = %+v", got)
 	}
+	if before["state"] != "started" {
+		t.Fatalf("before = %+v", before)
+	}
 	if calls := provider.LabelsCalls(); len(calls) != 1 || calls[0].Thread.External() != "slack:C0123:1727.9" {
 		t.Fatalf("label calls = %+v", calls)
 	}
 	if len(provider.Edits()) != 0 {
-		t.Fatal("a labels-only change reached Editor instead of Labeler")
+		t.Fatal("a labels-only change reached Editor instead of Labeler, even with a renderer")
 	}
 }
 

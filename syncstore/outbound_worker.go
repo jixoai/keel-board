@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -242,8 +243,10 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 		}
 		copyID = found.ExternalMessage
 	case boardsync.BoardLabelsChanged:
-		// A label change edits a copy only when a renderer reads labels.
-		if w.renderer != nil {
+		// A renderer edits a copy's text; a Labeler needs the copy's external
+		// thread too, even for a channel root (the copy is the issue/thread).
+		_, isLabeler := entry.Provider.(boardsync.Labeler)
+		if w.renderer != nil || isLabeler {
 			found, err := w.copyForChange(ctx, job)
 			if errors.Is(err, errNoCopy) {
 				return nil, nil, true
@@ -252,6 +255,19 @@ func (w *OutboundWorker) deliver(ctx context.Context, job Delivery) (error, *Cop
 				return err, nil, false
 			}
 			copyID = found.ExternalMessage
+			if isLabeler {
+				target := found.Target
+				if found.ExternalThread != "" {
+					subthread := target.Subthread
+					target.Thread = found.ExternalThread
+					target.Kind = boardsync.TargetThread
+					if subthread != "" && !strings.HasPrefix(subthread, target.Thread+":c:") {
+						subthread = ""
+					}
+					target.Subthread = subthread
+				}
+				job.Target = target
+			}
 		}
 	}
 	opts := boardsync.OutboundOptions{

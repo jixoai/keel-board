@@ -407,8 +407,18 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 		External:     req.Message.From != "" && req.Message.From != "board",
 		BoardMessage: req.Message.ID,
 		BoardThread:  req.Message.Thread,
-		Labels:       req.Message.Labels,
 	}
+	switch req.Event.Type {
+	case BoardMessagePosted, BoardThreadSynced:
+		msg.Labels = req.Message.Labels
+	case BoardLabelsChanged:
+		msg.Labels = req.Message.Labels
+		if req.Event.Before != nil {
+			msg.LabelsBefore = req.Event.Before.Labels
+		}
+	}
+	// A text edit has no label delta: passing the full labels would rewrite
+	// unrelated state when only the body changed.
 	if req.Renderer != nil {
 		rendered, err := req.Renderer(RenderInput{
 			Message: req.Message,
@@ -477,14 +487,18 @@ func (o *outboundOps) Deliver(ctx context.Context, req DeliverRequest) (Receipt,
 		receipt = Receipt{Target: req.Target, Thread: targetRef(req.Target), Message: req.Copy}
 	case BoardLabelsChanged:
 		// A provider that mirrors labels (Linear's issue state/properties) is
-		// told even when no renderer would change the text. Others only edit a
-		// copy when a renderer reads labels.
-		if req.Renderer == nil {
-			if labeler, ok := o.provider.(Labeler); ok {
-				err = labeler.Labels(ctx, req.Key, targetRef(req.Target), req.Message.Labels)
-				receipt = Receipt{Target: req.Target, Thread: targetRef(req.Target), Message: req.Copy}
-				break
+		// told even when a renderer exists: rendering the board text must not
+		// overwrite the platform issue's description.
+		if labeler, ok := o.provider.(Labeler); ok {
+			var before map[string]string
+			if req.Event.Before != nil {
+				before = req.Event.Before.Labels
 			}
+			err = labeler.Labels(ctx, req.Key, targetRef(req.Target), req.Message.Labels, before)
+			receipt = Receipt{Target: req.Target, Thread: targetRef(req.Target), Message: req.Copy}
+			break
+		}
+		if req.Renderer == nil {
 			return Receipt{}, nil
 		}
 		editor, ok := o.provider.(Editor)

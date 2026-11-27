@@ -38,7 +38,9 @@ func (u issueUpdate) empty() bool {
 
 // Labels implements boardsync.Labeler: a labels.changed event updates the
 // issue's state, priority, project, tags, and assignee without editing text.
-func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels map[string]string) error {
+// Only values that changed from before are written; a nil before means the
+// whole map is the desired state.
+func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsync.ThreadRef, labels, before map[string]string) error {
 	if thread.Platform != "linear" {
 		return fmt.Errorf("%w: thread platform %q isn't linear", boardsync.ErrBadRequest, thread.Platform)
 	}
@@ -50,7 +52,15 @@ func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsy
 	if err != nil {
 		return err
 	}
-	update, err := p.resolveIssueUpdate(ctx, teamKey, labels)
+	currentStateID := ""
+	if stateMayChange(labels, before) {
+		issue, err := p.client.IssueByID(ctx, issueID)
+		if err != nil {
+			return err
+		}
+		currentStateID = issue.State.ID
+	}
+	update, err := p.resolveIssueUpdate(ctx, teamKey, labels, before, currentStateID)
 	if err != nil {
 		return err
 	}
@@ -61,71 +71,105 @@ func (p *Provider) Labels(ctx context.Context, key boardsync.Key, thread boardsy
 }
 
 // resolveIssueUpdate translates board labels into Linear property IDs. A nil
-// map leaves everything unchanged; a non-nil map is the complete state, so an
-// absent tag/assignee/project clears the Linear value.
-func (p *Provider) resolveIssueUpdate(ctx context.Context, teamKey string, labels map[string]string) (issueUpdate, error) {
+// map leaves everything unchanged. A nil before applies the complete map; a
+// non-nil before applies only changed keys, so a text edit or one property
+// change doesn't rewrite the rest.
+func (p *Provider) resolveIssueUpdate(ctx context.Context, teamKey string, labels, before map[string]string, currentStateID string) (issueUpdate, error) {
 	if labels == nil {
 		return issueUpdate{}, nil
 	}
+	applyAll := before == nil
 	var update issueUpdate
-	if value, ok := labels["state"]; ok {
-		if strings.TrimSpace(value) == "" {
-			return issueUpdate{}, fmt.Errorf("%w: empty linear state label", boardsync.ErrBadRequest)
-		}
-		stateID, err := p.client.WorkflowStateID(ctx, teamKey, value)
+	if (applyAll || labelsValueChanged(labels, before, "state")) && strings.TrimSpace(labels["state"]) != "" {
+		stateID, err := p.client.WorkflowStateID(ctx, teamKey, labels["state"], currentStateID)
 		if err != nil {
 			return issueUpdate{}, err
 		}
 		update.SetState, update.StateID = true, stateID
 	}
-	if value, ok := labels["priority"]; ok {
-		priority, err := parsePriority(value)
+	if applyAll || labelsValueChanged(labels, before, "priority") {
+		priority, err := parsePriority(labels["priority"])
 		if err != nil {
 			return issueUpdate{}, err
 		}
 		update.SetPriority, update.Priority = true, priority
 	}
-	update.SetProject = true
-	if value, ok := labels["project"]; ok && strings.TrimSpace(value) != "" {
-		projectID, err := p.client.ProjectIDByName(ctx, teamKey, value)
-		if err != nil {
-			return issueUpdate{}, err
-		}
-		update.ProjectID = &projectID
-	}
-	update.SetAssignee = true
-	handles := labelValues(labels, "assignee.")
-	sort.Strings(handles)
-	if len(handles) > 0 {
-		userID, err := p.client.UserIDByHandle(ctx, handles[0])
-		if err != nil {
-			return issueUpdate{}, err
-		}
-		update.AssigneeID = &userID
-	}
-	update.SetLabels = true
-	names := labelValues(labels, "tag.")
-	sort.Strings(names)
-	seen := make(map[string]bool, len(names))
-	var teamID string
-	for _, name := range names {
-		if teamID == "" {
-			var err error
-			teamID, err = p.client.TeamID(ctx, teamKey)
+	if applyAll || labelsValueChanged(labels, before, "project") {
+		update.SetProject = true
+		if value := strings.TrimSpace(labels["project"]); value != "" {
+			projectID, err := p.client.ProjectIDByName(ctx, teamKey, value)
 			if err != nil {
 				return issueUpdate{}, err
 			}
+			update.ProjectID = &projectID
 		}
-		labelID, err := p.client.EnsureIssueLabel(ctx, teamKey, teamID, name)
-		if err != nil {
-			return issueUpdate{}, err
+	}
+	if applyAll || labelsPrefixChanged(labels, before, "assignee.") {
+		update.SetAssignee = true
+		handles := labelValues(labels, "assignee.")
+		sort.Strings(handles)
+		if len(handles) > 0 {
+			userID, err := p.client.UserIDByHandle(ctx, handles[0])
+			if err != nil {
+				return issueUpdate{}, err
+			}
+			update.AssigneeID = &userID
 		}
-		if !seen[labelID] {
-			seen[labelID] = true
-			update.LabelIDs = append(update.LabelIDs, labelID)
+	}
+	if applyAll || labelsPrefixChanged(labels, before, "tag.") {
+		update.SetLabels = true
+		names := labelValues(labels, "tag.")
+		sort.Strings(names)
+		seen := make(map[string]bool, len(names))
+		var teamID string
+		for _, name := range names {
+			if teamID == "" {
+				var err error
+				teamID, err = p.client.TeamID(ctx, teamKey)
+				if err != nil {
+					return issueUpdate{}, err
+				}
+			}
+			labelID, err := p.client.EnsureIssueLabel(ctx, teamKey, teamID, name)
+			if err != nil {
+				return issueUpdate{}, err
+			}
+			if !seen[labelID] {
+				seen[labelID] = true
+				update.LabelIDs = append(update.LabelIDs, labelID)
+			}
 		}
 	}
 	return update, nil
+}
+
+func stateMayChange(labels, before map[string]string) bool {
+	return before == nil || labelsValueChanged(labels, before, "state")
+}
+
+func labelsValueChanged(labels, before map[string]string, key string) bool {
+	value, ok := labels[key]
+	old, had := before[key]
+	return ok != had || value != old
+}
+
+func labelsPrefixChanged(labels, before map[string]string, prefix string) bool {
+	beforeValues := make(map[string]string)
+	for key, value := range before {
+		if strings.HasPrefix(key, prefix) {
+			beforeValues[key] = value
+		}
+	}
+	for key, value := range labels {
+		if !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if old, ok := beforeValues[key]; !ok || old != value {
+			return true
+		}
+		delete(beforeValues, key)
+	}
+	return len(beforeValues) > 0
 }
 
 func labelValues(labels map[string]string, prefix string) []string {
@@ -161,8 +205,11 @@ const workflowStatesQuery = `query WorkflowStates($team: String!) {
   }
 }`
 
-// WorkflowStateID resolves a state type or name to its UUID in a team.
-func (c *Client) WorkflowStateID(ctx context.Context, teamKey, value string) (string, error) {
+// WorkflowStateID resolves a state type or name to its UUID in a team. When a
+// type matches several states, the issue's current state is kept if it has
+// that type; otherwise the type is ambiguous and refused rather than moving
+// the issue to whichever state Linear returned first.
+func (c *Client) WorkflowStateID(ctx context.Context, teamKey, value, currentID string) (string, error) {
 	var out struct {
 		WorkflowStates struct {
 			Nodes []workflowState `json:"nodes"`
@@ -173,12 +220,29 @@ func (c *Client) WorkflowStateID(ctx context.Context, teamKey, value string) (st
 	}
 	wanted := strings.ToLower(strings.TrimSpace(value))
 	for _, state := range out.WorkflowStates.Nodes {
-		if strings.EqualFold(state.ID, value) ||
-			strings.EqualFold(state.Type, wanted) || strings.EqualFold(state.Name, wanted) {
+		if strings.EqualFold(state.ID, value) || strings.EqualFold(state.Name, wanted) {
 			return state.ID, nil
 		}
 	}
-	return "", fmt.Errorf("%w: linear team %s has no state %q", boardsync.ErrBadRequest, teamKey, value)
+	var matches []workflowState
+	for _, state := range out.WorkflowStates.Nodes {
+		if strings.EqualFold(state.Type, wanted) {
+			matches = append(matches, state)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("%w: linear team %s has no state %q", boardsync.ErrBadRequest, teamKey, value)
+	case 1:
+		return matches[0].ID, nil
+	default:
+		for _, state := range matches {
+			if currentID != "" && strings.EqualFold(state.ID, currentID) {
+				return state.ID, nil
+			}
+		}
+		return "", fmt.Errorf("%w: linear state type %q is ambiguous in team %s", boardsync.ErrBadRequest, value, teamKey)
+	}
 }
 
 const projectByNameQuery = `query ProjectByName($name: String!, $team: String!) {
@@ -358,7 +422,8 @@ func (c *Client) UpdateIssue(ctx context.Context, id string, update issueUpdate)
 		return nil
 	}
 	input := newGraphqlInput(map[string]any{"id": id})
-	input.add("id", "String!", id)
+	// $id is the mutation argument, not an IssueUpdateInput field.
+	input.defs = append(input.defs, "$id: String!")
 	input.addIssueProperties(update)
 	query := fmt.Sprintf("mutation IssueUpdate(%s) { issueUpdate(id: $id, input: { %s }) { success } }",
 		strings.Join(input.defs, ", "), strings.Join(input.fields, ", "))

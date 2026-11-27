@@ -65,7 +65,7 @@ func (p *Provider) normalizeIssue(key boardsync.Key, delivery string, body []byt
 	// The app's own events never open a second root: the board already
 	// recorded the issue it created. They still carry the issue's properties,
 	// so an existing thread's labels stay current.
-	own := p.isOwnActor(wh.Actor)
+	own := p.isOwnActor(wh.Actor) || p.isOwnUser(item.Creator)
 	switch wh.Action {
 	case "create":
 		lifecycle.Type = "issue.created"
@@ -99,6 +99,12 @@ func (p *Provider) normalizeComment(ctx context.Context, key boardsync.Key, deli
 	}
 	if item.ID == "" {
 		return nil, fmt.Errorf("%w: linear comment has no ID", boardsync.ErrBadRequest)
+	}
+	// Linear comments can hang off a project, initiative, document, or post;
+	// only issue comments are a board thread. Ignore the rest rather than
+	// answering 400 and making Linear retry forever.
+	if item.IssueID == "" && issueIDOf(item.Issue) == "" {
+		return nil, nil
 	}
 	// Linear's real Comment webhook carries issueId and userId, not a full
 	// issue or user object. Identity is available before any lookup, so the
@@ -217,6 +223,11 @@ func issueIDOf(issue *issueData) string {
 }
 
 func (p *Provider) commentAuthor(item *commentData, a *actor) boardsync.Author {
+	if a != nil && a.ID != "" {
+		if author := actorAuthor(a); author.ID != "" {
+			return author
+		}
+	}
 	if item.User != nil {
 		if author := authorOf(item.User); author.ID != "" {
 			return author
@@ -227,7 +238,7 @@ func (p *Provider) commentAuthor(item *commentData, a *actor) boardsync.Author {
 			ID: "linear:user:" + item.UserID, Handle: item.UserID, Name: item.UserID,
 		}
 	}
-	return actorAuthor(a)
+	return boardsync.Author{}
 }
 
 func (p *Provider) isOwnActor(a *actor) bool {

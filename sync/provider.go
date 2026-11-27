@@ -98,10 +98,10 @@ type RootFetcher interface {
 }
 
 // Labeler applies a message's labels to a delivered copy without editing its
-// text. A labels.changed event reaches a Labeler even when no renderer would
-// change the text (a Linear issue's state and properties).
+// text. A labels.changed event reaches a Labeler even when a renderer exists:
+// the renderer's text must not overwrite a platform issue's own description.
 type Labeler interface {
-	Labels(ctx context.Context, key Key, thread ThreadRef, labels map[string]string) error
+	Labels(ctx context.Context, key Key, thread ThreadRef, labels, before map[string]string) error
 }
 
 // Linker maps between a platform's URLs and its own thread and message IDs.

@@ -31,6 +31,7 @@ type fakeLinear struct {
 	status       int
 	gqlErrors    []any
 	projectTeams []string
+	states       []any
 
 	calls     []string
 	variables []map[string]any
@@ -38,7 +39,10 @@ type fakeLinear struct {
 
 func newFakeLinear(t *testing.T) (*fakeLinear, *httptest.Server) {
 	t.Helper()
-	fake := &fakeLinear{t: t, projectTeams: []string{"ENG"}}
+	fake := &fakeLinear{t: t, projectTeams: []string{"ENG"}, states: []any{
+		map[string]any{"id": "state-started", "name": "In Progress", "type": "started"},
+		map[string]any{"id": "state-completed", "name": "Done", "type": "completed"},
+	}}
 	return fake, httptest.NewServer(http.HandlerFunc(fake.serve))
 }
 
@@ -114,10 +118,10 @@ func (f *fakeLinear) answer(query string, variables map[string]any) any {
 	case strings.Contains(query, "query IssueByID"):
 		return map[string]any{"issue": f.issue(false)}
 	case strings.Contains(query, "query WorkflowStates"):
-		return map[string]any{"workflowStates": map[string]any{"nodes": []any{
-			map[string]any{"id": "state-started", "name": "In Progress", "type": "started"},
-			map[string]any{"id": "state-completed", "name": "Done", "type": "completed"},
-		}}}
+		f.mu.Lock()
+		states := append([]any(nil), f.states...)
+		f.mu.Unlock()
+		return map[string]any{"workflowStates": map[string]any{"nodes": states}}
 	case strings.Contains(query, "query ProjectByName"):
 		if variables["name"] != "Checkout" || variables["team"] != "ENG" {
 			f.t.Errorf("project query variables = %+v", variables)
@@ -191,7 +195,7 @@ func (f *fakeLinear) issue(withComments bool) map[string]any {
 		"description": "Retries checkout when the provider times out.",
 		"url":         testIssueURL, "createdAt": "2026-01-02T03:04:05Z",
 		"team":     map[string]any{"id": testTeamID, "key": "ENG", "name": "Engineering"},
-		"state":    map[string]any{"id": "state-2", "name": "In Progress", "type": "started"},
+		"state":    map[string]any{"id": "state-started", "name": "In Progress", "type": "started"},
 		"priority": 2, "priorityLabel": "High",
 		"project":  map[string]any{"id": testProjectID, "name": "Checkout", "url": "https://linear.app/acme/project/checkout"},
 		"labels":   map[string]any{"nodes": []any{map[string]any{"id": "label-1", "name": "Bug"}}},
@@ -231,6 +235,12 @@ func (f *fakeLinear) setProjectTeams(keys []string) {
 	f.projectTeams = keys
 }
 
+func (f *fakeLinear) setStates(states []any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states = states
+}
+
 func (f *fakeLinear) callsContaining(fragment string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -252,6 +262,17 @@ func (f *fakeLinear) lastVariables(fragment string) map[string]any {
 		}
 	}
 	return nil
+}
+
+func (f *fakeLinear) lastQuery(fragment string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.calls) - 1; i >= 0; i-- {
+		if strings.Contains(f.calls[i], fragment) {
+			return f.calls[i]
+		}
+	}
+	return ""
 }
 
 func newFakeProvider(t *testing.T, fake *fakeLinear, server *httptest.Server) *linear.Provider {

@@ -410,7 +410,7 @@ func TestCommentCreated(t *testing.T) {
 	if event.Subthread != "ENG:"+testIssueID+":c:comment-1" {
 		t.Fatalf("subthread = %s", event.Subthread)
 	}
-	if event.Author.ID != "linear:user:user-2" || event.Author.Handle != "user-2" {
+	if event.Author.ID != "linear:user:user-2" || event.Author.Handle != "julian" {
 		t.Fatalf("author = %+v", event.Author)
 	}
 	if event.Text != "I reproduced this on staging." {

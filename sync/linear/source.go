@@ -246,8 +246,8 @@ func (p *Provider) Permalink(ctx context.Context, key boardsync.Key, event board
 	if err != nil {
 		return "", err
 	}
-	if issueTeam := p.issueTeam(&issue); issueTeam != "" && issueTeam != teamKey {
-		return "", fmt.Errorf("%w: linear issue %s is in %s, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
+	if issueTeam := p.issueTeam(&issue); issueTeam == "" || issueTeam != teamKey {
+		return "", fmt.Errorf("%w: linear issue %s is in %q, not %s", boardsync.ErrNotFound, issueID, issueTeam, teamKey)
 	}
 	if issue.URL == "" {
 		return "", fmt.Errorf("%w: linear issue %s has no link", boardsync.ErrNotFound, issueID)
