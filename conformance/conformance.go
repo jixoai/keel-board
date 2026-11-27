@@ -61,6 +61,7 @@ func Run(t *testing.T, opts Options) {
 	if strings.TrimSpace(opts.Name) == "" {
 		opts.Name = "store"
 	}
+	t.Run(opts.Name+"/store_handles_share_the_log", func(t *testing.T) { testStoreHandlesShareTheLog(t, opts) })
 	t.Run(opts.Name+"/append_load_history", func(t *testing.T) { testAppendLoadHistory(t, opts) })
 	t.Run(opts.Name+"/conditional_append", func(t *testing.T) { testConditionalAppend(t, opts) })
 	t.Run(opts.Name+"/idempotency", func(t *testing.T) { testIdempotency(t, opts) })
@@ -111,6 +112,62 @@ func HeaderTenant(header string) server.TenantFunc {
 			return "", protocol.Invalid("the request names no board")
 		}
 		return tenant, nil
+	}
+}
+
+// recordingAuthorizer remembers what the server told it, proving the
+// authorizer seam receives the resolved tenant and actor.
+type recordingAuthorizer struct {
+	mu    sync.Mutex
+	calls []authCall
+}
+
+type authCall struct {
+	tenant     string
+	actor      protocol.ActorID
+	channel    string
+	permission protocol.Permission
+}
+
+// Authorize implements server.Authorizer.
+func (r *recordingAuthorizer) Authorize(_ context.Context, tenant string, actor protocol.Actor, channel string, permission protocol.Permission) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, authCall{tenant: tenant, actor: actor.ID, channel: channel, permission: permission})
+	return nil
+}
+
+// saw reports whether one call matched every dimension.
+func (r *recordingAuthorizer) saw(tenant string, actor protocol.ActorID, channel string, permission protocol.Permission) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, call := range r.calls {
+		if call.tenant == tenant && call.actor == actor && call.channel == channel && call.permission == permission {
+			return true
+		}
+	}
+	return false
+}
+
+// testStoreHandlesShareTheLog locks the Options.Store contract: two handles
+// from one factory call must see one durable log, as two processes would.
+func testStoreHandlesShareTheLog(t *testing.T, opts Options) {
+	t.Helper()
+	first, second := opts.Store(t), opts.Store(t)
+	tenant := tenantName(t)
+	appendOne(t, first, tenant, 0, 1)
+	records, err := second.Load(t.Context(), tenant)
+	if err != nil {
+		t.Fatalf("second handle's load: %v", err)
+	}
+	if len(records) != 1 || records[0].Seq != 1 {
+		t.Fatalf("the second handle doesn't see the first's log: %+v", records)
+	}
+	if head, ok := second.(store.HeadStore); ok {
+		got, err := head.Head(t.Context(), tenant)
+		if err != nil || got != 1 {
+			t.Fatalf("the second handle's head = %d, %v", got, err)
+		}
 	}
 }
 
@@ -368,6 +425,16 @@ func testIdempotentPost(t *testing.T, opts Options) {
 		t.Fatalf("expected duplicate_id, got %s", code)
 	}
 
+	// The key is per actor: another actor's same key is another write.
+	status, data = h.request(http.MethodPost, "/messages", map[string]any{"channel": "work", "text": "once"}, "local:user:bob", headers)
+	if status != http.StatusCreated {
+		t.Fatalf("same key, another actor: %d %s", status, data)
+	}
+	bob := decode[postBody](t, data).Message
+	if bob.ID == first.ID {
+		t.Fatalf("another actor replayed %s's write", first.ID)
+	}
+
 	events, err := opts.Store(t).Load(t.Context(), tenant)
 	if err != nil {
 		t.Fatalf("load: %v", err)
@@ -378,8 +445,8 @@ func testIdempotentPost(t *testing.T, opts Options) {
 			posted++
 		}
 	}
-	if posted != 1 {
-		t.Fatalf("a retry appended again: %d message.posted events", posted)
+	if posted != 2 {
+		t.Fatalf("expected two posts (one retry was answered, one actor was distinct), got %d", posted)
 	}
 }
 
@@ -649,6 +716,20 @@ func testSeams(t *testing.T, opts Options) {
 	status, _ = names.request(http.MethodGet, "/messages?channel=work", nil, actor, map[string]string{"X-Conformance-Tenant": tenant})
 	if status != http.StatusOK {
 		t.Fatalf("named tenant: %d", status)
+	}
+
+	// The authorizer receives the server-resolved tenant and actor, not an
+	// empty placeholder or another request's caller.
+	recorder := &recordingAuthorizer{}
+	recorded := newHarnessAt(t, open.board)
+	recorded.tenant = tenant
+	recorded.serve(t, server.Options{Authorize: recorder})
+	status, data = recorded.request(http.MethodPost, "/messages", map[string]any{"channel": "work", "text": "seen"}, actor, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("recorded post: %d %s", status, data)
+	}
+	if !recorder.saw(tenant, protocol.ActorID(actor), "work", protocol.PermissionPost) {
+		t.Fatalf("the authorizer didn't receive tenant=%q actor=%q post work: %+v", tenant, actor, recorder.calls)
 	}
 }
 
