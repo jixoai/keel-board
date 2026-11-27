@@ -50,6 +50,10 @@ type SyncOptions struct {
 	MaxFiles, MaxLinks int
 	// MaxWebhookBody caps a platform webhook body. Zero means 1 MiB.
 	MaxWebhookBody int64
+	// BridgeSecret resolves the HMAC v1 secret for one Chat SDK bridge entry.
+	// Nil disables the bridge event route (it answers 503); an entry without a
+	// secret must never accept signed events.
+	BridgeSecret func(tenant string, key boardsync.Key) (boardsync.Secret, bool)
 	// Logger receives sync failures. Zero uses the server's logger.
 	Logger *slog.Logger
 }
@@ -63,6 +67,8 @@ type syncService struct {
 	host          *SyncHost
 	runner        *boardsync.Runner
 	webhook       *syncstore.WebhookHandler
+	tenant        syncstore.TenantFunc
+	bridgeSecret  func(tenant string, key boardsync.Key) (boardsync.Secret, bool)
 	startChannels map[SyncKey][]string
 	owned         []SyncKey
 	logger        *slog.Logger
@@ -116,6 +122,7 @@ func newSyncService(board *log.Board, opts SyncOptions) (*syncService, error) {
 	return &syncService{
 		board: board, store: opts.Store, registry: opts.Registry,
 		host: host, runner: boardsync.NewRunner(host), webhook: handler,
+		tenant: opts.Tenant, bridgeSecret: opts.BridgeSecret,
 		startChannels: opts.StartChannels, owned: append([]SyncKey(nil), opts.Owned...),
 		logger: opts.Logger,
 	}, nil

@@ -164,24 +164,45 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 	if len(intake.Records) == 0 {
 		return response, nil
 	}
-	kept := make([]Record, 0, len(intake.Records))
+	if _, err := r.StoreRecords(ctx, tenant, key, intake.Records, gate, inbox); err != nil {
+		return WebhookResponse{Status: StatusCode(err)}, err
+	}
+	return response, nil
+}
+
+// StoreRecords validates normalized records, drops the connection's own
+// authors, applies the entry's routes (or the gate's), and pushes the rest to
+// inbox. It is the shared tail of a platform webhook and a bridge event push:
+// both have already authenticated and normalized, and both keep
+// store-before-ack. It returns how many records the inbox accepted; a dedupe
+// already present is not counted.
+func (r *Registry) StoreRecords(ctx context.Context, tenant string, key Key, records []Record, gate Gate, inbox Inbox) (int, error) {
+	entry, ok := r.Get(tenant, key)
+	if !ok {
+		return 0, fmt.Errorf("%w: no sync entry named %q for tenant %q", ErrNotFound, key, tenant)
+	}
+	if len(records) == 0 {
+		return 0, nil
+	}
+	kept := make([]Record, 0, len(records))
 	self, _ := entry.Provider.(SelfIdentifier)
-	for _, record := range intake.Records {
+	for _, record := range records {
 		if err := record.Validate(); err != nil {
-			return WebhookResponse{Status: StatusCode(err)}, err
+			return 0, err
 		}
 		if self != nil && record.Event.Author.ID != "" && containsID(self.SelfIDs(), record.Event.Author.ID) {
 			// The connection's own post: never import it back.
 			continue
 		}
 		mapped := false
+		var err error
 		if entry.Routes != nil {
 			mapped, err = entry.Routes(ctx, record.Event.Channel)
 		} else if gate != nil {
 			mapped, err = gate.Routes(ctx, tenant, key, record.Event.Channel)
 		}
 		if err != nil {
-			return WebhookResponse{Status: 500}, err
+			return 0, err
 		}
 		if !mapped {
 			if gate == nil {
@@ -189,7 +210,7 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 			}
 			synced, gateErr := gate.ThreadSynced(ctx, tenant, key, record.Event.ThreadRef().External())
 			if gateErr != nil {
-				return WebhookResponse{Status: 500}, gateErr
+				return 0, gateErr
 			}
 			if !synced {
 				continue
@@ -198,15 +219,17 @@ func (r *Registry) HandleWebhook(ctx context.Context, tenant string, key Key, re
 		kept = append(kept, record)
 	}
 	if len(kept) == 0 {
-		return response, nil
+		return 0, nil
 	}
-	if inbox != nil {
-		if _, err := inbox.Push(ctx, key, kept); err != nil {
-			// Storing failed, so the platform must send the event again.
-			return WebhookResponse{Status: 500}, err
-		}
+	if inbox == nil {
+		return len(kept), nil
 	}
-	return response, nil
+	pushed, err := inbox.Push(ctx, key, kept)
+	if err != nil {
+		// Storing failed, so the platform must send the event again.
+		return 0, err
+	}
+	return pushed, nil
 }
 
 // containsID reports whether ids names want.

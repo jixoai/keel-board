@@ -159,6 +159,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+base+"/events", s.handleEvents)
 	if s.sync != nil {
 		s.mux.Handle("POST /webhooks/{key}", s.sync.webhook)
+		s.mux.HandleFunc("POST "+base+"/sync/bridge/{key}/events", s.sync.bridgeEvents)
 		s.mux.HandleFunc("GET "+base+"/sync/entries", s.handleSyncEntries)
 		s.mux.HandleFunc("GET "+base+"/sync/status", s.handleSyncStatus)
 		s.mux.HandleFunc("GET "+base+"/sync/inbox", s.handleSyncInbox)
