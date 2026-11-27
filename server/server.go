@@ -302,8 +302,14 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 		return
 	}
 	if errors.Is(err, log.ErrLogInconsistent) || errors.Is(err, log.ErrProjectionAhead) {
+		s.logger.Error("the board's log and its projection disagree",
+			"method", r.Method, "path", r.URL.Path, "error", err)
 		writeError(w, protocol.NewError(protocol.CodeUnavailable,
 			"the board's log and its projection disagree: rebuild the projection or restore the log before writing"))
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeError(w, protocol.NewError(protocol.CodeUnavailable, "the board operation timed out"))
 		return
 	}
 	if errors.Is(err, log.ErrHeadMoved) {
