@@ -71,6 +71,8 @@ Usage:
               [--sync-tenant <tenant>] [--sync-dsn <dsn>] [--sync-schema <schema>]
               [--sync-key key=platform] [--sync-mirror key=platformChannel:boardChannel]
               [--sync-start key=platformChannel]
+              [--automation-tenant <tenant>] [--automation-dsn <dsn>] [--automation-schema <schema>]
+              [--automation-poll 1s] [--automation-lease 5m]
   board rebuild --dsn postgres://... [--tenant <tenant>]...
   board version
 
@@ -81,6 +83,11 @@ event.
 
 With --blobs, attachment bytes and their records live under that directory;
 without it they live in memory and are gone when the process ends.
+
+Watchers and schedules are always served. Their state uses --automation-dsn,
+else KEEL_AUTOMATION_DSN, else --dsn, else memory (development only). The
+built-in post action writes a fixed message as the watcher's bot; other actions
+are registered by an embedding deployment, never fetched from a URL.
 
 Sync is disabled unless at least one --sync-key is given. Each key's
 credentials come from KEEL_SYNC_<KEY>_* environment variables (SIGNING_SECRET or
@@ -124,10 +131,17 @@ func devHandler(logger *slog.Logger, board *log.Board, blobs blob.Store) http.Ha
 	return devServer(logger, board, blobs, nil)
 }
 
-// devServer is devHandler with an explicit sync surface; serve uses it when
-// sync connections are configured.
+// devServer is devHandler with explicit sync and automation surfaces; serve
+// uses it.
 func devServer(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOptions *server.SyncOptions) *server.Server {
-	return server.New(server.Options{Board: board, Logger: logger, Blobs: blobs, Sync: syncOptions})
+	return devServerWithAutomation(logger, board, blobs, syncOptions, nil)
+}
+
+func devServerWithAutomation(logger *slog.Logger, board *log.Board, blobs blob.Store, syncOptions *server.SyncOptions, automationOptions *server.AutomationOptions) *server.Server {
+	return server.New(server.Options{
+		Board: board, Logger: logger, Blobs: blobs,
+		Sync: syncOptions, Automation: automationOptions,
+	})
 }
 
 // serve runs the HTTP server until it's interrupted.
@@ -139,6 +153,7 @@ func serve(args []string) error {
 	blobsDir := flags.String("blobs", "", "directory for attachment files (default: memory)")
 	verbose := flags.Bool("verbose", false, "log every request")
 	syncCfg := registerSyncFlags(flags)
+	automationCfg := registerAutomationFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -189,13 +204,27 @@ func serve(args []string) error {
 			Logger: logger,
 		}
 	}
-	api := devServer(logger, board, blobs, syncOptions)
+	automationRuntime, err := buildAutomation(ctx, automationCfg, *dsn)
+	if err != nil {
+		if syncRuntime != nil {
+			syncRuntime.closeStore()
+		}
+		return err
+	}
+	api := devServerWithAutomation(logger, board, blobs, syncOptions, automationRuntime.options(logger))
 	handler := http.Handler(api)
 	stopSync, err := startSyncWorkers(ctx, logger, syncRuntime, api)
 	if err != nil {
+		automationRuntime.closeStore()
 		return err
 	}
 	defer stopSync()
+	stopAutomation, err := startAutomationWorkers(ctx, logger, automationRuntime, board, server.AllowAll{})
+	if err != nil {
+		stopSync()
+		return err
+	}
+	defer stopAutomation()
 
 	if *verbose {
 		handler = requestLogger(logger, handler)
