@@ -95,7 +95,10 @@ func (s *syncService) bridgeEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nonce := request.Header.Get(chatsdk.HeaderNonce)
-	claimed, err := s.store.ClaimNonce(r.Context(), tenant, key, nonce, chatsdk.DefaultWindow)
+	// The timestamp window is symmetric: a request may be up to five minutes
+	// ahead. Keep the nonce for two windows so a future-stamped request can't
+	// outlive its nonce while its timestamp is still accepted.
+	claimed, err := s.store.ClaimNonce(r.Context(), tenant, key, nonce, 2*chatsdk.DefaultWindow)
 	if err != nil {
 		s.logger.Error("sync bridge nonce claim failed", "tenant", tenant, "key", key, "error", syncstore.ErrorCode(err))
 		writeBridgeStatus(w, http.StatusInternalServerError)
