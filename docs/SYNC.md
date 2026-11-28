@@ -637,9 +637,10 @@ Routes:
 | Route | Purpose |
 | --- | --- |
 | `POST /webhooks/{key}` | `syncstore.WebhookHandler`: tenant, entry, gate, store-before-ack |
-| `GET /v1/board/sync/entries` | connections, enabled/owned, no secrets |
-| `GET /v1/board/sync/entries/{key}/status` | one connection's status: enabled/owned, its own inbox and outbox depth, and bounded (100) `failures`/`deadInbox` counts |
-| `GET /v1/board/sync/status` | per-key inbox depth and the tenant's outbox depth |
+| `GET /v1/board/sync/entries` | connections plus their read-only health: inbox/outbox depth, external targets, lag and 24h failures |
+| `GET /v1/board/sync/entries/{key}/status` | one connection's status: enabled/owned, its own inbox and outbox depth, targets, lag, `failures24h`, and bounded (100) `failures`/`deadInbox` counts |
+| `GET /v1/board/sync/entries/{key}/targets` | one connection's external targets, enumerated by key, with board root, pending/leased/dead, attempts, stable error code and undelivered |
+| `GET /v1/board/sync/status` | the same per-key health plus the tenant's outbox depth and aggregate lag/24h failures |
 | `GET /v1/board/sync/inbox?key=` | dead-lettered inbound events (IDs, thread, attempts) |
 | `GET /v1/board/sync/outbox/failures?key=` | dead deliveries (message, target, attempts, error class) |
 | `POST /v1/board/sync/inbox/{id}/retry?key=` | retry a dead inbound event |
@@ -660,6 +661,15 @@ key is 404 whether or not it is well formed; a disabled entry answers 409
 `sync_disabled` (its status stays readable). A page the provider had to trim
 locally may answer `more=true` with an empty `next`: that means "more exists,
 rerun with a larger limit", not "this was the end".
+
+Health fields are measured, never synthesized. `lag.inbox`/`lag.outbox` are
+`null` when that queue has no pending or leased row; `oldestAt` and
+`ageSeconds` describe the oldest outstanding row otherwise. `failures24h`
+counts dead outbound deliveries that entered the dead state in the last 24
+hours and were not cleared by a later success. `targets[]` lists the
+connection's external targets with their board root and outbound queue;
+`lastError` is the store's stable error code, never a platform response body.
+`GET /v1/board/sync/threads?thread=` remains the by-board-thread enumeration.
 
 The subscription follows each owned key's durable `board-events` cursor,
 delivers only `message.posted/edited/deleted`, `reaction.added/removed`, and

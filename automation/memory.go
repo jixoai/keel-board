@@ -525,6 +525,34 @@ func (m *Memory) DeliveryDepth(_ context.Context, tenant, watcherID string) (Dep
 	return depth, nil
 }
 
+// WatcherStats implements StatsReader.
+func (m *Memory) WatcherStats(_ context.Context, tenant, watcherID string) (WatcherStats, error) {
+	if err := expectTenant(tenant); err != nil {
+		return WatcherStats{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var stats WatcherStats
+	var lastErrorAt time.Time
+	data := m.tenants[tenant]
+	if data == nil {
+		return stats, nil
+	}
+	for _, row := range data.deliveries[watcherID] {
+		if row.State == StateDead {
+			stats.Dead++
+		}
+		if row.UpdatedAt.After(stats.LastDeliveryAt) {
+			stats.LastDeliveryAt = row.UpdatedAt
+		}
+		if row.LastError != "" && row.UpdatedAt.After(lastErrorAt) {
+			stats.LastError = row.LastError
+			lastErrorAt = row.UpdatedAt
+		}
+	}
+	return stats, nil
+}
+
 // CreateSchedule implements Store.
 func (m *Memory) CreateSchedule(_ context.Context, schedule Schedule) (Schedule, error) {
 	if schedule.ID == "" {

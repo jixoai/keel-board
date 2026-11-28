@@ -256,6 +256,52 @@ type KeyOutboxDepth interface {
 	OutboxDepthByKey(ctx context.Context, tenant string) (map[boardsync.Key]OutboxDepth, error)
 }
 
+// Target health states. A target with any dead row is failed; a target with a
+// pending or leased row is pending; otherwise its mapping is synced.
+const (
+	TargetStatusSynced  = "synced"
+	TargetStatusPending = "pending"
+	TargetStatusFailed  = "failed"
+)
+
+// TargetHealth is one external target's read-only health: the board thread it
+// mirrors, its outbound queue, and the last stable error code. It carries no
+// message text and no platform response body.
+type TargetHealth struct {
+	Target         string               `json:"target"`
+	BoardThread    uint64               `json:"boardThread"`
+	Key            boardsync.Key        `json:"key"`
+	Platform       boardsync.Platform   `json:"platform"`
+	Channel        string               `json:"channel"`
+	Thread         string               `json:"thread,omitempty"`
+	Subthread      string               `json:"subthread,omitempty"`
+	Kind           boardsync.TargetKind `json:"kind"`
+	Status         string               `json:"status"`
+	Pending        int                  `json:"pending"`
+	Leased         int                  `json:"leased"`
+	Dead           int                  `json:"dead"`
+	Attempts       int                  `json:"attempts"`
+	LastError      string               `json:"lastError,omitempty"`
+	Undelivered    int                  `json:"undelivered"`
+	LastDeliveryAt time.Time            `json:"lastDeliveryAt,omitempty"`
+}
+
+// QueueLag is one queue's oldest outstanding row. Outstanding counts pending
+// and leased rows: both still need work. A zero OldestAt means the queue has
+// no outstanding row, which the status DTO reports as null rather than 0.
+type QueueLag struct {
+	Outstanding int       `json:"outstanding"`
+	OldestAt    time.Time `json:"oldestAt,omitempty"`
+}
+
+// Lag is a connection's inbound and outbound backlog. A nil member means the
+// queue has no outstanding row, never that the measurement failed: a failed
+// measurement is an error from the store.
+type Lag struct {
+	Inbox  *QueueLag `json:"inbox"`
+	Outbox *QueueLag `json:"outbox"`
+}
+
 // Store is the durable sync state. Memory and PostgreSQL implement it with
 // the same semantics; a caller may run either behind the workers and handler.
 //
@@ -283,6 +329,15 @@ type Store interface {
 	DeadInbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]boardsync.InboxItem, error)
 	RetryInbox(ctx context.Context, tenant string, key boardsync.Key, id string) error
 	InboxDepth(ctx context.Context, tenant string, key boardsync.Key) (InboxDepth, error)
+	// Targets lists one connection's external targets and their outbound
+	// health, oldest mapping first. limit <= 0 means the default bound.
+	Targets(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]TargetHealth, error)
+	// OldestPending reports the oldest outstanding (pending or leased) row in
+	// each queue. A nil member means that queue is empty.
+	OldestPending(ctx context.Context, tenant string, key boardsync.Key) (Lag, error)
+	// Failures24h counts dead outbound deliveries that entered the dead state
+	// at or after since and are not cleared by a later success.
+	Failures24h(ctx context.Context, tenant string, key boardsync.Key, since time.Time) (int, error)
 
 	// Outbound. EnqueueOutbox turns one board fact and its targets into one
 	// deterministic job per target. LeaseOutbox returns at most one due job per

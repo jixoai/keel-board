@@ -938,6 +938,166 @@ func (m *Memory) TargetFailures(_ context.Context, tenant string, key boardsync.
 	return out, nil
 }
 
+// Targets implements Store.
+func (m *Memory) Targets(_ context.Context, tenant string, key boardsync.Key, limit int) ([]TargetHealth, error) {
+	if err := validTenant(tenant); err != nil {
+		return nil, err
+	}
+	if err := expectKey(key); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data := m.tenantLocked(tenant)
+	threads := make([]Thread, 0)
+	for _, thread := range data.threads {
+		if thread.Key == key {
+			threads = append(threads, thread)
+		}
+	}
+	sort.Slice(threads, func(i, j int) bool { return threads[i].ID < threads[j].ID })
+	if len(threads) > limit {
+		threads = threads[:limit]
+	}
+	out := make([]TargetHealth, 0, len(threads))
+	for _, thread := range threads {
+		target := boardsync.ResolvedTarget{
+			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
+			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
+		}
+		health := TargetHealth{
+			Target: target.External(), BoardThread: thread.BoardThread,
+			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
+			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
+		}
+		targetKey := targetKeyOf(target)
+		var lastErrorSeq uint64
+		for _, row := range data.outbox {
+			if row.delivery.Key != key || row.targetKey != targetKey ||
+				row.delivery.Event.Thread != thread.BoardThread {
+				continue
+			}
+			switch row.state {
+			case StatePending:
+				health.Pending++
+			case StateLeased:
+				health.Leased++
+			case StateDead:
+				if row.clearedAt.IsZero() {
+					health.Dead++
+				}
+			}
+			if row.delivery.Attempts > health.Attempts {
+				health.Attempts = row.delivery.Attempts
+			}
+			if row.lastError != "" && (row.state != StateDead || row.clearedAt.IsZero()) && row.seq >= lastErrorSeq {
+				health.LastError = row.lastError
+				lastErrorSeq = row.seq
+			}
+			at := row.createdAt
+			if !row.completedAt.IsZero() {
+				at = row.completedAt
+			}
+			if at.After(health.LastDeliveryAt) {
+				health.LastDeliveryAt = at
+			}
+		}
+		health.Undelivered = health.Pending + health.Leased
+		switch {
+		case health.Dead > 0:
+			health.Status = TargetStatusFailed
+		case health.Undelivered > 0:
+			health.Status = TargetStatusPending
+		default:
+			health.Status = TargetStatusSynced
+		}
+		out = append(out, health)
+	}
+	return out, nil
+}
+
+// OldestPending implements Store.
+func (m *Memory) OldestPending(_ context.Context, tenant string, key boardsync.Key) (Lag, error) {
+	if err := validTenant(tenant); err != nil {
+		return Lag{}, err
+	}
+	if err := expectKey(key); err != nil {
+		return Lag{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	data := m.tenantLocked(tenant)
+	var lag Lag
+	var inboxLag *QueueLag
+	var oldest time.Time
+	if inbox := data.inboxes[key]; inbox != nil {
+		for _, row := range inbox.rows {
+			if row.state != StatePending && row.state != StateLeased {
+				continue
+			}
+			if inboxLag == nil {
+				inboxLag = &QueueLag{}
+			}
+			inboxLag.Outstanding++
+			if oldest.IsZero() || row.createdAt.Before(oldest) {
+				oldest = row.createdAt
+			}
+		}
+	}
+	if inboxLag != nil {
+		inboxLag.OldestAt = oldest
+		lag.Inbox = inboxLag
+	}
+	var outboxLag *QueueLag
+	var oldestOutbox time.Time
+	for _, row := range data.outbox {
+		if row.delivery.Key != key || (row.state != StatePending && row.state != StateLeased) {
+			continue
+		}
+		if outboxLag == nil {
+			outboxLag = &QueueLag{}
+		}
+		outboxLag.Outstanding++
+		if oldestOutbox.IsZero() || row.createdAt.Before(oldestOutbox) {
+			oldestOutbox = row.createdAt
+		}
+	}
+	if outboxLag != nil {
+		outboxLag.OldestAt = oldestOutbox
+		lag.Outbox = outboxLag
+	}
+	return lag, nil
+}
+
+// Failures24h implements Store.
+func (m *Memory) Failures24h(_ context.Context, tenant string, key boardsync.Key, since time.Time) (int, error) {
+	if err := validTenant(tenant); err != nil {
+		return 0, err
+	}
+	if err := expectKey(key); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	failures := 0
+	for _, row := range m.tenantLocked(tenant).outbox {
+		if row.delivery.Key != key || row.state != StateDead || !row.clearedAt.IsZero() {
+			continue
+		}
+		at := row.completedAt
+		if at.IsZero() {
+			at = row.createdAt
+		}
+		if !at.Before(since) {
+			failures++
+		}
+	}
+	return failures, nil
+}
+
 // UpsertThread implements Store.
 func (m *Memory) UpsertThread(_ context.Context, thread Thread) (Thread, error) {
 	if err := thread.Validate(); err != nil {

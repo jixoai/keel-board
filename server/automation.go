@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -113,15 +114,18 @@ type watcherRequest struct {
 // parameters: a parameter may hold a credential, and the API's job is to
 // enable, disable, and list, not to echo deployment secrets.
 type watcherView struct {
-	ID        string            `json:"id"`
-	Channel   string            `json:"channel"`
-	Filter    automation.Filter `json:"filter"`
-	Action    string            `json:"action"`
-	Bot       string            `json:"bot,omitempty"`
-	Enabled   bool              `json:"enabled"`
-	Cursor    string            `json:"cursor,omitempty"`
-	CreatedAt string            `json:"createdAt"`
-	UpdatedAt string            `json:"updatedAt"`
+	ID             string            `json:"id"`
+	Channel        string            `json:"channel"`
+	Filter         automation.Filter `json:"filter"`
+	Action         string            `json:"action"`
+	Bot            string            `json:"bot,omitempty"`
+	Enabled        bool              `json:"enabled"`
+	Cursor         string            `json:"cursor,omitempty"`
+	Dead           int               `json:"dead"`
+	LastError      string            `json:"lastError,omitempty"`
+	LastDeliveryAt string            `json:"lastDeliveryAt,omitempty"`
+	CreatedAt      string            `json:"createdAt"`
+	UpdatedAt      string            `json:"updatedAt"`
 }
 
 func watcherViewOf(watcher automation.Watcher) watcherView {
@@ -139,6 +143,29 @@ func watcherViewOf(watcher automation.Watcher) watcherView {
 	}
 	if view.Filter.Labels == nil {
 		view.Filter.Labels = map[string]string{}
+	}
+	return view
+}
+
+// watcherHealthView adds the store's optional delivery facts. A store without
+// StatsReader leaves dead=0 and the optional fields absent, which is honest:
+// the API doesn't invent stats it can't read.
+func (s *Server) watcherHealthView(ctx context.Context, tenant string, watcher automation.Watcher) watcherView {
+	view := watcherViewOf(watcher)
+	reader, ok := s.automation.store.(automation.StatsReader)
+	if !ok {
+		return view
+	}
+	stats, err := reader.WatcherStats(ctx, tenant, watcher.ID)
+	if err != nil {
+		s.logger.Warn("watcher stats failed; omitting delivery facts",
+			"tenant", tenant, "watcher", watcher.ID, "error", err)
+		return view
+	}
+	view.Dead = stats.Dead
+	view.LastError = stats.LastError
+	if !stats.LastDeliveryAt.IsZero() {
+		view.LastDeliveryAt = protocol.FormatTime(stats.LastDeliveryAt)
 	}
 	return view
 }
@@ -261,7 +288,7 @@ func (s *Server) handleWatchers(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]watcherView, 0, len(watchers))
 	for _, watcher := range watchers {
-		views = append(views, watcherViewOf(watcher))
+		views = append(views, s.watcherHealthView(req.ctx, req.tenant, watcher))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"watchers": views})
 }
@@ -285,7 +312,7 @@ func (s *Server) handleWatcher(w http.ResponseWriter, r *http.Request) {
 		writeError(w, protocol.NotFound(protocol.CodeNotFound, "no such watcher"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"watcher": watcherViewOf(watcher)})
+	writeJSON(w, http.StatusOK, map[string]any{"watcher": s.watcherHealthView(req.ctx, req.tenant, watcher)})
 }
 
 // handleCreateWatcher answers POST /watchers.
@@ -483,7 +510,7 @@ func (s *Server) setWatcherEnabled(w http.ResponseWriter, r *http.Request, enabl
 		s.failAutomation(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"watcher": watcherViewOf(watcher)})
+	writeJSON(w, http.StatusOK, map[string]any{"watcher": s.watcherHealthView(req.ctx, req.tenant, watcher)})
 }
 
 // handleWatcherDeliveries answers GET /watchers/{id}/deliveries.

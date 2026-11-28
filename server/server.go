@@ -217,6 +217,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("POST "+base+"/sync/bridge/{key}/events", s.sync.bridgeEvents)
 		s.mux.HandleFunc("GET "+base+"/sync/entries", s.handleSyncEntries)
 		s.mux.HandleFunc("GET "+base+"/sync/entries/{key}/status", s.handleSyncEntryStatus)
+		s.mux.HandleFunc("GET "+base+"/sync/entries/{key}/targets", s.handleSyncEntryTargets)
 		s.mux.HandleFunc("GET "+base+"/sync/status", s.handleSyncStatus)
 		s.mux.HandleFunc("GET "+base+"/sync/inbox", s.handleSyncInbox)
 		s.mux.HandleFunc("POST "+base+"/sync/inbox/{id}/retry", s.handleSyncRetryInbox)

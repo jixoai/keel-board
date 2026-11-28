@@ -17,8 +17,11 @@ grant HTTP routes remain a later phase.
 - Status: phase 0 feature-complete for the standalone board: core log, message
   and task surface, access grants, durable watchers/schedules, the two-way sync
   engine with Slack/GitHub/Linear/Chat SDK adapters, management and source-read
-  APIs, a PostgreSQL store with forced RLS, and the E2E harness. Phase 1 (the
-  keel import and UI) is tracked in keel's `keel-board-v1` change.
+  APIs, read-only sync/automation health (external targets, oldest pending lag,
+  24h failures, watcher dead/error facts since `v0.1.2`), a PostgreSQL store
+  with forced RLS, and the E2E harness. Phase 1 (the keel import and UI) is
+  tracked in keel's `keel-board-v1` change and its `feat-keel-board-sync-v2`
+  follow-up.
 - Sync design: [`docs/SYNC.md`](docs/SYNC.md)
 
 ## Running

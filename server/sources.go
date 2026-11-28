@@ -116,30 +116,24 @@ const syncEntryStatusLimit = 100
 // syncEntryStatusView is one connection's status. Outbox is this
 // connection's depth, not the tenant total; Failures and DeadInbox count this
 // connection's dead deliveries and dead inbound events, up to
-// syncEntryStatusLimit.
+// syncEntryStatusLimit. The embedded health view is the same shape the list
+// and status routes return.
 type syncEntryStatusView struct {
-	syncEntryView
-	Inbox     syncstore.InboxDepth  `json:"inbox"`
-	Outbox    syncstore.OutboxDepth `json:"outbox"`
-	Failures  int                   `json:"failures"`
-	DeadInbox int                   `json:"deadInbox"`
+	syncEntryHealthView
+	Failures  int `json:"failures"`
+	DeadInbox int `json:"deadInbox"`
 }
 
 // handleSyncEntryStatus answers GET /sync/entries/{key}/status: one
-// connection's status view, including its own outbox depth and bounded dead
-// letter counts. A disabled entry stays readable here so an operator can see
-// why source read/join answers 409.
+// connection's status view, including its own outbox depth, targets, lag,
+// 24h failures and bounded dead letter counts. A disabled entry stays readable
+// here so an operator can see why source read/join answers 409.
 func (s *Server) handleSyncEntryStatus(w http.ResponseWriter, r *http.Request) {
 	req, entry, _, ok := s.resolveSyncSource(w, r)
 	if !ok {
 		return
 	}
-	depth, err := s.sync.store.InboxDepth(req.ctx, req.tenant, entry.Key)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	outbox, err := s.sync.store.OutboxDepthFor(req.ctx, req.tenant, entry.Key)
+	health, err := s.syncEntryHealth(req.ctx, req.tenant, entry)
 	if err != nil {
 		s.fail(w, r, err)
 		return
@@ -155,16 +149,26 @@ func (s *Server) handleSyncEntryStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, syncEntryStatusView{
-		syncEntryView: syncEntryView{
-			Key: string(entry.Key), Platform: string(entry.Platform), Enabled: entry.Enabled,
-			Owned:     s.sync.owns(req.tenant, entry.Key),
-			CreatedAt: protocol.FormatTime(entry.CreatedAt), UpdatedAt: protocol.FormatTime(entry.UpdatedAt),
-		},
-		Inbox:     depth,
-		Outbox:    outbox,
-		Failures:  len(failures),
-		DeadInbox: len(dead),
+		syncEntryHealthView: health,
+		Failures:            len(failures),
+		DeadInbox:           len(dead),
 	})
+}
+
+// handleSyncEntryTargets answers GET /sync/entries/{key}/targets: one
+// connection's external targets and their outbound health. It is the by-key
+// enumeration; GET /sync/threads?thread= remains the by-board-thread one.
+func (s *Server) handleSyncEntryTargets(w http.ResponseWriter, r *http.Request) {
+	req, entry, _, ok := s.resolveSyncSource(w, r)
+	if !ok {
+		return
+	}
+	targets, err := s.sync.store.Targets(req.ctx, req.tenant, entry.Key, syncEntryStatusLimit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"targets": targetViews(targets)})
 }
 
 // resolveSyncSource resolves the caller, gates on board.manage, and reads the

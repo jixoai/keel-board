@@ -724,6 +724,37 @@ func (p *Postgres) DeliveryDepth(ctx context.Context, tenant, watcherID string) 
 	return depth, nil
 }
 
+// WatcherStats implements StatsReader.
+func (p *Postgres) WatcherStats(ctx context.Context, tenant, watcherID string) (WatcherStats, error) {
+	var stats WatcherStats
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		var last pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE state = 'dead'), max(updated_at)
+			FROM board_watch_deliveries
+			WHERE tenant_id = $1 AND watcher_id = $2`, tenant, watcherID).
+			Scan(&stats.Dead, &last); err != nil {
+			return err
+		}
+		if last.Valid {
+			stats.LastDeliveryAt = last.Time
+		}
+		err := tx.QueryRow(ctx, `
+			SELECT last_error FROM board_watch_deliveries
+			WHERE tenant_id = $1 AND watcher_id = $2 AND last_error <> ''
+			ORDER BY updated_at DESC, event_seq DESC LIMIT 1`, tenant, watcherID).
+			Scan(&stats.LastError)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return err
+	})
+	if err != nil {
+		return WatcherStats{}, err
+	}
+	return stats, nil
+}
+
 const scheduleColumns = `tenant_id, schedule_id, channel, COALESCE(re, 0), text, labels,
 	creator_actor, creator_kind, COALESCE(creator_via, '{}'::jsonb),
 	creation_key, creation_digest,

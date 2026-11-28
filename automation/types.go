@@ -325,6 +325,22 @@ type Depth struct {
 	Dead    int `json:"dead"`
 }
 
+// WatcherStats is one watcher's read-only delivery health: dead letters, the
+// latest stable error code, and the last delivery activity. It carries no
+// event content and no action parameters.
+type WatcherStats struct {
+	Dead           int       `json:"dead"`
+	LastError      string    `json:"lastError,omitempty"`
+	LastDeliveryAt time.Time `json:"lastDeliveryAt,omitempty"`
+}
+
+// StatsReader is the optional store seam for watcher health. A store that
+// doesn't implement it leaves the management DTO's stats absent rather than
+// guessing them.
+type StatsReader interface {
+	WatcherStats(ctx context.Context, tenant, watcherID string) (WatcherStats, error)
+}
+
 // AckResult says what an ack did: committed a success, scheduled a retry, or
 // dead-lettered the row.
 type AckResult struct {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -1257,6 +1258,208 @@ func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boards
 		return nil, err
 	}
 	return out, nil
+}
+
+// targetAggregate is one target's outbound counts, read in one pass.
+type targetAggregate struct {
+	pending   int
+	leased    int
+	dead      int
+	attempts  int
+	updatedAt time.Time
+	lastError string
+}
+
+// Targets implements Store.
+func (p *Postgres) Targets(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]TargetHealth, error) {
+	if err := validTenant(tenant); err != nil {
+		return nil, err
+	}
+	if err := expectKey(key); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	threads := make([]Thread, 0)
+	aggregates := make(map[string]targetAggregate)
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT `+threadColumns+` FROM board_sync_threads
+			WHERE tenant_id = $1 AND sync_key = $2 ORDER BY id LIMIT $3`,
+			tenant, key, limit)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			thread, err := scanThread(rows)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			threads = append(threads, thread)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		stats, err := tx.Query(ctx, `
+			SELECT board_thread, target_key,
+				count(*) FILTER (WHERE state = 'pending'),
+				count(*) FILTER (WHERE state = 'leased'),
+				count(*) FILTER (WHERE state = 'dead' AND cleared_at IS NULL),
+				COALESCE(max(attempts), 0),
+				COALESCE(max(updated_at), 'epoch'::timestamptz)
+			FROM board_sync_outbox
+			WHERE tenant_id = $1 AND sync_key = $2
+			GROUP BY board_thread, target_key`, tenant, key)
+		if err != nil {
+			return err
+		}
+		for stats.Next() {
+			var aggregate targetAggregate
+			var boardThread uint64
+			var targetKey string
+			if err := stats.Scan(&boardThread, &targetKey, &aggregate.pending,
+				&aggregate.leased, &aggregate.dead, &aggregate.attempts,
+				&aggregate.updatedAt); err != nil {
+				stats.Close()
+				return err
+			}
+			aggregates[targetAggregateKey(boardThread, targetKey)] = aggregate
+		}
+		if err := stats.Err(); err != nil {
+			stats.Close()
+			return err
+		}
+		stats.Close()
+
+		errors, err := tx.Query(ctx, `
+			SELECT DISTINCT ON (board_thread, target_key) board_thread, target_key, last_error
+			FROM board_sync_outbox
+			WHERE tenant_id = $1 AND sync_key = $2 AND last_error <> ''
+				AND (state <> 'dead' OR cleared_at IS NULL)
+			ORDER BY board_thread, target_key, id DESC`, tenant, key)
+		if err != nil {
+			return err
+		}
+		defer errors.Close()
+		for errors.Next() {
+			var boardThread uint64
+			var targetKey, lastError string
+			if err := errors.Scan(&boardThread, &targetKey, &lastError); err != nil {
+				return err
+			}
+			aggregate := aggregates[targetAggregateKey(boardThread, targetKey)]
+			aggregate.lastError = lastError
+			aggregates[targetAggregateKey(boardThread, targetKey)] = aggregate
+		}
+		return errors.Err()
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TargetHealth, 0, len(threads))
+	for _, thread := range threads {
+		target := boardsync.ResolvedTarget{
+			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
+			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
+		}
+		health := TargetHealth{
+			Target: target.External(), BoardThread: thread.BoardThread,
+			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
+			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
+		}
+		if aggregate, found := aggregates[targetAggregateKey(thread.BoardThread, targetKeyOf(target))]; found {
+			health.Pending = aggregate.pending
+			health.Leased = aggregate.leased
+			health.Dead = aggregate.dead
+			health.Attempts = aggregate.attempts
+			health.LastError = aggregate.lastError
+			health.LastDeliveryAt = aggregate.updatedAt
+		}
+		health.Undelivered = health.Pending + health.Leased
+		switch {
+		case health.Dead > 0:
+			health.Status = TargetStatusFailed
+		case health.Undelivered > 0:
+			health.Status = TargetStatusPending
+		default:
+			health.Status = TargetStatusSynced
+		}
+		out = append(out, health)
+	}
+	return out, nil
+}
+
+// targetAggregateKey separates one target's rows on one board thread.
+func targetAggregateKey(boardThread uint64, targetKey string) string {
+	return strconv.FormatUint(boardThread, 10) + "\x00" + targetKey
+}
+
+// OldestPending implements Store.
+func (p *Postgres) OldestPending(ctx context.Context, tenant string, key boardsync.Key) (Lag, error) {
+	if err := validTenant(tenant); err != nil {
+		return Lag{}, err
+	}
+	if err := expectKey(key); err != nil {
+		return Lag{}, err
+	}
+	var lag Lag
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		var inboxCount int
+		var inboxOldest pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*), min(created_at) FROM board_sync_inbox
+			WHERE tenant_id = $1 AND sync_key = $2 AND state IN ('pending', 'leased')`,
+			tenant, key).Scan(&inboxCount, &inboxOldest); err != nil {
+			return err
+		}
+		if inboxCount > 0 && inboxOldest.Valid {
+			lag.Inbox = &QueueLag{Outstanding: inboxCount, OldestAt: inboxOldest.Time}
+		}
+		var outboxCount int
+		var outboxOldest pgtype.Timestamptz
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*), min(created_at) FROM board_sync_outbox
+			WHERE tenant_id = $1 AND sync_key = $2 AND state IN ('pending', 'leased')`,
+			tenant, key).Scan(&outboxCount, &outboxOldest); err != nil {
+			return err
+		}
+		if outboxCount > 0 && outboxOldest.Valid {
+			lag.Outbox = &QueueLag{Outstanding: outboxCount, OldestAt: outboxOldest.Time}
+		}
+		return nil
+	})
+	if err != nil {
+		return Lag{}, err
+	}
+	return lag, nil
+}
+
+// Failures24h implements Store.
+func (p *Postgres) Failures24h(ctx context.Context, tenant string, key boardsync.Key, since time.Time) (int, error) {
+	if err := validTenant(tenant); err != nil {
+		return 0, err
+	}
+	if err := expectKey(key); err != nil {
+		return 0, err
+	}
+	var failures int
+	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `
+			SELECT count(*) FROM board_sync_outbox
+			WHERE tenant_id = $1 AND sync_key = $2 AND state = 'dead'
+				AND cleared_at IS NULL
+				AND COALESCE(completed_at, updated_at) >= $3`,
+			tenant, key, since).Scan(&failures)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return failures, nil
 }
 
 const threadColumns = `tenant_id, id, board_thread, sync_key, platform, channel,

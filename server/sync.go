@@ -552,14 +552,64 @@ type syncEntryView struct {
 	UpdatedAt string `json:"updatedAt"`
 }
 
-type syncKeyStatus struct {
-	syncEntryView
-	Inbox syncstore.InboxDepth `json:"inbox"`
+// syncTargetView is one external target and its outbound health. Target is the
+// key-prefixed external ID; Root is the board thread it mirrors. LastError is
+// the store's stable error code, never a platform response body.
+type syncTargetView struct {
+	Target         string `json:"target"`
+	Root           string `json:"root"`
+	Key            string `json:"key"`
+	Platform       string `json:"platform"`
+	Channel        string `json:"channel"`
+	Thread         string `json:"thread,omitempty"`
+	Subthread      string `json:"subthread,omitempty"`
+	Kind           string `json:"kind"`
+	Status         string `json:"status"`
+	Pending        int    `json:"pending"`
+	Leased         int    `json:"leased"`
+	Dead           int    `json:"dead"`
+	Attempts       int    `json:"attempts"`
+	LastError      string `json:"lastError,omitempty"`
+	Undelivered    int    `json:"undelivered"`
+	LastDeliveryAt string `json:"lastDeliveryAt,omitempty"`
 }
 
+// syncQueueLagView is one queue's oldest outstanding row. A nil member at the
+// syncLagView level means the queue is empty, not that measuring failed.
+type syncQueueLagView struct {
+	Outstanding int    `json:"outstanding"`
+	OldestAt    string `json:"oldestAt"`
+	AgeSeconds  int64  `json:"ageSeconds"`
+}
+
+type syncLagView struct {
+	Inbox  *syncQueueLagView `json:"inbox"`
+	Outbox *syncQueueLagView `json:"outbox"`
+}
+
+// syncEntryHealthView is the per-entry read-only health every list and status
+// route returns. It is one shape for /sync/entries, /sync/status and
+// /sync/entries/{key}/status, so a client never needs a second rule set.
+type syncEntryHealthView struct {
+	syncEntryView
+	Inbox       syncstore.InboxDepth  `json:"inbox"`
+	Outbox      syncstore.OutboxDepth `json:"outbox"`
+	Targets     []syncTargetView      `json:"targets"`
+	Lag         syncLagView           `json:"lag"`
+	Failures24h int                   `json:"failures24h"`
+	// measured is the same lag before formatting, used only to aggregate the
+	// tenant status without parsing formatted timestamps.
+	measured syncstore.Lag
+}
+
+type syncKeyStatus = syncEntryHealthView
+
 type syncStatusView struct {
-	Keys   []syncKeyStatus       `json:"keys"`
-	Outbox syncstore.OutboxDepth `json:"outbox"`
+	Keys        []syncKeyStatus       `json:"keys"`
+	Outbox      syncstore.OutboxDepth `json:"outbox"`
+	Lag         syncLagView           `json:"lag"`
+	Failures24h int                   `json:"failures24h"`
+	UpdatedAt   string                `json:"updatedAt"`
 }
 
 type syncInboxView struct {
@@ -604,7 +654,8 @@ func (req *request) permitSyncManage(s *Server) *protocol.Error {
 	return req.permit(s, "*", protocol.PermissionManage)
 }
 
-// handleSyncEntries answers GET /sync/entries.
+// handleSyncEntries answers GET /sync/entries: every connection with the same
+// read-only health facts as the status routes.
 func (s *Server) handleSyncEntries(w http.ResponseWriter, r *http.Request) {
 	req, ok := s.resolve(w, r)
 	if !ok {
@@ -619,20 +670,21 @@ func (s *Server) handleSyncEntries(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	views := make([]syncEntryView, 0, len(entries))
+	views := make([]syncEntryHealthView, 0, len(entries))
 	for _, entry := range entries {
-		views = append(views, syncEntryView{
-			Key: string(entry.Key), Platform: string(entry.Platform), Enabled: entry.Enabled,
-			Owned:     s.sync.owns(req.tenant, entry.Key),
-			CreatedAt: protocol.FormatTime(entry.CreatedAt), UpdatedAt: protocol.FormatTime(entry.UpdatedAt),
-		})
+		view, err := s.syncEntryHealth(req.ctx, req.tenant, entry)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		views = append(views, view)
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].Key < views[j].Key })
 	writeJSON(w, http.StatusOK, map[string]any{"entries": views})
 }
 
-// handleSyncStatus answers GET /sync/status: entries with their inbox depth
-// and the tenant's outbox depth.
+// handleSyncStatus answers GET /sync/status: entries with their own inbox,
+// outbox, targets, lag and 24h failures, plus the tenant aggregate.
 func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 	req, ok := s.resolve(w, r)
 	if !ok {
@@ -648,21 +700,18 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := syncStatusView{Keys: make([]syncKeyStatus, 0, len(entries))}
+	var tenantLag syncstore.Lag
 	for _, entry := range entries {
-		depth, err := s.sync.store.InboxDepth(req.ctx, req.tenant, entry.Key)
+		view, err := s.syncEntryHealth(req.ctx, req.tenant, entry)
 		if err != nil {
 			s.fail(w, r, err)
 			return
 		}
-		status.Keys = append(status.Keys, syncKeyStatus{
-			syncEntryView: syncEntryView{
-				Key: string(entry.Key), Platform: string(entry.Platform), Enabled: entry.Enabled,
-				Owned:     s.sync.owns(req.tenant, entry.Key),
-				CreatedAt: protocol.FormatTime(entry.CreatedAt), UpdatedAt: protocol.FormatTime(entry.UpdatedAt),
-			},
-			Inbox: depth,
-		})
-		s.observeInboxDepth(entry.Key, depth)
+		status.Keys = append(status.Keys, view)
+		status.Failures24h += view.Failures24h
+		mergeEntryLag(&tenantLag, view.measured)
+		s.observeInboxDepth(entry.Key, view.Inbox)
+		s.observeOutboxDepth(entry.Key, view.Outbox)
 	}
 	sort.Slice(status.Keys, func(i, j int) bool { return status.Keys[i].Key < status.Keys[j].Key })
 	status.Outbox, err = s.sync.store.OutboxDepth(req.ctx, req.tenant)
@@ -670,6 +719,9 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
+	now := s.now().UTC()
+	status.Lag = lagView(tenantLag, now)
+	status.UpdatedAt = protocol.FormatTime(now)
 	// The outbox is tenant-wide in the store's contract; a store that can
 	// break it down by key exports the per-key series. A store that can't, or
 	// that fails this optional read, leaves the outbox series unchanged rather
@@ -687,6 +739,110 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// syncEntryHealth reads one connection's read-only health facts. It is the
+// single place the list and status routes share, so their shapes can't drift.
+func (s *Server) syncEntryHealth(ctx context.Context, tenant string, entry syncstore.Entry) (syncEntryHealthView, error) {
+	inbox, err := s.sync.store.InboxDepth(ctx, tenant, entry.Key)
+	if err != nil {
+		return syncEntryHealthView{}, err
+	}
+	outbox, err := s.sync.store.OutboxDepthFor(ctx, tenant, entry.Key)
+	if err != nil {
+		return syncEntryHealthView{}, err
+	}
+	targets, err := s.sync.store.Targets(ctx, tenant, entry.Key, syncEntryStatusLimit)
+	if err != nil {
+		return syncEntryHealthView{}, err
+	}
+	lag, err := s.sync.store.OldestPending(ctx, tenant, entry.Key)
+	if err != nil {
+		return syncEntryHealthView{}, err
+	}
+	failures, err := s.sync.store.Failures24h(ctx, tenant, entry.Key, s.now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		return syncEntryHealthView{}, err
+	}
+	view := syncEntryHealthView{
+		syncEntryView: syncEntryView{
+			Key: string(entry.Key), Platform: string(entry.Platform), Enabled: entry.Enabled,
+			Owned:     s.sync.owns(tenant, entry.Key),
+			CreatedAt: protocol.FormatTime(entry.CreatedAt), UpdatedAt: protocol.FormatTime(entry.UpdatedAt),
+		},
+		Inbox: inbox, Outbox: outbox,
+		Targets:     targetViews(targets),
+		Lag:         lagView(lag, s.now().UTC()),
+		Failures24h: failures,
+		measured:    lag,
+	}
+	return view, nil
+}
+
+func targetViews(targets []syncstore.TargetHealth) []syncTargetView {
+	views := make([]syncTargetView, 0, len(targets))
+	for _, target := range targets {
+		view := syncTargetView{
+			Target: target.Target, Root: protocol.FormatRef(target.BoardThread),
+			Key: string(target.Key), Platform: string(target.Platform),
+			Channel: target.Channel, Thread: target.Thread, Subthread: target.Subthread,
+			Kind: string(target.Kind), Status: target.Status,
+			Pending: target.Pending, Leased: target.Leased, Dead: target.Dead,
+			Attempts: target.Attempts, LastError: target.LastError,
+			Undelivered: target.Undelivered,
+		}
+		if !target.LastDeliveryAt.IsZero() {
+			view.LastDeliveryAt = protocol.FormatTime(target.LastDeliveryAt)
+		}
+		views = append(views, view)
+	}
+	return views
+}
+
+func lagView(lag syncstore.Lag, now time.Time) syncLagView {
+	return syncLagView{
+		Inbox:  queueLagView(lag.Inbox, now),
+		Outbox: queueLagView(lag.Outbox, now),
+	}
+}
+
+func queueLagView(lag *syncstore.QueueLag, now time.Time) *syncQueueLagView {
+	if lag == nil {
+		return nil
+	}
+	age := int64(now.Sub(lag.OldestAt).Seconds())
+	if age < 0 {
+		age = 0
+	}
+	return &syncQueueLagView{
+		Outstanding: lag.Outstanding,
+		OldestAt:    protocol.FormatTime(lag.OldestAt),
+		AgeSeconds:  age,
+	}
+}
+
+// mergeEntryLag folds one entry's measured lag into a tenant aggregate. A
+// queue with any entry backlog keeps the oldest observed row and sums the
+// outstanding counts.
+func mergeEntryLag(into *syncstore.Lag, from syncstore.Lag) {
+	if from.Inbox != nil {
+		if into.Inbox == nil {
+			into.Inbox = &syncstore.QueueLag{}
+		}
+		into.Inbox.Outstanding += from.Inbox.Outstanding
+		if into.Inbox.OldestAt.IsZero() || from.Inbox.OldestAt.Before(into.Inbox.OldestAt) {
+			into.Inbox.OldestAt = from.Inbox.OldestAt
+		}
+	}
+	if from.Outbox != nil {
+		if into.Outbox == nil {
+			into.Outbox = &syncstore.QueueLag{}
+		}
+		into.Outbox.Outstanding += from.Outbox.Outstanding
+		if into.Outbox.OldestAt.IsZero() || from.Outbox.OldestAt.Before(into.Outbox.OldestAt) {
+			into.Outbox.OldestAt = from.Outbox.OldestAt
+		}
+	}
 }
 
 // handleSyncInbox answers GET /sync/inbox?key=&state=dead: dead-lettered
