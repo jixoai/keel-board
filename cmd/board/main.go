@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"log/slog"
 	"net/http"
 	"os"
@@ -33,6 +34,7 @@ import (
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/metrics"
+	"github.com/jixoai/keel-board/pgadapter"
 	"github.com/jixoai/keel-board/server"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
@@ -113,7 +115,7 @@ func openStore(ctx context.Context, dsn string) (events store.EventStore, closeS
 	if strings.TrimSpace(dsn) == "" {
 		return store.NewMemory(), func() {}, "memory", nil
 	}
-	postgres, err := store.Open(ctx, dsn)
+	postgres, err := pglogstore.OpenLogDSN(ctx, dsn)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -168,7 +170,7 @@ func openAudit(ctx context.Context, dsn string) (audit.Store, func(), string, er
 	if strings.TrimSpace(dsn) == "" {
 		return audit.NewMemory(), func() {}, "memory", nil
 	}
-	postgres, err := audit.OpenPostgres(ctx, audit.PostgresOptions{DSN: dsn})
+	postgres, err := pgadapter.OpenAudit(ctx, pgadapter.AuditOptions{DSN: dsn})
 	if err != nil {
 		return nil, nil, "", err
 	}

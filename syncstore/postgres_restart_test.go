@@ -3,6 +3,7 @@ package syncstore_test
 import (
 	"context"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"io"
 	"log/slog"
 	"sync"
@@ -11,7 +12,6 @@ import (
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
-	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/sync/fake"
 	"github.com/jixoai/keel-board/syncstore"
@@ -26,7 +26,7 @@ func TestPostgresHostRestart(t *testing.T) {
 	boardSchema := newTestSchema(t, dsn)
 	cfg := testConfig()
 	store1 := openPostgres(t, dsn, schema, cfg)
-	boardStore1, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: boardSchema})
+	boardStore1, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: boardSchema})
 	if err != nil {
 		t.Fatalf("open board store: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestPostgresHostRestart(t *testing.T) {
 	if _, found, err := store2.Copy(t.Context(), "t1", "slack", channelTarget("C1"), rootID); err != nil || !found {
 		t.Fatalf("persisted copy = %v, %v", found, err)
 	}
-	boardStore2, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: boardSchema})
+	boardStore2, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: boardSchema})
 	if err != nil {
 		t.Fatalf("reopen board store: %v", err)
 	}

@@ -69,7 +69,7 @@ type memoryOutboxRow struct {
 
 // NewMemory returns an empty in-memory store.
 func NewMemory(cfg Config) (*Memory, error) {
-	checked, err := cfg.withDefaults()
+	checked, err := cfg.WithDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -479,29 +479,29 @@ func (m *Memory) EnqueueOutbox(_ context.Context, tenant string, key boardsync.K
 	now := m.now()
 	added := 0
 	for _, job := range jobs {
-		if _, exists := data.byDelivery[job.id]; exists {
+		if _, exists := data.byDelivery[job.ID]; exists {
 			continue
 		}
-		eventCopy, err := cloneJSON(job.event)
+		eventCopy, err := cloneJSON(job.Event)
 		if err != nil {
-			return EnqueueResult{}, fmt.Errorf("%w: board event %d can't be queued", boardsync.ErrBadRequest, job.event.ID)
+			return EnqueueResult{}, fmt.Errorf("%w: board event %d can't be queued", boardsync.ErrBadRequest, job.Event.ID)
 		}
-		messageCopy, err := cloneJSON(job.message)
+		messageCopy, err := cloneJSON(job.Message)
 		if err != nil {
-			return EnqueueResult{}, fmt.Errorf("%w: board message %d can't be queued", boardsync.ErrBadRequest, job.message.ID)
+			return EnqueueResult{}, fmt.Errorf("%w: board message %d can't be queued", boardsync.ErrBadRequest, job.Message.ID)
 		}
 		row := &memoryOutboxRow{
 			seq: m.nextSeqLocked(),
 			delivery: Delivery{
-				ID: job.id, Lane: job.lane, Key: job.key, Event: eventCopy,
-				Message: messageCopy, Target: job.target, State: StatePending,
+				ID: job.ID, Lane: job.Lane, Key: job.Key, Event: eventCopy,
+				Message: messageCopy, Target: job.Target, State: StatePending,
 				AvailableAt: now, CreatedAt: now,
 			},
-			lane: job.lane, targetKey: job.targetKey, state: StatePending,
+			lane: job.Lane, targetKey: job.TargetKey, state: StatePending,
 			availableAt: now, createdAt: now,
 		}
 		data.outbox = append(data.outbox, row)
-		data.byDelivery[job.id] = row
+		data.byDelivery[job.ID] = row
 		added++
 	}
 	return EnqueueResult{Added: added, Skipped: len(targets) - added}, nil
@@ -1378,6 +1378,10 @@ func cloneDelivery(delivery Delivery) Delivery {
 	}
 	return delivery
 }
+
+// LeaseOwner is leaseOwner for storage adapters: every dialect records the
+// same owner for an unnamed worker.
+func LeaseOwner(owner string) string { return leaseOwner(owner) }
 
 func leaseOwner(owner string) string {
 	if owner == "" {

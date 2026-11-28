@@ -322,6 +322,10 @@ func (m *Memory) Tenants(_ context.Context) ([]string, error) {
 	return tenants, nil
 }
 
+// RequestOf returns the key and digest a batch writes, if any. The log sets
+// them on the batch's first record. Storage adapters share it.
+func RequestOf(records []Record) (string, string) { return requestOf(records) }
+
 // requestOf returns the key and digest a batch writes, if any. The log sets
 // them on the batch's first record.
 func requestOf(records []Record) (string, string) {
@@ -330,6 +334,10 @@ func requestOf(records []Record) (string, string) {
 	}
 	return records[0].RequestKey, records[0].Digest
 }
+
+// BatchResultOf computes a batch's answer from its records and the log's
+// result note on the first one. Storage adapters share it.
+func BatchResultOf(records []Record) BatchResult { return batchResultOf(records) }
 
 // batchResultOf computes a batch's answer from its records and the log's
 // result note on the first one.
@@ -368,6 +376,12 @@ var (
 	_ IntegrityStore = (*Memory)(nil)
 	_ TenantStore    = (*Memory)(nil)
 )
+
+// CheckBatch verifies a batch's seqs start right after expectedHead and are
+// contiguous. Storage adapters call it before writing.
+func CheckBatch(records []Record, expectedHead uint64) error {
+	return checkBatch(records, expectedHead)
+}
 
 // checkBatch verifies a batch's seqs start right after expectedHead and are
 // contiguous. Stores call it before writing.
@@ -409,6 +423,11 @@ func payloadHasNUL(payload []byte) bool {
 	}
 	return false
 }
+
+// NormalizeRecords returns copies of records in the store's canonical payload
+// and timestamp form, for storage adapters. It never mutates the caller's
+// records or payloads.
+func NormalizeRecords(records []Record) ([]Record, error) { return normalizeRecords(records) }
 
 // normalizeRecords returns copies of records in the store's canonical payload
 // and timestamp form. It never mutates the caller's records or payloads:

@@ -3,6 +3,7 @@ package syncstore_test
 import (
 	"context"
 	"errors"
+	"github.com/jixoai/keel-board/pgadapter"
 	"testing"
 	"time"
 
@@ -14,14 +15,14 @@ import (
 func TestPostgresMigrationIsIdempotent(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	first, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	first, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	first.Close()
-	second, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	second, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {
@@ -53,7 +54,7 @@ func TestPostgresMigrationIsIdempotent(t *testing.T) {
 func TestPostgresRestartRecovery(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	first, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	first, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {
@@ -68,7 +69,7 @@ func TestPostgresRestartRecovery(t *testing.T) {
 	}
 	first.Close()
 
-	second, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	second, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {

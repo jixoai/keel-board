@@ -282,6 +282,10 @@ func normalizeWatcher(w Watcher) Watcher {
 	return w
 }
 
+// NormalizeWatcher is normalizeWatcher for storage adapters: a watcher written
+// through a dialect keeps the domain's normalization.
+func NormalizeWatcher(w Watcher) Watcher { return normalizeWatcher(w) }
+
 // ValidateWatcherID checks a watcher ID's shape.
 func ValidateWatcherID(id string) error {
 	if len(id) == 0 || len(id) > WatcherIDMax || !watcherIDExpr.MatchString(id) {
@@ -512,6 +516,10 @@ func sameInstant(left, right time.Time) bool {
 	return protocol.FormatTime(left) == protocol.FormatTime(right)
 }
 
+// SameInstant is sameInstant for storage adapters: an expected version compares
+// at the same wire precision in every dialect.
+func SameInstant(left, right time.Time) bool { return sameInstant(left, right) }
+
 // NewWatcherID returns a random watcher ID.
 func NewWatcherID() (string, error) {
 	var raw [16]byte
@@ -636,6 +644,11 @@ func validTenant(tenant string) error {
 	return nil
 }
 
+// ValidTenant reports whether tenant is usable as a tenant namespace. Storage
+// adapters call it before scoping a transaction, so validation stays in the
+// domain instead of being reimplemented per dialect.
+func ValidTenant(tenant string) error { return validTenant(tenant) }
+
 // cloneWatcher, cloneDelivery, and cloneSchedule detach a stored value from
 // the caller and from the store's maps.
 func cloneWatcher(w Watcher) Watcher {
@@ -656,6 +669,10 @@ func cloneDelivery(d Delivery) Delivery {
 	}
 	return d
 }
+
+// CloneSchedule detaches a schedule from a caller or a store's maps. Storage
+// adapters use it so no dialect hands out shared nested pointers.
+func CloneSchedule(s Schedule) Schedule { return cloneSchedule(s) }
 
 func cloneSchedule(s Schedule) Schedule {
 	if s.Re != nil {

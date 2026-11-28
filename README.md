@@ -19,10 +19,13 @@ grant HTTP routes remain a later phase.
   engine with Slack/GitHub/Linear/Chat SDK adapters, management and source-read
   APIs, read-only sync/automation health (external targets, oldest pending lag,
   24h failures, watcher dead/error facts since `v0.1.2`), a PostgreSQL store
-  with forced RLS, and the E2E harness. Phase 1 (the keel import and UI) is
-  tracked in keel's `keel-board-v1` change and its `feat-keel-board-sync-v2`
-  follow-up.
+  with forced RLS, and the E2E harness. Storage access is dialect-neutral since
+  `v0.1.3`: the domain/server/sync packages depend on interfaces only, and the
+  `pgadapter` packages own pgx, SQL, transactions, migrations, advisory locks
+  and the lease dialect. Phase 1 (the keel import and UI) is tracked in keel's
+  `keel-board-v1` change and its `feat-keel-board-sync-v2` follow-up.
 - Sync design: [`docs/SYNC.md`](docs/SYNC.md)
+- Storage boundary: [`docs/STORAGE.md`](docs/STORAGE.md)
 
 ## Running
 

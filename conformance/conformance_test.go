@@ -3,6 +3,7 @@ package conformance_test
 import (
 	"context"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -33,7 +34,7 @@ func TestPostgres(t *testing.T) {
 		Name: "postgres",
 		Store: func(t *testing.T) store.EventStore {
 			t.Helper()
-			postgres, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: schema})
+			postgres, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: schema})
 			if err != nil {
 				t.Fatalf("opening PostgreSQL store: %v", err)
 			}

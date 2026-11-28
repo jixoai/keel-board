@@ -1,10 +1,11 @@
-package automation
+package pgadapter
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/schema"
 	"hash/fnv"
 	"sort"
 	"strings"
@@ -14,12 +15,12 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	. "github.com/jixoai/keel-board/automation"
 	"github.com/jixoai/keel-board/protocol"
-	"github.com/jixoai/keel-board/store"
 )
 
-// PostgresOptions configure a PostgreSQL automation store.
-type PostgresOptions struct {
+// AutomationOptions configure a PostgreSQL automation store.
+type AutomationOptions struct {
 	// DSN is the database. It is required.
 	DSN string
 	// SearchPath confines every automation table to one schema. Tests use it
@@ -29,24 +30,24 @@ type PostgresOptions struct {
 	Config Config
 }
 
-// Postgres is a PostgreSQL-backed Store. Each lease is one transaction that
+// Automation is a PostgreSQL-backed Store. Each lease is one transaction that
 // takes an advisory lock for its tenant, so two workers can't hand out the same
 // row while different tenants proceed in parallel. Every statement carries the
 // tenant predicate.
-type Postgres struct {
+type Automation struct {
 	pool       *pgxpool.Pool
 	cfg        Config
 	searchPath string
 }
 
-// OpenPostgres connects with opts, applies the board and automation schema,
+// OpenAutomation connects with opts, applies the board and automation schema,
 // and returns a store. The schema is idempotent, so opening a migrated
 // database again changes nothing.
-func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) {
+func OpenAutomation(ctx context.Context, opts AutomationOptions) (*Automation, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("automation: a PostgreSQL DSN is required")
 	}
-	cfg, err := opts.Config.withDefaults()
+	cfg, err := opts.Config.WithDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +66,7 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, fmt.Errorf("automation: connecting to PostgreSQL: %w", err)
 	}
-	if err := store.ApplyMigrations(ctx, pool); err != nil {
+	if err := pgschema.ApplyAll(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -73,21 +74,21 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 	if opts.SearchPath != "" {
 		searchPath = pgx.Identifier{opts.SearchPath}.Sanitize()
 	}
-	return &Postgres{pool: pool, cfg: cfg, searchPath: searchPath}, nil
+	return &Automation{pool: pool, cfg: cfg, searchPath: searchPath}, nil
 }
 
 // Close closes the connection pool.
-func (p *Postgres) Close() { p.pool.Close() }
+func (p *Automation) Close() { p.pool.Close() }
 
 // LeaseTTL returns the lease the store grants. Workers compare it with their
 // action timeout before they run.
-func (p *Postgres) LeaseTTL() time.Duration { return p.cfg.LeaseTTL }
+func (p *Automation) LeaseTTL() time.Duration { return p.cfg.LeaseTTL }
 
 // withTenant runs fn in a transaction whose session variable names the tenant.
 // Every automation table has FORCE ROW LEVEL SECURITY with a policy over that
 // variable, so a statement without this setting sees and writes no rows.
-func (p *Postgres) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx) error) error {
-	if err := validTenant(tenant); err != nil {
+func (p *Automation) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx) error) error {
+	if err := ValidTenant(tenant); err != nil {
 		return err
 	}
 	tx, err := p.pool.Begin(ctx)
@@ -109,9 +110,8 @@ func (p *Postgres) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx
 	return tx.Commit(ctx)
 }
 
-type scanner interface {
-	Scan(dest ...any) error
-}
+// scanner is what a row and a row set share. It is defined once for every
+// PostgreSQL implementation in this package.
 
 const watcherColumns = `tenant_id, watcher_id, channel, filter, action, bot_id, enabled, cursor_seq, cursor_set, created_at, updated_at`
 
@@ -167,8 +167,8 @@ func scanWatcher(row scanner) (Watcher, error) {
 }
 
 // CreateWatcher implements Store.
-func (p *Postgres) CreateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
-	watcher = normalizeWatcher(watcher)
+func (p *Automation) CreateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
+	watcher = NormalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -202,7 +202,7 @@ func (p *Postgres) CreateWatcher(ctx context.Context, watcher Watcher) (Watcher,
 }
 
 // Watcher implements Store.
-func (p *Postgres) Watcher(ctx context.Context, tenant, id string) (Watcher, bool, error) {
+func (p *Automation) Watcher(ctx context.Context, tenant, id string) (Watcher, bool, error) {
 	var stored Watcher
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var err error
@@ -221,7 +221,7 @@ func (p *Postgres) Watcher(ctx context.Context, tenant, id string) (Watcher, boo
 }
 
 // Watchers implements Store.
-func (p *Postgres) Watchers(ctx context.Context, tenant string) ([]Watcher, error) {
+func (p *Automation) Watchers(ctx context.Context, tenant string) ([]Watcher, error) {
 	var out []Watcher
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -247,8 +247,8 @@ func (p *Postgres) Watchers(ctx context.Context, tenant string) ([]Watcher, erro
 }
 
 // UpdateWatcher implements Store.
-func (p *Postgres) UpdateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
-	watcher = normalizeWatcher(watcher)
+func (p *Automation) UpdateWatcher(ctx context.Context, watcher Watcher) (Watcher, error) {
+	watcher = NormalizeWatcher(watcher)
 	if err := watcher.Validate(); err != nil {
 		return Watcher{}, err
 	}
@@ -281,7 +281,7 @@ func (p *Postgres) UpdateWatcher(ctx context.Context, watcher Watcher) (Watcher,
 }
 
 // SetWatcherEnabled implements Store.
-func (p *Postgres) SetWatcherEnabled(ctx context.Context, tenant, id string, enabled bool, cursor *uint64) (Watcher, error) {
+func (p *Automation) SetWatcherEnabled(ctx context.Context, tenant, id string, enabled bool, cursor *uint64) (Watcher, error) {
 	var cursorValue *int64
 	if cursor != nil {
 		value := int64(*cursor)
@@ -310,7 +310,7 @@ func (p *Postgres) SetWatcherEnabled(ctx context.Context, tenant, id string, ena
 }
 
 // DeleteWatcher implements Store.
-func (p *Postgres) DeleteWatcher(ctx context.Context, tenant, id string) error {
+func (p *Automation) DeleteWatcher(ctx context.Context, tenant, id string) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			DELETE FROM board_watch_deliveries WHERE tenant_id = $1 AND watcher_id = $2`, tenant, id); err != nil {
@@ -329,7 +329,7 @@ func (p *Postgres) DeleteWatcher(ctx context.Context, tenant, id string) error {
 }
 
 // AdvanceWatcher implements Store.
-func (p *Postgres) AdvanceWatcher(ctx context.Context, tenant, id string, cursor uint64, events []uint64) (int, error) {
+func (p *Automation) AdvanceWatcher(ctx context.Context, tenant, id string, cursor uint64, events []uint64) (int, error) {
 	added := 0
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var current int64
@@ -388,11 +388,11 @@ func (p *Postgres) AdvanceWatcher(ctx context.Context, tenant, id string, cursor
 	return added, nil
 }
 
-// deliveryColumns selects a delivery without its lease credential.
-const deliveryColumns = `tenant_id, watcher_id, event_seq, state, attempts, next_at,
+// watchDeliveryColumns selects a delivery without its lease credential.
+const watchDeliveryColumns = `tenant_id, watcher_id, event_seq, state, attempts, next_at,
 	last_error, lease_owner, lease_token, lease_until, created_at, updated_at, completed_at`
 
-func scanDelivery(row scanner) (Delivery, error) {
+func scanWatchDelivery(row scanner) (Delivery, error) {
 	var (
 		delivery   Delivery
 		leaseUntil pgtype.Timestamptz
@@ -416,11 +416,11 @@ func scanDelivery(row scanner) (Delivery, error) {
 }
 
 // LeaseDeliveries implements Store.
-func (p *Postgres) LeaseDeliveries(ctx context.Context, tenant string, limit int, owner string) ([]Delivery, error) {
+func (p *Automation) LeaseDeliveries(ctx context.Context, tenant string, limit int, owner string) ([]Delivery, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	owner = leaseOwner(owner)
+	owner = LeaseOwner(owner)
 	out := make([]Delivery, 0, limit)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("watch-deliveries", tenant)); err != nil {
@@ -463,18 +463,18 @@ func (p *Postgres) LeaseDeliveries(ctx context.Context, tenant string, limit int
 			return err
 		}
 		for _, item := range heads {
-			token, err := newLeaseToken()
+			token, err := NewLeaseToken()
 			if err != nil {
 				return err
 			}
-			delivery, err := scanDelivery(tx.QueryRow(ctx, `
+			delivery, err := scanWatchDelivery(tx.QueryRow(ctx, `
 				UPDATE board_watch_deliveries
 				SET state = 'leased', lease_owner = $4, lease_token = $5,
 					lease_until = now() + make_interval(secs => $6), updated_at = now()
 				WHERE tenant_id = $1 AND watcher_id = $2 AND event_seq = $3
 					AND ((state = 'pending' AND next_at <= now())
 						OR (state = 'leased' AND lease_until <= now()))
-				RETURNING `+deliveryColumns,
+				RETURNING `+watchDeliveryColumns,
 				tenant, item.watcherID, item.eventSeq, owner, token, p.cfg.LeaseTTL.Seconds()))
 			if errors.Is(err, pgx.ErrNoRows) {
 				continue
@@ -494,7 +494,7 @@ func (p *Postgres) LeaseDeliveries(ctx context.Context, tenant string, limit int
 }
 
 // AckDelivery implements Store.
-func (p *Postgres) AckDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, jobErr error) (AckResult, error) {
+func (p *Automation) AckDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, jobErr error) (AckResult, error) {
 	var result AckResult
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var (
@@ -568,7 +568,7 @@ func (p *Postgres) AckDelivery(ctx context.Context, tenant, watcherID string, ev
 }
 
 // ReleaseDelivery implements Store.
-func (p *Postgres) ReleaseDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, delay time.Duration) error {
+func (p *Automation) ReleaseDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, delay time.Duration) error {
 	if delay < 0 {
 		delay = 0
 	}
@@ -591,7 +591,7 @@ func (p *Postgres) ReleaseDelivery(ctx context.Context, tenant, watcherID string
 }
 
 // RenewDelivery implements Store.
-func (p *Postgres) RenewDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, ttl time.Duration) error {
+func (p *Automation) RenewDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64, lease string, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = p.cfg.LeaseTTL
 	}
@@ -613,22 +613,22 @@ func (p *Postgres) RenewDelivery(ctx context.Context, tenant, watcherID string, 
 }
 
 // Deliveries implements Store.
-func (p *Postgres) Deliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
+func (p *Automation) Deliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
 	return p.listDeliveries(ctx, tenant, watcherID, "", limit)
 }
 
 // DeadDeliveries implements Store.
-func (p *Postgres) DeadDeliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
+func (p *Automation) DeadDeliveries(ctx context.Context, tenant, watcherID string, limit int) ([]Delivery, error) {
 	return p.listDeliveries(ctx, tenant, watcherID, StateDead, limit)
 }
 
-func (p *Postgres) listDeliveries(ctx context.Context, tenant, watcherID, state string, limit int) ([]Delivery, error) {
+func (p *Automation) listDeliveries(ctx context.Context, tenant, watcherID, state string, limit int) ([]Delivery, error) {
 	if limit <= 0 {
 		limit = 100
 	}
 	var out []Delivery
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
-		query := `SELECT ` + deliveryColumns + ` FROM board_watch_deliveries
+		query := `SELECT ` + watchDeliveryColumns + ` FROM board_watch_deliveries
 			WHERE tenant_id = $1 AND watcher_id = $2`
 		args := []any{tenant, watcherID}
 		if state != "" {
@@ -643,7 +643,7 @@ func (p *Postgres) listDeliveries(ctx context.Context, tenant, watcherID, state 
 		}
 		defer rows.Close()
 		for rows.Next() {
-			delivery, err := scanDelivery(rows)
+			delivery, err := scanWatchDelivery(rows)
 			if err != nil {
 				return err
 			}
@@ -658,7 +658,7 @@ func (p *Postgres) listDeliveries(ctx context.Context, tenant, watcherID, state 
 }
 
 // RetryDelivery implements Store.
-func (p *Postgres) RetryDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64) error {
+func (p *Automation) RetryDelivery(ctx context.Context, tenant, watcherID string, eventSeq uint64) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE board_watch_deliveries
@@ -677,7 +677,7 @@ func (p *Postgres) RetryDelivery(ctx context.Context, tenant, watcherID string, 
 }
 
 // ClearDeliveries implements Store.
-func (p *Postgres) ClearDeliveries(ctx context.Context, tenant, watcherID string) (int64, error) {
+func (p *Automation) ClearDeliveries(ctx context.Context, tenant, watcherID string) (int64, error) {
 	var removed int64
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var exists bool
@@ -705,7 +705,7 @@ func (p *Postgres) ClearDeliveries(ctx context.Context, tenant, watcherID string
 }
 
 // DeliveryDepth implements Store.
-func (p *Postgres) DeliveryDepth(ctx context.Context, tenant, watcherID string) (Depth, error) {
+func (p *Automation) DeliveryDepth(ctx context.Context, tenant, watcherID string) (Depth, error) {
 	var depth Depth
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
@@ -725,7 +725,7 @@ func (p *Postgres) DeliveryDepth(ctx context.Context, tenant, watcherID string) 
 }
 
 // WatcherStats implements StatsReader.
-func (p *Postgres) WatcherStats(ctx context.Context, tenant, watcherID string) (WatcherStats, error) {
+func (p *Automation) WatcherStats(ctx context.Context, tenant, watcherID string) (WatcherStats, error) {
 	var stats WatcherStats
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var last pgtype.Timestamptz
@@ -829,7 +829,7 @@ func marshalLabels(labels map[string]string) ([]byte, error) {
 }
 
 // CreateSchedule implements Store.
-func (p *Postgres) CreateSchedule(ctx context.Context, schedule Schedule) (Schedule, error) {
+func (p *Automation) CreateSchedule(ctx context.Context, schedule Schedule) (Schedule, error) {
 	if schedule.ID == "" {
 		id, err := NewScheduleID()
 		if err != nil {
@@ -919,7 +919,7 @@ func (p *Postgres) CreateSchedule(ctx context.Context, schedule Schedule) (Sched
 }
 
 // Schedule implements Store.
-func (p *Postgres) Schedule(ctx context.Context, tenant, id string) (Schedule, bool, error) {
+func (p *Automation) Schedule(ctx context.Context, tenant, id string) (Schedule, bool, error) {
 	var stored Schedule
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var err error
@@ -938,7 +938,7 @@ func (p *Postgres) Schedule(ctx context.Context, tenant, id string) (Schedule, b
 }
 
 // Schedules implements Store.
-func (p *Postgres) Schedules(ctx context.Context, tenant string) ([]Schedule, error) {
+func (p *Automation) Schedules(ctx context.Context, tenant string) ([]Schedule, error) {
 	var out []Schedule
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -964,7 +964,7 @@ func (p *Postgres) Schedules(ctx context.Context, tenant string) ([]Schedule, er
 }
 
 // UpdateSchedule implements Store.
-func (p *Postgres) UpdateSchedule(ctx context.Context, schedule Schedule) (Schedule, error) {
+func (p *Automation) UpdateSchedule(ctx context.Context, schedule Schedule) (Schedule, error) {
 	var stored Schedule
 	err := p.withTenant(ctx, schedule.Tenant, func(tx pgx.Tx) error {
 		current, err := scanSchedule(tx.QueryRow(ctx, `
@@ -977,13 +977,13 @@ func (p *Postgres) UpdateSchedule(ctx context.Context, schedule Schedule) (Sched
 		if err != nil {
 			return err
 		}
-		if schedule.ExpectedUpdatedAt != nil && !sameInstant(current.UpdatedAt, *schedule.ExpectedUpdatedAt) {
+		if schedule.ExpectedUpdatedAt != nil && !SameInstant(current.UpdatedAt, *schedule.ExpectedUpdatedAt) {
 			return ErrVersionConflict
 		}
 		if current.LeaseUntil.After(time.Now().UTC()) {
 			return ErrLeased
 		}
-		updated := cloneSchedule(schedule)
+		updated := CloneSchedule(schedule)
 		updated.Creator = current.Creator
 		updated.CreatorKind = current.CreatorKind
 		updated.CreatorVia = current.CreatorVia
@@ -1037,7 +1037,7 @@ func (p *Postgres) UpdateSchedule(ctx context.Context, schedule Schedule) (Sched
 }
 
 // SetScheduleEnabled implements Store.
-func (p *Postgres) SetScheduleEnabled(ctx context.Context, tenant, id string, enabled bool, now time.Time) (Schedule, error) {
+func (p *Automation) SetScheduleEnabled(ctx context.Context, tenant, id string, enabled bool, now time.Time) (Schedule, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1100,7 +1100,7 @@ func (p *Postgres) SetScheduleEnabled(ctx context.Context, tenant, id string, en
 }
 
 // DeleteSchedule implements Store.
-func (p *Postgres) DeleteSchedule(ctx context.Context, tenant, id string) error {
+func (p *Automation) DeleteSchedule(ctx context.Context, tenant, id string) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM board_schedules WHERE tenant_id = $1 AND schedule_id = $2`, tenant, id)
@@ -1115,11 +1115,11 @@ func (p *Postgres) DeleteSchedule(ctx context.Context, tenant, id string) error 
 }
 
 // LeaseSchedules implements Store.
-func (p *Postgres) LeaseSchedules(ctx context.Context, tenant string, limit int, owner string) ([]Schedule, error) {
+func (p *Automation) LeaseSchedules(ctx context.Context, tenant string, limit int, owner string) ([]Schedule, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	owner = leaseOwner(owner)
+	owner = LeaseOwner(owner)
 	out := make([]Schedule, 0, limit)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, advisoryLockKey("watch-schedules", tenant)); err != nil {
@@ -1148,7 +1148,7 @@ func (p *Postgres) LeaseSchedules(ctx context.Context, tenant string, limit int,
 			return err
 		}
 		for _, id := range ids {
-			token, err := newLeaseToken()
+			token, err := NewLeaseToken()
 			if err != nil {
 				return err
 			}
@@ -1179,7 +1179,7 @@ func (p *Postgres) LeaseSchedules(ctx context.Context, tenant string, limit int,
 }
 
 // AckSchedule implements Store.
-func (p *Postgres) AckSchedule(ctx context.Context, tenant, id, lease string, result ScheduleResult) (Schedule, error) {
+func (p *Automation) AckSchedule(ctx context.Context, tenant, id, lease string, result ScheduleResult) (Schedule, error) {
 	var stored Schedule
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		schedule, err := scanSchedule(tx.QueryRow(ctx, `
@@ -1267,7 +1267,7 @@ func (p *Postgres) AckSchedule(ctx context.Context, tenant, id, lease string, re
 }
 
 // ReleaseSchedule implements Store.
-func (p *Postgres) ReleaseSchedule(ctx context.Context, tenant, id, lease string, delay time.Duration) error {
+func (p *Automation) ReleaseSchedule(ctx context.Context, tenant, id, lease string, delay time.Duration) error {
 	if delay < 0 {
 		delay = 0
 	}
@@ -1291,7 +1291,7 @@ func (p *Postgres) ReleaseSchedule(ctx context.Context, tenant, id, lease string
 }
 
 // RetrySchedule implements Store.
-func (p *Postgres) RetrySchedule(ctx context.Context, tenant, id string) error {
+func (p *Automation) RetrySchedule(ctx context.Context, tenant, id string) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var status string
 		var leaseLive bool
@@ -1321,7 +1321,7 @@ func (p *Postgres) RetrySchedule(ctx context.Context, tenant, id string) error {
 }
 
 // ClearSchedule implements Store.
-func (p *Postgres) ClearSchedule(ctx context.Context, tenant, id string) error {
+func (p *Automation) ClearSchedule(ctx context.Context, tenant, id string) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		var status string
 		err := tx.QueryRow(ctx, `
@@ -1360,4 +1360,4 @@ func advisoryLockKey(parts ...string) int64 {
 	return int64(hash.Sum64())
 }
 
-var _ Store = (*Postgres)(nil)
+var _ Store = (*Automation)(nil)

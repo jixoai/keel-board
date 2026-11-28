@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jixoai/keel-board/pgadapter"
 	"github.com/jixoai/keel-board/server"
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/sync/chatsdk"
@@ -354,7 +355,7 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 		}
 		store, closeStore = memory, func() {}
 	} else {
-		postgres, err := syncstore.OpenPostgres(ctx, syncstore.PostgresOptions{
+		postgres, err := pgadapter.OpenSync(ctx, pgadapter.SyncOptions{
 			DSN: dsn, SearchPath: strings.TrimSpace(flags.schema),
 		})
 		if err != nil {

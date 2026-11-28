@@ -1,32 +1,26 @@
-package store
+package pglogstore
 
 import (
 	"context"
-	"embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"io/fs"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/jixoai/keel-board/pgadapter/schema"
+	. "github.com/jixoai/keel-board/store"
 )
 
-//go:embed migrations/*.sql
-var migrations embed.FS
+// waitPoll is how often Wait checks the head for a write another process made.
+// It is a poller, never a lock: a writer is never blocked by it.
+const waitPoll = 50 * time.Millisecond
 
-const (
-	// WaitPoll is how often Wait checks the head for a write another process
-	// made. It is a poller, never a lock: a writer is never blocked by it.
-	WaitPoll = 50 * time.Millisecond
-)
-
-// PostgresOptions configure a PostgreSQL-backed log.
-type PostgresOptions struct {
+// LogOptions configure a PostgreSQL-backed log.
+type LogOptions struct {
 	// DSN is the database. It is required.
 	DSN string
 	// SearchPath, when set, confines the store's tables to one schema. It is
@@ -35,22 +29,22 @@ type PostgresOptions struct {
 	SearchPath string
 }
 
-// Postgres is a PostgreSQL-backed EventStore. A board's whole log is one
+// LogStore is a PostgreSQL-backed EventStore. A board's whole log is one
 // transaction away: Append takes the tenant's head row, checks it against the
 // caller's expected head, writes the batch and its idempotency row, and
 // commits; a failure rolls all of it back.
-type Postgres struct {
+type LogStore struct {
 	pool *pgxpool.Pool
 }
 
 // Open connects to dsn and applies the log's schema.
-func Open(ctx context.Context, dsn string) (*Postgres, error) {
-	return OpenPostgres(ctx, PostgresOptions{DSN: dsn})
+func OpenLogDSN(ctx context.Context, dsn string) (*LogStore, error) {
+	return OpenLog(ctx, LogOptions{DSN: dsn})
 }
 
-// OpenPostgres connects with opts and applies the log's schema. The schema's
+// OpenLog connects with opts and applies the log's schema. The schema's
 // statements are idempotent, so opening an already-migrated database is safe.
-func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) {
+func OpenLog(ctx context.Context, opts LogOptions) (*LogStore, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("store: a PostgreSQL DSN is required")
 	}
@@ -69,8 +63,8 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, fmt.Errorf("store: connecting to PostgreSQL: %w", err)
 	}
-	postgres := &Postgres{pool: pool}
-	if err := postgres.migrate(ctx); err != nil {
+	postgres := &LogStore{pool: pool}
+	if err := pgschema.ApplyAll(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -78,124 +72,8 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 }
 
 // Close closes the connection pool.
-func (p *Postgres) Close() {
+func (p *LogStore) Close() {
 	p.pool.Close()
-}
-
-// defaultMigrationLockID names the advisory lock when a connection has no
-// current schema.
-const defaultMigrationLockID int64 = 0x6b65656c5f626f61
-
-// migrationLockID names the advisory lock a process holds while it applies
-// migrations. It is derived from the current schema: two servers on the same
-// schema serialize, while test schemas (or tenants of one database confined by
-// search_path) migrate in parallel.
-func migrationLockID(schema string) int64 {
-	if schema == "" {
-		return defaultMigrationLockID
-	}
-	hash := fnv.New64a()
-	_, _ = hash.Write([]byte(schema))
-	return int64(hash.Sum64())
-}
-
-// AuditMigration is the migration that creates board_audit. It is the only
-// migration an audit-only database needs.
-const AuditMigration = "0009_audit.sql"
-
-// ApplyMigrations applies the embedded schema through pool. It is the same
-// run OpenPostgres performs, exported for a package that owns its own pool
-// (syncstore opens one for the sync tables). Migrations are idempotent, so
-// applying them twice changes nothing.
-func ApplyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	if pool == nil {
-		return errors.New("store: a PostgreSQL pool is required")
-	}
-	names, err := migrationNames()
-	if err != nil {
-		return err
-	}
-	return applyMigrations(ctx, pool, names)
-}
-
-// ApplyAuditMigration applies only the audit table's migration through pool.
-// An audit store may share a database with the board, or have its own: on its
-// own, this creates board_audit without requiring ownership of the board's or
-// sync's tables.
-func ApplyAuditMigration(ctx context.Context, pool *pgxpool.Pool) error {
-	if pool == nil {
-		return errors.New("store: a PostgreSQL pool is required")
-	}
-	return applyMigrations(ctx, pool, []string{AuditMigration})
-}
-
-// migrate applies every embedded migration, in name order. Each file is
-// idempotent, so a second open changes nothing.
-func (p *Postgres) migrate(ctx context.Context) error {
-	names, err := migrationNames()
-	if err != nil {
-		return err
-	}
-	return applyMigrations(ctx, p.pool, names)
-}
-
-// migrationNames lists the embedded migrations in apply order.
-func migrationNames() ([]string, error) {
-	entries, err := fs.ReadDir(migrations, "migrations")
-	if err != nil {
-		return nil, fmt.Errorf("store: reading migrations: %w", err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".sql") {
-			names = append(names, entry.Name())
-		}
-	}
-	sort.Strings(names)
-	return names, nil
-}
-
-// applyMigrations applies the named embedded migrations. One connection holds a
-// session advisory lock for the whole run; migrations each run in their own
-// transaction, so a failure leaves no half-migrated file.
-func applyMigrations(ctx context.Context, pool *pgxpool.Pool, names []string) error {
-	if len(names) == 0 {
-		return nil
-	}
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("store: reserving a migration connection: %w", err)
-	}
-	defer conn.Release()
-	var schema string
-	if err := conn.QueryRow(ctx, `SELECT COALESCE(current_schema(), '')`).Scan(&schema); err != nil {
-		return fmt.Errorf("store: reading the migration schema: %w", err)
-	}
-	lockID := migrationLockID(schema)
-	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
-		return fmt.Errorf("store: taking the migration lock: %w", err)
-	}
-	defer conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, lockID)
-	for _, name := range names {
-		statement, err := migrations.ReadFile("migrations/" + name)
-		if err != nil {
-			return fmt.Errorf("store: reading migration %s: %w", name, err)
-		}
-		// One transaction per file. Keep migrations transactional (no CREATE
-		// INDEX CONCURRENTLY).
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("store: starting migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx, string(statement)); err != nil {
-			tx.Rollback(ctx)
-			return fmt.Errorf("store: applying migration %s: %w", name, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("store: committing migration %s: %w", name, err)
-		}
-	}
-	return nil
 }
 
 // recordColumns is the projection every read shares. request_last and
@@ -212,12 +90,12 @@ const recordFrom = ` FROM board_events e
 	  ON r.tenant_id = e.tenant_id AND r.request_key = e.request_key`
 
 // Load implements EventStore.
-func (p *Postgres) Load(ctx context.Context, tenant string) ([]Record, error) {
+func (p *LogStore) Load(ctx context.Context, tenant string) ([]Record, error) {
 	return p.readRecords(ctx, tenant, 0, 0)
 }
 
 // History implements HistoryStore.
-func (p *Postgres) History(ctx context.Context, tenant string, after uint64, limit int) ([]Record, error) {
+func (p *LogStore) History(ctx context.Context, tenant string, after uint64, limit int) ([]Record, error) {
 	if limit <= 0 {
 		limit = HistoryDefaultLimit
 	}
@@ -226,7 +104,7 @@ func (p *Postgres) History(ctx context.Context, tenant string, after uint64, lim
 
 // readRecords reads a tenant's records after seq, at one repeatable-read
 // snapshot, so a batch and its request row are always seen together.
-func (p *Postgres) readRecords(ctx context.Context, tenant string, after uint64, limit int) ([]Record, error) {
+func (p *LogStore) readRecords(ctx context.Context, tenant string, after uint64, limit int) ([]Record, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{
 		IsoLevel:   pgx.RepeatableRead,
 		AccessMode: pgx.ReadOnly,
@@ -235,7 +113,7 @@ func (p *Postgres) readRecords(ctx context.Context, tenant string, after uint64,
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setLogTenant(ctx, tx, tenant); err != nil {
 		return nil, err
 	}
 
@@ -282,24 +160,24 @@ func (p *Postgres) readRecords(ctx context.Context, tenant string, after uint64,
 }
 
 // Append implements EventStore.
-func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, expectedHead uint64) (AppendResult, error) {
+func (p *LogStore) Append(ctx context.Context, tenant string, records []Record, expectedHead uint64) (AppendResult, error) {
 	if len(records) == 0 {
 		return AppendResult{}, nil
 	}
-	normalized, err := normalizeRecords(records)
+	normalized, err := NormalizeRecords(records)
 	if err != nil {
 		return AppendResult{}, err
 	}
 	records = normalized
-	key, digest := requestOf(records)
-	result := batchResultOf(records)
+	key, digest := RequestOf(records)
+	result := BatchResultOf(records)
 
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return AppendResult{}, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setLogTenant(ctx, tx, tenant); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -317,7 +195,7 @@ func (p *Postgres) Append(ctx context.Context, tenant string, records []Record, 
 			return AppendResult{Replayed: true, BatchResult: stored.result}, nil
 		}
 	}
-	if err := checkBatch(records, expectedHead); err != nil {
+	if err := CheckBatch(records, expectedHead); err != nil {
 		return AppendResult{}, err
 	}
 
@@ -489,13 +367,13 @@ func ensureEmptyLog(ctx context.Context, tx pgx.Tx, tenant string) error {
 
 // Integrity implements IntegrityStore in one statement, so the head row and
 // the log end are read at one snapshot.
-func (p *Postgres) Integrity(ctx context.Context, tenant string) (Integrity, error) {
+func (p *LogStore) Integrity(ctx context.Context, tenant string) (Integrity, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return Integrity{}, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setLogTenant(ctx, tx, tenant); err != nil {
 		return Integrity{}, err
 	}
 	var integrity Integrity
@@ -516,7 +394,7 @@ func (p *Postgres) Integrity(ctx context.Context, tenant string) (Integrity, err
 // tenant whose head row is missing is still offered to a rebuild. It is an
 // operator read: it is the one caller that sets the RLS bypass, because
 // listing every tenant is exactly what tenant isolation forbids a request.
-func (p *Postgres) Tenants(ctx context.Context) ([]string, error) {
+func (p *LogStore) Tenants(ctx context.Context) ([]string, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, err
@@ -552,13 +430,13 @@ func (p *Postgres) Tenants(ctx context.Context) ([]string, error) {
 }
 
 // Request implements RequestStore.
-func (p *Postgres) Request(ctx context.Context, tenant, key string) (Request, bool, error) {
+func (p *LogStore) Request(ctx context.Context, tenant, key string) (Request, bool, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return Request{}, false, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setLogTenant(ctx, tx, tenant); err != nil {
 		return Request{}, false, err
 	}
 	stored, found, err := requestInTx(ctx, tx, tenant, key)
@@ -606,13 +484,13 @@ func requestInTx(ctx context.Context, q queryer, tenant, key string) (storedRequ
 }
 
 // Head implements HeadStore with one indexed lookup on the tenant's head row.
-func (p *Postgres) Head(ctx context.Context, tenant string) (uint64, error) {
+func (p *LogStore) Head(ctx context.Context, tenant string) (uint64, error) {
 	tx, err := p.pool.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setLogTenant(ctx, tx, tenant); err != nil {
 		return 0, err
 	}
 	var head uint64
@@ -633,7 +511,7 @@ func (p *Postgres) Head(ctx context.Context, tenant string) (uint64, error) {
 // a FORCE RLS policy that reads keel.tenant_id, so a transaction that loses its
 // tenant predicate sees no rows instead of another tenant's. SET LOCAL keeps
 // the setting from following the connection back into the pool.
-func setTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
+func setLogTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', $1, true)`, tenant); err != nil {
 		return fmt.Errorf("store: setting tenant scope: %w", err)
 	}
@@ -642,8 +520,8 @@ func setTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 
 // Wait implements Waiter by polling the tenant's head. It holds no lock, so
 // writers never wait on a reader.
-func (p *Postgres) Wait(ctx context.Context, tenant string, after uint64) error {
-	ticker := time.NewTicker(WaitPoll)
+func (p *LogStore) Wait(ctx context.Context, tenant string, after uint64) error {
+	ticker := time.NewTicker(waitPoll)
 	defer ticker.Stop()
 	for {
 		head, err := p.Head(ctx, tenant)
@@ -662,11 +540,11 @@ func (p *Postgres) Wait(ctx context.Context, tenant string, after uint64) error 
 }
 
 var (
-	_ EventStore     = (*Postgres)(nil)
-	_ HistoryStore   = (*Postgres)(nil)
-	_ HeadStore      = (*Postgres)(nil)
-	_ Waiter         = (*Postgres)(nil)
-	_ RequestStore   = (*Postgres)(nil)
-	_ IntegrityStore = (*Postgres)(nil)
-	_ TenantStore    = (*Postgres)(nil)
+	_ EventStore     = (*LogStore)(nil)
+	_ HistoryStore   = (*LogStore)(nil)
+	_ HeadStore      = (*LogStore)(nil)
+	_ Waiter         = (*LogStore)(nil)
+	_ RequestStore   = (*LogStore)(nil)
+	_ IntegrityStore = (*LogStore)(nil)
+	_ TenantStore    = (*LogStore)(nil)
 )

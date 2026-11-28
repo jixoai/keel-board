@@ -3,6 +3,7 @@ package syncstore_test
 import (
 	"context"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -58,9 +59,9 @@ func newTestSchema(t *testing.T, dsn string) string {
 	return name
 }
 
-func openPostgres(t *testing.T, dsn, schema string, cfg syncstore.Config) *syncstore.Postgres {
+func openPostgres(t *testing.T, dsn, schema string, cfg syncstore.Config) *pgadapter.SyncStore {
 	t.Helper()
-	postgres, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	postgres, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,
 	})
 	if err != nil {

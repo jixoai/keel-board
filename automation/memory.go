@@ -29,7 +29,7 @@ type memoryTenant struct {
 
 // NewMemory returns an empty in-memory store.
 func NewMemory(cfg Config) (*Memory, error) {
-	checked, err := cfg.withDefaults()
+	checked, err := cfg.WithDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -964,6 +964,10 @@ func clearScheduleLease(schedule *Schedule) {
 	schedule.LeaseOwner = ""
 	schedule.LeaseUntil = time.Time{}
 }
+
+// NewLeaseToken returns an unguessable lease token. Storage adapters use it so
+// every dialect mints the same shape of ack credential.
+func NewLeaseToken() (string, error) { return newLeaseToken() }
 
 func newLeaseToken() (string, error) {
 	var raw [24]byte

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"io"
 	"log/slog"
 	"net/http"
@@ -72,9 +73,9 @@ func newTestSchema(t *testing.T, dsn string) string {
 }
 
 // openTestPostgres opens a store in the schema and closes it after the test.
-func openTestPostgres(t *testing.T, dsn, schema string) *store.Postgres {
+func openTestPostgres(t *testing.T, dsn, schema string) *pglogstore.LogStore {
 	t.Helper()
-	postgres, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: schema})
+	postgres, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("opening PostgreSQL store: %v", err)
 	}

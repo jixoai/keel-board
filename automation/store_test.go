@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter"
 	"os"
 	"strings"
 	"sync"
@@ -57,9 +58,9 @@ func newTestSchema(t *testing.T, dsn string) string {
 	return name
 }
 
-func openPostgres(t *testing.T, dsn, schema string, cfg automation.Config) *automation.Postgres {
+func openPostgres(t *testing.T, dsn, schema string, cfg automation.Config) *pgadapter.Automation {
 	t.Helper()
-	postgres, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
+	postgres, err := pgadapter.OpenAutomation(t.Context(), pgadapter.AutomationOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,
 	})
 	if err != nil {
@@ -113,14 +114,14 @@ func testSchedule(id string, next time.Time) automation.Schedule {
 func TestPostgresMigrationAndRLS(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	first, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
+	first, err := pgadapter.OpenAutomation(t.Context(), pgadapter.AutomationOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {
 		t.Fatalf("first open: %v", err)
 	}
 	first.Close()
-	second, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
+	second, err := pgadapter.OpenAutomation(t.Context(), pgadapter.AutomationOptions{
 		DSN: dsn, SearchPath: schema, Config: testConfig(),
 	})
 	if err != nil {
@@ -646,7 +647,7 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 	// assertions below while `go test -count=10` runs packages in parallel.
 	// A 150ms lease made the recovered ack itself flaky.
 	cfg.LeaseTTL = 2 * time.Second
-	first, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
+	first, err := pgadapter.OpenAutomation(t.Context(), pgadapter.AutomationOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,
 	})
 	if err != nil {
@@ -670,7 +671,7 @@ func TestPostgresRestartRecoversCursorAndLease(t *testing.T) {
 	first.Close()
 	time.Sleep(2500 * time.Millisecond)
 
-	second, err := automation.OpenPostgres(t.Context(), automation.PostgresOptions{
+	second, err := pgadapter.OpenAutomation(t.Context(), pgadapter.AutomationOptions{
 		DSN: dsn, SearchPath: schema, Config: cfg,
 	})
 	if err != nil {

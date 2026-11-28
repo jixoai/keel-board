@@ -151,6 +151,11 @@ func validTenant(tenant string) error {
 	return nil
 }
 
+// ValidTenant reports whether tenant is usable as a tenant namespace. Storage
+// adapters call it before scoping a transaction, so validation stays in the
+// domain instead of being reimplemented per dialect.
+func ValidTenant(tenant string) error { return validTenant(tenant) }
+
 // validToken accepts an identifier-like token: letters, digits, '.', '_', '-',
 // ':' and '/', starting with a letter. It refuses whitespace, quotes, and
 // anything long enough to be opaque content.
@@ -273,6 +278,11 @@ func validDetailValue(value any) bool {
 		return false
 	}
 }
+
+// Prepare normalizes an event before it is stored: fills the time, copies the
+// detail, and validates. Storage adapters call it so normalization and
+// validation stay in the domain.
+func Prepare(event Event) (Event, error) { return prepare(event) }
 
 // prepare normalizes an event before it is stored: fills the time, copies the
 // detail, and validates.

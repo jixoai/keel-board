@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -65,7 +66,7 @@ func newBridgeSchema(t *testing.T, dsn string) string {
 func TestBridgeEventsPostgres(t *testing.T) {
 	dsn := bridgePGDSN(t)
 	schema := newBridgeSchema(t, dsn)
-	store, err := syncstore.OpenPostgres(t.Context(), syncstore.PostgresOptions{
+	store, err := pgadapter.OpenSync(t.Context(), pgadapter.SyncOptions{
 		DSN: dsn, SearchPath: schema,
 	})
 	if err != nil {

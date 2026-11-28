@@ -1,10 +1,11 @@
-package syncstore
+package pgadapter
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/schema"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,12 +15,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jixoai/keel-board/store"
+
 	boardsync "github.com/jixoai/keel-board/sync"
+	. "github.com/jixoai/keel-board/syncstore"
 )
 
-// PostgresOptions configure a PostgreSQL sync store.
-type PostgresOptions struct {
+// SyncOptions configure a PostgreSQL sync store.
+type SyncOptions struct {
 	// DSN is the database. It is required.
 	DSN string
 	// SearchPath confines every sync table to one schema. Tests use it for
@@ -29,11 +31,11 @@ type PostgresOptions struct {
 	Config Config
 }
 
-// Postgres is a PostgreSQL-backed Store. Each lease is one transaction that
+// SyncStore is a PostgreSQL-backed Store. Each lease is one transaction that
 // takes an advisory lock for its tenant and lane kind, so two workers can't
 // hand out the same row, while different tenants and keys proceed in
 // parallel. Every statement carries the tenant predicate.
-type Postgres struct {
+type SyncStore struct {
 	pool *pgxpool.Pool
 	cfg  Config
 	// searchPath is set transaction-locally as well as on connections, so a
@@ -45,14 +47,14 @@ type Postgres struct {
 	connConfig *pgx.ConnConfig
 }
 
-// OpenPostgres connects with opts, applies the board and sync schema, and
+// OpenSync connects with opts, applies the board and sync schema, and
 // returns a store. The schema is idempotent, so opening a migrated database
 // again changes nothing.
-func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) {
+func OpenSync(ctx context.Context, opts SyncOptions) (*SyncStore, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("syncstore: a PostgreSQL DSN is required")
 	}
-	cfg, err := opts.Config.withDefaults()
+	cfg, err := opts.Config.WithDefaults()
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +73,7 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, fmt.Errorf("syncstore: connecting to PostgreSQL: %w", err)
 	}
-	if err := store.ApplyMigrations(ctx, pool); err != nil {
+	if err := pgschema.ApplyAll(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -79,14 +81,14 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 	if opts.SearchPath != "" {
 		searchPath = pgx.Identifier{opts.SearchPath}.Sanitize()
 	}
-	return &Postgres{
+	return &SyncStore{
 		pool: pool, cfg: cfg, searchPath: searchPath,
 		connConfig: config.ConnConfig.Copy(),
 	}, nil
 }
 
 // Close closes the connection pool.
-func (p *Postgres) Close() {
+func (p *SyncStore) Close() {
 	p.pool.Close()
 }
 
@@ -95,8 +97,8 @@ func (p *Postgres) Close() {
 // variable, so a statement without this setting sees and writes no rows. The
 // variable is transaction-local, so a pooled connection never carries one
 // tenant's identity into another's work.
-func (p *Postgres) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx) error) error {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) withTenant(ctx context.Context, tenant string, fn func(pgx.Tx) error) error {
+	if err := ValidTenant(tenant); err != nil {
 		return err
 	}
 	tx, err := p.pool.Begin(ctx)
@@ -132,7 +134,7 @@ func scanEntry(row scanner) (Entry, error) {
 }
 
 // UpsertEntry implements Store.
-func (p *Postgres) UpsertEntry(ctx context.Context, entry Entry) (Entry, error) {
+func (p *SyncStore) UpsertEntry(ctx context.Context, entry Entry) (Entry, error) {
 	if err := entry.Validate(); err != nil {
 		return Entry{}, err
 	}
@@ -155,8 +157,8 @@ func (p *Postgres) UpsertEntry(ctx context.Context, entry Entry) (Entry, error) 
 }
 
 // Entry implements Store.
-func (p *Postgres) Entry(ctx context.Context, tenant string, key boardsync.Key) (Entry, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) Entry(ctx context.Context, tenant string, key boardsync.Key) (Entry, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return Entry{}, false, err
 	}
 	var entry Entry
@@ -177,7 +179,7 @@ func (p *Postgres) Entry(ctx context.Context, tenant string, key boardsync.Key) 
 }
 
 // Entries implements Store.
-func (p *Postgres) Entries(ctx context.Context, tenant string) ([]Entry, error) {
+func (p *SyncStore) Entries(ctx context.Context, tenant string) ([]Entry, error) {
 	entries := make([]Entry, 0)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -203,8 +205,8 @@ func (p *Postgres) Entries(ctx context.Context, tenant string) ([]Entry, error) 
 }
 
 // SetEntryEnabled implements Store.
-func (p *Postgres) SetEntryEnabled(ctx context.Context, tenant string, key boardsync.Key, enabled bool) (bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) SetEntryEnabled(ctx context.Context, tenant string, key boardsync.Key, enabled bool) (bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return false, err
 	}
 	var changed bool
@@ -250,8 +252,8 @@ func scanInboxItem(row scanner) (boardsync.InboxItem, string, error) {
 }
 
 // PushInbox implements Store.
-func (p *Postgres) PushInbox(ctx context.Context, tenant string, key boardsync.Key, records []boardsync.Record) (InboxPush, error) {
-	prepared, err := prepareRecords(key, records)
+func (p *SyncStore) PushInbox(ctx context.Context, tenant string, key boardsync.Key, records []boardsync.Record) (InboxPush, error) {
+	prepared, err := PrepareRecords(key, records)
 	if err != nil {
 		return InboxPush{}, err
 	}
@@ -291,14 +293,14 @@ func (p *Postgres) PushInbox(ctx context.Context, tenant string, key boardsync.K
 }
 
 // LeaseInbox implements Store.
-func (p *Postgres) LeaseInbox(ctx context.Context, tenant string, key boardsync.Key, limit int, owner string) ([]boardsync.InboxItem, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) LeaseInbox(ctx context.Context, tenant string, key boardsync.Key, limit int, owner string) ([]boardsync.InboxItem, error) {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
 		limit = 10
 	}
-	owner = leaseOwner(owner)
+	owner = LeaseOwner(owner)
 	out := make([]boardsync.InboxItem, 0, limit)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`,
@@ -335,7 +337,7 @@ func (p *Postgres) LeaseInbox(ctx context.Context, tenant string, key boardsync.
 			return err
 		}
 		for _, seq := range seqs {
-			token, err := newLeaseToken()
+			token, err := NewLeaseToken()
 			if err != nil {
 				return err
 			}
@@ -368,8 +370,8 @@ func (p *Postgres) LeaseInbox(ctx context.Context, tenant string, key boardsync.
 }
 
 // AckInbox implements Store.
-func (p *Postgres) AckInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, jobErr error) (AckResult, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) AckInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, jobErr error) (AckResult, error) {
+	if err := ExpectKey(key); err != nil {
 		return AckResult{}, err
 	}
 	var result AckResult
@@ -444,8 +446,8 @@ func (p *Postgres) AckInbox(ctx context.Context, tenant string, key boardsync.Ke
 }
 
 // ReleaseInbox implements Store.
-func (p *Postgres) ReleaseInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, delay time.Duration) error {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) ReleaseInbox(ctx context.Context, tenant string, key boardsync.Key, id, lease string, delay time.Duration) error {
+	if err := ExpectKey(key); err != nil {
 		return err
 	}
 	if delay < 0 {
@@ -470,11 +472,11 @@ func (p *Postgres) ReleaseInbox(ctx context.Context, tenant string, key boardsyn
 }
 
 // DeadInbox implements Store.
-func (p *Postgres) DeadInbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]boardsync.InboxItem, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) DeadInbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]boardsync.InboxItem, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return nil, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -508,8 +510,8 @@ func (p *Postgres) DeadInbox(ctx context.Context, tenant string, key boardsync.K
 }
 
 // RetryInbox implements Store.
-func (p *Postgres) RetryInbox(ctx context.Context, tenant string, key boardsync.Key, id string) error {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) RetryInbox(ctx context.Context, tenant string, key boardsync.Key, id string) error {
+	if err := ExpectKey(key); err != nil {
 		return err
 	}
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
@@ -531,8 +533,8 @@ func (p *Postgres) RetryInbox(ctx context.Context, tenant string, key boardsync.
 }
 
 // InboxDepth implements Store.
-func (p *Postgres) InboxDepth(ctx context.Context, tenant string, key boardsync.Key) (InboxDepth, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) InboxDepth(ctx context.Context, tenant string, key boardsync.Key) (InboxDepth, error) {
+	if err := ExpectKey(key); err != nil {
 		return InboxDepth{}, err
 	}
 	var depth InboxDepth
@@ -553,8 +555,8 @@ func (p *Postgres) InboxDepth(ctx context.Context, tenant string, key boardsync.
 }
 
 // EnqueueOutbox implements Store.
-func (p *Postgres) EnqueueOutbox(ctx context.Context, tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) (EnqueueResult, error) {
-	jobs, err := prepareOutbox(tenant, key, event, message, targets)
+func (p *SyncStore) EnqueueOutbox(ctx context.Context, tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) (EnqueueResult, error) {
+	jobs, err := PrepareOutbox(tenant, key, event, message, targets)
 	if err != nil {
 		return EnqueueResult{}, err
 	}
@@ -564,15 +566,15 @@ func (p *Postgres) EnqueueOutbox(ctx context.Context, tenant string, key boardsy
 	added := 0
 	err = p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		for _, job := range jobs {
-			eventJSON, err := json.Marshal(job.event)
+			eventJSON, err := json.Marshal(job.Event)
 			if err != nil {
-				return fmt.Errorf("%w: board event %d can't be queued", boardsync.ErrBadRequest, job.event.ID)
+				return fmt.Errorf("%w: board event %d can't be queued", boardsync.ErrBadRequest, job.Event.ID)
 			}
-			messageJSON, err := json.Marshal(job.message)
+			messageJSON, err := json.Marshal(job.Message)
 			if err != nil {
-				return fmt.Errorf("%w: board message %d can't be queued", boardsync.ErrBadRequest, job.message.ID)
+				return fmt.Errorf("%w: board message %d can't be queued", boardsync.ErrBadRequest, job.Message.ID)
 			}
-			targetJSON, err := json.Marshal(job.target)
+			targetJSON, err := json.Marshal(job.Target)
 			if err != nil {
 				return fmt.Errorf("%w: target can't be queued", boardsync.ErrBadRequest)
 			}
@@ -582,8 +584,8 @@ func (p *Postgres) EnqueueOutbox(ctx context.Context, tenant string, key boardsy
 					 board_thread, board_message, target_key, target, event, message)
 				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 				ON CONFLICT (tenant_id, delivery_id) DO NOTHING`,
-				tenant, job.id, job.lane, job.key, job.event.ID, job.event.Type,
-				job.event.Thread, job.message.ID, job.targetKey, targetJSON, eventJSON, messageJSON)
+				tenant, job.ID, job.Lane, job.Key, job.Event.ID, job.Event.Type,
+				job.Event.Thread, job.Message.ID, job.TargetKey, targetJSON, eventJSON, messageJSON)
 			if err != nil {
 				return err
 			}
@@ -597,10 +599,10 @@ func (p *Postgres) EnqueueOutbox(ctx context.Context, tenant string, key boardsy
 	return EnqueueResult{Added: added, Skipped: len(targets) - added}, nil
 }
 
-const deliveryColumns = `id, delivery_id, lane, sync_key, event, message, target,
+const syncDeliveryColumns = `id, delivery_id, lane, sync_key, event, message, target,
 	attempts, state, available_at, lease_token, last_error, created_at`
 
-func scanDelivery(row scanner) (Delivery, string, string, error) {
+func scanSyncDelivery(row scanner) (Delivery, string, string, error) {
 	var (
 		rowID      int64
 		delivery   Delivery
@@ -627,13 +629,13 @@ func scanDelivery(row scanner) (Delivery, string, string, error) {
 		return Delivery{}, "", "", fmt.Errorf("syncstore: decoding delivery %q target: %w", delivery.ID, err)
 	}
 	delivery.Lease = leaseToken
-	targetKey = targetKeyOf(delivery.Target)
+	targetKey = TargetKeyOf(delivery.Target)
 	return delivery, delivery.Lane, targetKey, nil
 }
 
 // LeaseOutbox implements Store.
-func (p *Postgres) LeaseOutbox(ctx context.Context, tenant string, keys []boardsync.Key, limit int, owner string) ([]Delivery, error) {
-	owned, err := ownedKeys(keys)
+func (p *SyncStore) LeaseOutbox(ctx context.Context, tenant string, keys []boardsync.Key, limit int, owner string) ([]Delivery, error) {
+	owned, err := OwnedKeys(keys)
 	if err != nil {
 		return nil, err
 	}
@@ -647,7 +649,7 @@ func (p *Postgres) LeaseOutbox(ctx context.Context, tenant string, keys []boards
 	if limit <= 0 {
 		limit = 10
 	}
-	owner = leaseOwner(owner)
+	owner = LeaseOwner(owner)
 	out := make([]Delivery, 0, limit)
 	err = p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`,
@@ -687,16 +689,16 @@ func (p *Postgres) LeaseOutbox(ctx context.Context, tenant string, keys []boards
 			return err
 		}
 		for _, id := range ids {
-			token, err := newLeaseToken()
+			token, err := NewLeaseToken()
 			if err != nil {
 				return err
 			}
-			delivery, _, _, err := scanDelivery(tx.QueryRow(ctx, `
+			delivery, _, _, err := scanSyncDelivery(tx.QueryRow(ctx, `
 				UPDATE board_sync_outbox
 				SET state = 'leased', lease_owner = $3, lease_token = $4,
 					lease_until = now() + make_interval(secs => $5), updated_at = now()
 				WHERE tenant_id = $1 AND id = $2 AND state IN ('pending', 'leased')
-				RETURNING `+deliveryColumns,
+				RETURNING `+syncDeliveryColumns,
 				tenant, id, owner, token, p.cfg.LeaseTTL.Seconds()))
 			if errors.Is(err, pgx.ErrNoRows) {
 				continue
@@ -717,8 +719,8 @@ func (p *Postgres) LeaseOutbox(ctx context.Context, tenant string, keys []boards
 }
 
 // AckOutbox implements Store.
-func (p *Postgres) AckOutbox(ctx context.Context, tenant, deliveryID, lease string, jobErr error, copy *Copy) (AckResult, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) AckOutbox(ctx context.Context, tenant, deliveryID, lease string, jobErr error, copy *Copy) (AckResult, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return AckResult{}, err
 	}
 	if deliveryID == "" || lease == "" {
@@ -783,7 +785,7 @@ func (p *Postgres) AckOutbox(ctx context.Context, tenant, deliveryID, lease stri
 				if copy.BoardThread != uint64(boardThread) || copy.BoardMessage != uint64(boardMessage) {
 					return fmt.Errorf("%w: a copy's board message isn't the delivery's", boardsync.ErrBadRequest)
 				}
-				copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
+				copy.ID = CopyIDOf(copy.Key, copy.Target, copy.BoardMessage)
 				_, err = tx.Exec(ctx, `
 					INSERT INTO board_sync_copies
 						(tenant_id, id, board_message, board_thread, sync_key, platform,
@@ -799,7 +801,7 @@ func (p *Postgres) AckOutbox(ctx context.Context, tenant, deliveryID, lease stri
 					tenant, copy.ID, copy.BoardMessage, copy.BoardThread, copy.Key,
 					copy.Target.Platform, copy.Target.Channel, copy.Target.Thread,
 					copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage,
-					nonNilFiles(copy.Files), copy.FilesSet)
+					NonNilFiles(copy.Files), copy.FilesSet)
 				if err != nil {
 					return err
 				}
@@ -851,7 +853,7 @@ func (p *Postgres) AckOutbox(ctx context.Context, tenant, deliveryID, lease stri
 }
 
 // ReleaseOutbox implements Store.
-func (p *Postgres) ReleaseOutbox(ctx context.Context, tenant, deliveryID, lease string, delay time.Duration) error {
+func (p *SyncStore) ReleaseOutbox(ctx context.Context, tenant, deliveryID, lease string, delay time.Duration) error {
 	if deliveryID == "" || lease == "" {
 		return fmt.Errorf("%w: a release needs a delivery and a lease", boardsync.ErrBadRequest)
 	}
@@ -877,16 +879,16 @@ func (p *Postgres) ReleaseOutbox(ctx context.Context, tenant, deliveryID, lease 
 }
 
 // DeadOutbox implements Store.
-func (p *Postgres) DeadOutbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
+func (p *SyncStore) DeadOutbox(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
 	if key != "" {
-		if err := expectKey(key); err != nil {
+		if err := ExpectKey(key); err != nil {
 			return nil, err
 		}
 	}
 	if limit <= 0 {
 		limit = 100
 	}
-	query := `SELECT ` + deliveryColumns + ` FROM board_sync_outbox
+	query := `SELECT ` + syncDeliveryColumns + ` FROM board_sync_outbox
 		WHERE tenant_id = $1 AND state = 'dead'`
 	arguments := []any{tenant}
 	if key != "" {
@@ -903,7 +905,7 @@ func (p *Postgres) DeadOutbox(ctx context.Context, tenant string, key boardsync.
 		}
 		defer rows.Close()
 		for rows.Next() {
-			delivery, _, _, err := scanDelivery(rows)
+			delivery, _, _, err := scanSyncDelivery(rows)
 			if err != nil {
 				return err
 			}
@@ -919,7 +921,7 @@ func (p *Postgres) DeadOutbox(ctx context.Context, tenant string, key boardsync.
 }
 
 // RetryOutbox implements Store.
-func (p *Postgres) RetryOutbox(ctx context.Context, tenant, deliveryID string) error {
+func (p *SyncStore) RetryOutbox(ctx context.Context, tenant, deliveryID string) error {
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 			UPDATE board_sync_outbox
@@ -938,7 +940,7 @@ func (p *Postgres) RetryOutbox(ctx context.Context, tenant, deliveryID string) e
 }
 
 // OutboxDepth implements Store.
-func (p *Postgres) OutboxDepth(ctx context.Context, tenant string) (OutboxDepth, error) {
+func (p *SyncStore) OutboxDepth(ctx context.Context, tenant string) (OutboxDepth, error) {
 	var depth OutboxDepth
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		return tx.QueryRow(ctx, `
@@ -957,7 +959,7 @@ func (p *Postgres) OutboxDepth(ctx context.Context, tenant string) (OutboxDepth,
 }
 
 // OutboxDepthByKey implements KeyOutboxDepth.
-func (p *Postgres) OutboxDepthByKey(ctx context.Context, tenant string) (map[boardsync.Key]OutboxDepth, error) {
+func (p *SyncStore) OutboxDepthByKey(ctx context.Context, tenant string) (map[boardsync.Key]OutboxDepth, error) {
 	out := make(map[boardsync.Key]OutboxDepth)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -998,11 +1000,11 @@ func (p *Postgres) OutboxDepthByKey(ctx context.Context, tenant string) (map[boa
 }
 
 // OutboxDepthFor implements Store.
-func (p *Postgres) OutboxDepthFor(ctx context.Context, tenant string, key boardsync.Key) (OutboxDepth, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) OutboxDepthFor(ctx context.Context, tenant string, key boardsync.Key) (OutboxDepth, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return OutboxDepth{}, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return OutboxDepth{}, err
 	}
 	var depth OutboxDepth
@@ -1050,8 +1052,8 @@ func scanCopy(row scanner) (Copy, error) {
 }
 
 // Copy implements Store.
-func (p *Postgres) Copy(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) Copy(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) (Copy, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return Copy{}, false, err
 	}
 	if err := target.Validate(); err != nil {
@@ -1065,7 +1067,7 @@ func (p *Postgres) Copy(ctx context.Context, tenant string, key boardsync.Key, t
 		var err error
 		copy, err = scanCopy(tx.QueryRow(ctx, `
 			SELECT `+copyColumns+` FROM board_sync_copies
-			WHERE tenant_id = $1 AND id = $2`, tenant, copyIDOf(key, target, boardMessage)))
+			WHERE tenant_id = $1 AND id = $2`, tenant, CopyIDOf(key, target, boardMessage)))
 		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1078,8 +1080,8 @@ func (p *Postgres) Copy(ctx context.Context, tenant string, key boardsync.Key, t
 }
 
 // CopyForMessage implements Store.
-func (p *Postgres) CopyForMessage(ctx context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) CopyForMessage(ctx context.Context, tenant string, key boardsync.Key, boardMessage uint64) ([]Copy, error) {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	out := make([]Copy, 0, 2)
@@ -1108,8 +1110,8 @@ func (p *Postgres) CopyForMessage(ctx context.Context, tenant string, key boards
 }
 
 // CopyByExternal implements Store.
-func (p *Postgres) CopyByExternal(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, externalMessage string) (Copy, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) CopyByExternal(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget, externalMessage string) (Copy, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return Copy{}, false, err
 	}
 	if err := target.Validate(); err != nil {
@@ -1144,8 +1146,8 @@ func (p *Postgres) CopyByExternal(ctx context.Context, tenant string, key boards
 }
 
 // CopyByExternalMessage implements Store.
-func (p *Postgres) CopyByExternalMessage(ctx context.Context, tenant string, key boardsync.Key, externalMessage string) (Copy, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) CopyByExternalMessage(ctx context.Context, tenant string, key boardsync.Key, externalMessage string) (Copy, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return Copy{}, false, err
 	}
 	if externalMessage == "" || len(externalMessage) > 1200 {
@@ -1184,11 +1186,11 @@ func (p *Postgres) CopyByExternalMessage(ctx context.Context, tenant string, key
 }
 
 // SaveCopy implements Store.
-func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error) {
+func (p *SyncStore) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy, error) {
 	if err := copy.Validate(); err != nil {
 		return Copy{}, err
 	}
-	copy.ID = copyIDOf(copy.Key, copy.Target, copy.BoardMessage)
+	copy.ID = CopyIDOf(copy.Key, copy.Target, copy.BoardMessage)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, `
 			INSERT INTO board_sync_copies
@@ -1205,7 +1207,7 @@ func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy
 			tenant, copy.ID, copy.BoardMessage, copy.BoardThread, copy.Key,
 			copy.Target.Platform, copy.Target.Channel, copy.Target.Thread,
 			copy.Target.Subthread, copy.Target.Kind, copy.ExternalThread, copy.ExternalMessage,
-			nonNilFiles(copy.Files), copy.FilesSet)
+			NonNilFiles(copy.Files), copy.FilesSet)
 		return err
 	})
 	if err != nil {
@@ -1215,7 +1217,7 @@ func (p *Postgres) SaveCopy(ctx context.Context, tenant string, copy Copy) (Copy
 }
 
 // RemoveCopy implements Store.
-func (p *Postgres) RemoveCopy(ctx context.Context, tenant, id string) error {
+func (p *SyncStore) RemoveCopy(ctx context.Context, tenant, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: a copy removal needs an ID", boardsync.ErrBadRequest)
 	}
@@ -1226,8 +1228,8 @@ func (p *Postgres) RemoveCopy(ctx context.Context, tenant, id string) error {
 }
 
 // TargetFailures implements Store.
-func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) TargetFailures(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]Delivery, error) {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -1236,7 +1238,7 @@ func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boards
 	out := make([]Delivery, 0)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
-			SELECT `+deliveryColumns+` FROM board_sync_outbox
+			SELECT `+syncDeliveryColumns+` FROM board_sync_outbox
 			WHERE tenant_id = $1 AND sync_key = $2
 				AND state = 'dead' AND cleared_at IS NULL
 			ORDER BY id LIMIT $3`, tenant, key, limit)
@@ -1245,7 +1247,7 @@ func (p *Postgres) TargetFailures(ctx context.Context, tenant string, key boards
 		}
 		defer rows.Close()
 		for rows.Next() {
-			delivery, _, _, err := scanDelivery(rows)
+			delivery, _, _, err := scanSyncDelivery(rows)
 			if err != nil {
 				return err
 			}
@@ -1271,11 +1273,11 @@ type targetAggregate struct {
 }
 
 // Targets implements Store.
-func (p *Postgres) Targets(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]TargetHealth, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) Targets(ctx context.Context, tenant string, key boardsync.Key, limit int) ([]TargetHealth, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return nil, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -1372,7 +1374,7 @@ func (p *Postgres) Targets(ctx context.Context, tenant string, key boardsync.Key
 			Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
 			Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
 		}
-		if aggregate, found := aggregates[targetAggregateKey(thread.BoardThread, targetKeyOf(target))]; found {
+		if aggregate, found := aggregates[targetAggregateKey(thread.BoardThread, TargetKeyOf(target))]; found {
 			health.Pending = aggregate.pending
 			health.Leased = aggregate.leased
 			health.Dead = aggregate.dead
@@ -1400,11 +1402,11 @@ func targetAggregateKey(boardThread uint64, targetKey string) string {
 }
 
 // OldestPending implements Store.
-func (p *Postgres) OldestPending(ctx context.Context, tenant string, key boardsync.Key) (Lag, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) OldestPending(ctx context.Context, tenant string, key boardsync.Key) (Lag, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return Lag{}, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return Lag{}, err
 	}
 	var lag Lag
@@ -1440,11 +1442,11 @@ func (p *Postgres) OldestPending(ctx context.Context, tenant string, key boardsy
 }
 
 // Failures24h implements Store.
-func (p *Postgres) Failures24h(ctx context.Context, tenant string, key boardsync.Key, since time.Time) (int, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) Failures24h(ctx context.Context, tenant string, key boardsync.Key, since time.Time) (int, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return 0, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return 0, err
 	}
 	var failures int
@@ -1476,7 +1478,7 @@ func scanThread(row scanner) (Thread, error) {
 // UpsertThread implements Store. A thread target already attached to another
 // board thread is refused; the partial unique index decides a race, and the
 // pre-check only supplies a friendly error.
-func (p *Postgres) UpsertThread(ctx context.Context, thread Thread) (Thread, error) {
+func (p *SyncStore) UpsertThread(ctx context.Context, thread Thread) (Thread, error) {
 	if err := thread.Validate(); err != nil {
 		return Thread{}, err
 	}
@@ -1484,7 +1486,7 @@ func (p *Postgres) UpsertThread(ctx context.Context, thread Thread) (Thread, err
 		Key: thread.Key, Platform: thread.Platform, Channel: thread.Channel,
 		Thread: thread.Thread, Subthread: thread.Subthread, Kind: thread.Kind,
 	}
-	thread.ID = threadIDOf(thread.BoardThread, thread.Key, target)
+	thread.ID = ThreadIDOf(thread.BoardThread, thread.Key, target)
 	var stored Thread
 	err := p.withTenant(ctx, thread.Tenant, func(tx pgx.Tx) error {
 		// The partial unique index is the cross-process guarantee; the check
@@ -1541,11 +1543,11 @@ func uniqueThreadViolation(err error) bool {
 
 // LockTarget implements Store with a session advisory lock on a dedicated
 // connection. A process crash closes the session and releases the lock.
-func (p *Postgres) LockTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (func(), error) {
-	if err := validTenant(tenant); err != nil {
+func (p *SyncStore) LockTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (func(), error) {
+	if err := ValidTenant(tenant); err != nil {
 		return nil, err
 	}
-	if err := expectKey(key); err != nil {
+	if err := ExpectKey(key); err != nil {
 		return nil, err
 	}
 	if target.Key != key {
@@ -1558,7 +1560,7 @@ func (p *Postgres) LockTarget(ctx context.Context, tenant string, key boardsync.
 	if err != nil {
 		return nil, err
 	}
-	id := targetLockID(tenant, key, target)
+	id := TargetLockID(tenant, key, target)
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, id); err != nil {
 		_ = conn.Close(context.Background())
 		return nil, err
@@ -1576,7 +1578,7 @@ func (p *Postgres) LockTarget(ctx context.Context, tenant string, key boardsync.
 }
 
 // Threads implements Store.
-func (p *Postgres) Threads(ctx context.Context, tenant string, boardThread uint64) ([]Thread, error) {
+func (p *SyncStore) Threads(ctx context.Context, tenant string, boardThread uint64) ([]Thread, error) {
 	out := make([]Thread, 0)
 	err := p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `
@@ -1602,8 +1604,8 @@ func (p *Postgres) Threads(ctx context.Context, tenant string, boardThread uint6
 }
 
 // ThreadByTarget implements Store.
-func (p *Postgres) ThreadByTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (Thread, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) ThreadByTarget(ctx context.Context, tenant string, key boardsync.Key, target boardsync.ResolvedTarget) (Thread, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return Thread{}, false, err
 	}
 	if target.Key != key {
@@ -1633,11 +1635,11 @@ func (p *Postgres) ThreadByTarget(ctx context.Context, tenant string, key boards
 }
 
 // ThreadSynced implements Store.
-func (p *Postgres) ThreadSynced(ctx context.Context, tenant string, key boardsync.Key, external string) (bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) ThreadSynced(ctx context.Context, tenant string, key boardsync.Key, external string) (bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return false, err
 	}
-	if err := expectLabel(external, "external thread", 1200); err != nil {
+	if err := ExpectLabel(external, "external thread", 1200); err != nil {
 		return false, err
 	}
 	var synced bool
@@ -1656,7 +1658,7 @@ func (p *Postgres) ThreadSynced(ctx context.Context, tenant string, key boardsyn
 }
 
 // RemoveThread implements Store.
-func (p *Postgres) RemoveThread(ctx context.Context, tenant, id string) error {
+func (p *SyncStore) RemoveThread(ctx context.Context, tenant, id string) error {
 	if id == "" {
 		return fmt.Errorf("%w: a thread removal needs an ID", boardsync.ErrBadRequest)
 	}
@@ -1668,11 +1670,11 @@ func (p *Postgres) RemoveThread(ctx context.Context, tenant, id string) error {
 }
 
 // Cursor implements Store.
-func (p *Postgres) Cursor(ctx context.Context, tenant string, key boardsync.Key, source string) (string, bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) Cursor(ctx context.Context, tenant string, key boardsync.Key, source string) (string, bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return "", false, err
 	}
-	if err := expectLabel(source, "source", 200); err != nil {
+	if err := ExpectLabel(source, "source", 200); err != nil {
 		return "", false, err
 	}
 	var cursor string
@@ -1691,14 +1693,14 @@ func (p *Postgres) Cursor(ctx context.Context, tenant string, key boardsync.Key,
 }
 
 // SetCursor implements Store.
-func (p *Postgres) SetCursor(ctx context.Context, tenant string, key boardsync.Key, source, cursor string) error {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) SetCursor(ctx context.Context, tenant string, key boardsync.Key, source, cursor string) error {
+	if err := ExpectKey(key); err != nil {
 		return err
 	}
-	if err := expectLabel(source, "source", 200); err != nil {
+	if err := ExpectLabel(source, "source", 200); err != nil {
 		return err
 	}
-	if err := validCursor(cursor); err != nil {
+	if err := ValidCursor(cursor); err != nil {
 		return err
 	}
 	return p.withTenant(ctx, tenant, func(tx pgx.Tx) error {
@@ -1712,11 +1714,11 @@ func (p *Postgres) SetCursor(ctx context.Context, tenant string, key boardsync.K
 }
 
 // ClaimNonce implements Store.
-func (p *Postgres) ClaimNonce(ctx context.Context, tenant string, key boardsync.Key, nonce string, ttl time.Duration) (bool, error) {
-	if err := expectKey(key); err != nil {
+func (p *SyncStore) ClaimNonce(ctx context.Context, tenant string, key boardsync.Key, nonce string, ttl time.Duration) (bool, error) {
+	if err := ExpectKey(key); err != nil {
 		return false, err
 	}
-	if err := expectLabel(nonce, "nonce", 500); err != nil {
+	if err := ExpectLabel(nonce, "nonce", 500); err != nil {
 		return false, err
 	}
 	if ttl <= 0 {
@@ -1742,7 +1744,7 @@ func (p *Postgres) ClaimNonce(ctx context.Context, tenant string, key boardsync.
 }
 
 // PruneNonces implements Store.
-func (p *Postgres) PruneNonces(ctx context.Context, tenant string, before time.Time) (int64, error) {
+func (p *SyncStore) PruneNonces(ctx context.Context, tenant string, before time.Time) (int64, error) {
 	if before.IsZero() {
 		before = time.Now()
 	}
@@ -1764,5 +1766,5 @@ func (p *Postgres) PruneNonces(ctx context.Context, tenant string, before time.T
 }
 
 var (
-	_ Store = (*Postgres)(nil)
+	_ Store = (*SyncStore)(nil)
 )

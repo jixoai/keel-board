@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"io"
 	"log/slog"
 	"net/http"
@@ -19,7 +20,6 @@ import (
 	"github.com/jixoai/keel-board/log"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
-	"github.com/jixoai/keel-board/store"
 )
 
 // projectionTestDSN returns the PostgreSQL DSN, or skips. CI must set one.
@@ -71,7 +71,7 @@ func newProjectionSchema(t *testing.T, dsn string) string {
 func TestPostgresProjectionAdmin(t *testing.T) {
 	dsn := projectionTestDSN(t)
 	schema := newProjectionSchema(t, dsn)
-	postgres, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: schema})
+	postgres, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}

@@ -202,7 +202,7 @@ func TestMigration0005DeduplicatesAsRestrictedOwner(t *testing.T) {
 		t.Fatalf("set role: %v", err)
 	}
 	for _, name := range []string{"0001_board_log.sql", "0002_sync.sql", "0003_sync_rls.sql", "0004_sync_copy_files.sql"} {
-		statement, err := os.ReadFile("migrations/" + name)
+		statement, err := os.ReadFile("../pgadapter/schema/migrations/" + name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
 		}
@@ -221,7 +221,7 @@ func TestMigration0005DeduplicatesAsRestrictedOwner(t *testing.T) {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 	}
-	statement, err := os.ReadFile("migrations/0005_sync_thread_identity.sql")
+	statement, err := os.ReadFile("../pgadapter/schema/migrations/0005_sync_thread_identity.sql")
 	if err != nil {
 		t.Fatalf("read 0005: %v", err)
 	}

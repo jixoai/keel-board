@@ -1,21 +1,22 @@
-package audit
+package pgadapter
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/schema"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/jixoai/keel-board/store"
+	. "github.com/jixoai/keel-board/audit"
 )
 
-// PostgresOptions configure a PostgreSQL-backed audit store.
-type PostgresOptions struct {
+// AuditOptions configure a PostgreSQL-backed audit store.
+type AuditOptions struct {
 	// DSN is the database. Required.
 	DSN string
 	// SearchPath confines the table to one schema, which is how tests isolate
@@ -23,17 +24,17 @@ type PostgresOptions struct {
 	SearchPath string
 }
 
-// Postgres is a PostgreSQL-backed Store. Every statement is tenant-scoped in
+// AuditStore is a PostgreSQL-backed Store. Every statement is tenant-scoped in
 // the predicate and in the transaction's keel.tenant_id, which the table's
 // FORCE RLS policy checks.
-type Postgres struct {
+type AuditStore struct {
 	pool *pgxpool.Pool
 }
 
-// OpenPostgres connects and applies only the audit table's migration
+// OpenAudit connects and applies only the audit table's migration
 // (0009_audit.sql). An audit-only database therefore needs privileges for
 // board_audit and its sequence, not for the board's or sync's tables.
-func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) {
+func OpenAudit(ctx context.Context, opts AuditOptions) (*AuditStore, error) {
 	if strings.TrimSpace(opts.DSN) == "" {
 		return nil, errors.New("audit: a PostgreSQL DSN is required")
 	}
@@ -52,19 +53,19 @@ func OpenPostgres(ctx context.Context, opts PostgresOptions) (*Postgres, error) 
 		pool.Close()
 		return nil, fmt.Errorf("audit: connecting to PostgreSQL: %w", err)
 	}
-	if err := store.ApplyAuditMigration(ctx, pool); err != nil {
+	if err := pgschema.ApplyAudit(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("audit: applying migrations: %w", err)
 	}
-	return &Postgres{pool: pool}, nil
+	return &AuditStore{pool: pool}, nil
 }
 
 // Close closes the connection pool.
-func (p *Postgres) Close() { p.pool.Close() }
+func (p *AuditStore) Close() { p.pool.Close() }
 
 // setTenant scopes the current transaction. SET LOCAL keeps the setting from
 // following the connection back into the pool.
-func setTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
+func setAuditTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 	if _, err := tx.Exec(ctx, `SELECT set_config('keel.tenant_id', $1, true)`, tenant); err != nil {
 		return fmt.Errorf("audit: setting tenant scope: %w", err)
 	}
@@ -72,8 +73,8 @@ func setTenant(ctx context.Context, tx pgx.Tx, tenant string) error {
 }
 
 // Append implements Store.
-func (p *Postgres) Append(ctx context.Context, event Event) (Event, error) {
-	prepared, err := prepare(event)
+func (p *AuditStore) Append(ctx context.Context, event Event) (Event, error) {
+	prepared, err := Prepare(event)
 	if err != nil {
 		return Event{}, err
 	}
@@ -89,7 +90,7 @@ func (p *Postgres) Append(ctx context.Context, event Event) (Event, error) {
 		return Event{}, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, prepared.Tenant); err != nil {
+	if err := setAuditTenant(ctx, tx, prepared.Tenant); err != nil {
 		return Event{}, err
 	}
 	err = tx.QueryRow(ctx, `
@@ -110,8 +111,8 @@ func (p *Postgres) Append(ctx context.Context, event Event) (Event, error) {
 }
 
 // Recent implements Store: the tenant's newest rows, newest first.
-func (p *Postgres) Recent(ctx context.Context, tenant string, limit int) ([]Event, error) {
-	if err := validTenant(tenant); err != nil {
+func (p *AuditStore) Recent(ctx context.Context, tenant string, limit int) ([]Event, error) {
+	if err := ValidTenant(tenant); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -125,7 +126,7 @@ func (p *Postgres) Recent(ctx context.Context, tenant string, limit int) ([]Even
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	if err := setTenant(ctx, tx, tenant); err != nil {
+	if err := setAuditTenant(ctx, tx, tenant); err != nil {
 		return nil, err
 	}
 	rows, err := tx.Query(ctx, `
@@ -163,4 +164,4 @@ func (p *Postgres) Recent(ctx context.Context, tenant string, limit int) ([]Even
 	return events, nil
 }
 
-var _ Store = (*Postgres)(nil)
+var _ Store = (*AuditStore)(nil)

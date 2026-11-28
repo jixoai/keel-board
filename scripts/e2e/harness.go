@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"io"
 	"log/slog"
 	"net"
@@ -19,9 +20,9 @@ import (
 	"github.com/jixoai/keel-board/automation"
 	"github.com/jixoai/keel-board/blob"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/pgadapter"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
-	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
 	"github.com/jixoai/keel-board/sync/chatsdk/sidecartest"
 	"github.com/jixoai/keel-board/sync/github"
@@ -43,9 +44,9 @@ type harness struct {
 
 	fake               *fakePlatform
 	board              *log.Board
-	boardStore         *store.Postgres
-	syncStore          *syncstore.Postgres
-	automationStore    *automation.Postgres
+	boardStore         *pglogstore.LogStore
+	syncStore          *pgadapter.SyncStore
+	automationStore    *pgadapter.Automation
 	automationRegistry *automation.Registry
 	server             *server.Server
 	http               *http.Server
@@ -75,14 +76,14 @@ func newHarness(fake *fakePlatform, dsn, schema string) *harness {
 
 // Start opens PostgreSQL, builds the server, and starts its workers.
 func (h *harness) Start(ctx context.Context) error {
-	boardStore, err := store.OpenPostgres(ctx, store.PostgresOptions{DSN: h.dsn, SearchPath: h.schema})
+	boardStore, err := pglogstore.OpenLog(ctx, pglogstore.LogOptions{DSN: h.dsn, SearchPath: h.schema})
 	if err != nil {
 		return fmt.Errorf("open board store: %w", err)
 	}
 	h.boardStore = boardStore
 	h.board = log.New(log.Options{Store: boardStore, Freshness: -1})
 
-	syncStore, err := syncstore.OpenPostgres(ctx, syncstore.PostgresOptions{
+	syncStore, err := pgadapter.OpenSync(ctx, pgadapter.SyncOptions{
 		DSN: h.dsn, SearchPath: h.schema,
 		Config: syncstore.Config{
 			InboundRetry:  boardsync.RetryPolicy{MaxAttempts: 5, BaseDelay: 30 * time.Millisecond, MaxDelay: 120 * time.Millisecond},
@@ -96,7 +97,7 @@ func (h *harness) Start(ctx context.Context) error {
 	}
 	h.syncStore = syncStore
 
-	automationStore, err := automation.OpenPostgres(ctx, automation.PostgresOptions{
+	automationStore, err := pgadapter.OpenAutomation(ctx, pgadapter.AutomationOptions{
 		DSN: h.dsn, SearchPath: h.schema,
 		Config: automation.Config{
 			Retry:    automation.RetryPolicy{MaxAttempts: 3, BaseDelay: 20 * time.Millisecond, MaxDelay: 120 * time.Millisecond},
@@ -613,7 +614,7 @@ func decodeJSON[T any](data []byte) (T, error) {
 // appendBoardReply writes a reply directly through the log, simulating another
 // process writing while the harness server is stopped.
 func appendBoardReply(ctx context.Context, dsn, schema string, rootID uint64, text string) (uint64, error) {
-	events, err := store.OpenPostgres(ctx, store.PostgresOptions{DSN: dsn, SearchPath: schema})
+	events, err := pglogstore.OpenLog(ctx, pglogstore.LogOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		return 0, err
 	}

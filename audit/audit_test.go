@@ -3,6 +3,7 @@ package audit_test
 import (
 	"context"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter"
 	"os"
 	"strings"
 	"testing"
@@ -129,7 +130,7 @@ func TestEventValidationRefusesUnboundedFields(t *testing.T) {
 func TestPostgresAppendAndRecent(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	store, err := audit.OpenPostgres(t.Context(), audit.PostgresOptions{DSN: dsn, SearchPath: schema})
+	store, err := pgadapter.OpenAudit(t.Context(), pgadapter.AuditOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -174,7 +175,7 @@ func TestPostgresAuditRLSTenantIsolation(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
 	ctx := t.Context()
-	store, err := audit.OpenPostgres(ctx, audit.PostgresOptions{DSN: dsn, SearchPath: schema})
+	store, err := pgadapter.OpenAudit(ctx, pgadapter.AuditOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -344,7 +345,7 @@ func TestPostgresAuditRLSTenantIsolation(t *testing.T) {
 func TestOpenPostgresCreatesOnlyTheAuditTable(t *testing.T) {
 	dsn := testDSN(t)
 	schema := newTestSchema(t, dsn)
-	store, err := audit.OpenPostgres(t.Context(), audit.PostgresOptions{DSN: dsn, SearchPath: schema})
+	store, err := pgadapter.OpenAudit(t.Context(), pgadapter.AuditOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/jixoai/keel-board/automation"
 	"github.com/jixoai/keel-board/log"
+	"github.com/jixoai/keel-board/pgadapter"
 	"github.com/jixoai/keel-board/protocol"
 	"github.com/jixoai/keel-board/server"
 )
@@ -104,7 +105,7 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 		}
 		store, closeStore = memory, func() {}
 	} else {
-		postgres, err := automation.OpenPostgres(ctx, automation.PostgresOptions{
+		postgres, err := pgadapter.OpenAutomation(ctx, pgadapter.AutomationOptions{
 			DSN: dsn, SearchPath: strings.TrimSpace(flags.schema),
 			Config: automation.Config{LeaseTTL: lease},
 		})

@@ -105,8 +105,8 @@ func (p RetryPolicy) Delay(attempt int) time.Duration {
 	return delay
 }
 
-// withDefaults validates a configuration and fills zero values.
-func (c Config) withDefaults() (Config, error) {
+// WithDefaults validates the configuration and fills zero values.
+func (c Config) WithDefaults() (Config, error) {
 	var err error
 	if c.Retry, err = c.Retry.Validate(); err != nil {
 		return Config{}, err
@@ -206,6 +206,10 @@ func leaseOwner(owner string) string {
 	}
 	return owner
 }
+
+// LeaseOwner is leaseOwner for storage adapters: every dialect records the
+// same owner for an unnamed worker.
+func LeaseOwner(owner string) string { return leaseOwner(owner) }
 
 // expectTenant validates a tenant on a read or write.
 func expectTenant(tenant string) error {

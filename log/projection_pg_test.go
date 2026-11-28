@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jixoai/keel-board/pgadapter/logstore"
 	"os"
 	"strings"
 	"sync"
@@ -60,9 +61,9 @@ func newPGTestSchema(t *testing.T, dsn string) string {
 }
 
 // openPGTestStore opens a pool on the test schema and closes it after.
-func openPGTestStore(t *testing.T, dsn, schema string) *store.Postgres {
+func openPGTestStore(t *testing.T, dsn, schema string) *pglogstore.LogStore {
 	t.Helper()
-	postgres, err := store.OpenPostgres(t.Context(), store.PostgresOptions{DSN: dsn, SearchPath: schema})
+	postgres, err := pglogstore.OpenLog(t.Context(), pglogstore.LogOptions{DSN: dsn, SearchPath: schema})
 	if err != nil {
 		t.Fatalf("opening PostgreSQL store: %v", err)
 	}

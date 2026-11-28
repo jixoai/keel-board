@@ -65,8 +65,8 @@ type Config struct {
 	LeaseTTL      time.Duration
 }
 
-// withDefaults validates the configuration and fills zero values.
-func (c Config) withDefaults() (Config, error) {
+// WithDefaults validates the configuration and fills zero values.
+func (c Config) WithDefaults() (Config, error) {
 	if c.InboundRetry == (boardsync.RetryPolicy{}) {
 		c.InboundRetry = boardsync.InboundRetry
 	}
@@ -406,6 +406,15 @@ func validTenant(tenant string) error {
 	return nil
 }
 
+// ValidTenant reports whether tenant is usable as a tenant namespace. Storage
+// adapters call it before scoping a transaction, so validation stays in the
+// domain instead of being reimplemented per dialect.
+func ValidTenant(tenant string) error { return validTenant(tenant) }
+
+// OwnedKeys validates a worker's key set for a storage adapter and returns it
+// as a set. An empty set means the worker owns nothing, never "all keys".
+func OwnedKeys(keys []boardsync.Key) (map[boardsync.Key]struct{}, error) { return ownedKeys(keys) }
+
 // ownedKeys validates a worker's key set and returns it as a set. An empty set
 // means the worker owns nothing, never "all keys": a missing configuration must
 // not let one key's worker burn another key's deliveries.
@@ -418,6 +427,13 @@ func ownedKeys(keys []boardsync.Key) (map[boardsync.Key]struct{}, error) {
 		owned[key] = struct{}{}
 	}
 	return owned, nil
+}
+
+// PrepareRecords validates a webhook's records and fills their event identity.
+// Nothing is stored unless every record is valid. Storage adapters share it so
+// every dialect imports the same set.
+func PrepareRecords(key boardsync.Key, records []boardsync.Record) ([]boardsync.Record, error) {
+	return prepareRecords(key, records)
 }
 
 // prepareRecords validates a webhook's records and fills their event identity.
@@ -464,21 +480,28 @@ func deliverable(eventType boardsync.BoardEventType) bool {
 	}
 }
 
-// preparedDelivery is one enqueue's validated job.
-type preparedDelivery struct {
-	id        string
-	lane      string
-	key       boardsync.Key
-	event     boardsync.BoardEvent
-	message   boardsync.Message
-	target    boardsync.ResolvedTarget
-	targetKey string
+// PreparedDelivery is one enqueue's validated job.
+type PreparedDelivery struct {
+	ID        string
+	Lane      string
+	Key       boardsync.Key
+	Event     boardsync.BoardEvent
+	Message   boardsync.Message
+	Target    boardsync.ResolvedTarget
+	TargetKey string
+}
+
+// PrepareOutbox validates a board fact and its targets for a storage adapter.
+// It applies echo suppression and NoSync before returning jobs, so an outbox
+// row is never queued for the platform a message came from.
+func PrepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) ([]PreparedDelivery, error) {
+	return prepareOutbox(tenant, key, event, message, targets)
 }
 
 // prepareOutbox validates a board fact and its targets. It applies echo
 // suppression and NoSync before returning jobs, so an outbox row is never
 // queued for the platform a message came from.
-func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) ([]preparedDelivery, error) {
+func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent, message boardsync.Message, targets []boardsync.ResolvedTarget) ([]PreparedDelivery, error) {
 	if err := validTenant(tenant); err != nil {
 		return nil, err
 	}
@@ -526,7 +549,7 @@ func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent,
 		}
 		kept = append(kept, target)
 	}
-	jobs := make([]preparedDelivery, 0, len(kept))
+	jobs := make([]PreparedDelivery, 0, len(kept))
 	seen := make(map[string]struct{}, len(kept))
 	for _, target := range kept {
 		if target.Key != key {
@@ -540,14 +563,14 @@ func prepareOutbox(tenant string, key boardsync.Key, event boardsync.BoardEvent,
 			continue
 		}
 		seen[targetKey] = struct{}{}
-		jobs = append(jobs, preparedDelivery{
-			id:        DeliveryID(tenant, key, event, target),
-			lane:      strconv.FormatUint(event.Thread, 10),
-			key:       key,
-			event:     event,
-			message:   message,
-			target:    target,
-			targetKey: targetKey,
+		jobs = append(jobs, PreparedDelivery{
+			ID:        DeliveryID(tenant, key, event, target),
+			Lane:      strconv.FormatUint(event.Thread, 10),
+			Key:       key,
+			Event:     event,
+			Message:   message,
+			Target:    target,
+			TargetKey: targetKey,
 		})
 	}
 	return jobs, nil
@@ -563,6 +586,10 @@ func DeliveryID(tenant string, key boardsync.Key, event boardsync.BoardEvent, ta
 		targetKeyOf(target), event.Emoji, event.Cause,
 	))
 }
+
+// TargetKeyOf is the normalized identity of one resolved target, for storage
+// adapters that need the same target key the domain computes.
+func TargetKeyOf(target boardsync.ResolvedTarget) string { return targetKeyOf(target) }
 
 func targetKeyOf(target boardsync.ResolvedTarget) string {
 	return keyParts(
@@ -584,16 +611,34 @@ func keyParts(parts ...string) string {
 	return b.String()
 }
 
+// CopyIDOf is the deterministic identity of one board message on one target.
+// Storage adapters use it so every dialect names a copy the same way.
+func CopyIDOf(key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) string {
+	return copyIDOf(key, target, boardMessage)
+}
+
 func copyIDOf(key boardsync.Key, target boardsync.ResolvedTarget, boardMessage uint64) string {
 	return "copy_" + boardsync.Hash(keyParts(
 		string(key), targetKeyOf(target), strconv.FormatUint(boardMessage, 10),
 	))
 }
 
+// TargetLockID names one external target's cross-process lock, for storage
+// adapters that serialize root creation and attachment across processes.
+func TargetLockID(tenant string, key boardsync.Key, target boardsync.ResolvedTarget) string {
+	return targetLockID(tenant, key, target)
+}
+
 // targetLockID names one external target's cross-process lock.
 func targetLockID(tenant string, key boardsync.Key, target boardsync.ResolvedTarget) string {
 	return keyParts(tenant, string(key), string(target.Platform), target.Channel,
 		target.Thread, target.Subthread, string(target.Kind))
+}
+
+// ThreadIDOf is the deterministic identity of one board thread mapping on one
+// target. Storage adapters use it so every dialect names a thread the same way.
+func ThreadIDOf(boardThread uint64, key boardsync.Key, target boardsync.ResolvedTarget) string {
+	return threadIDOf(boardThread, key, target)
 }
 
 func threadIDOf(boardThread uint64, key boardsync.Key, target boardsync.ResolvedTarget) string {
@@ -676,6 +721,10 @@ func cloneJSON[T any](value T) (T, error) {
 	return out, nil
 }
 
+// ExpectKey reports whether key is usable as a sync key. Storage adapters call
+// it before scoping a row, so validation stays in the domain.
+func ExpectKey(key boardsync.Key) error { return expectKey(key) }
+
 func expectKey(key boardsync.Key) error {
 	if !key.Valid() {
 		return fmt.Errorf("%w: %q isn't a sync key", boardsync.ErrBadRequest, key)
@@ -685,12 +734,19 @@ func expectKey(key boardsync.Key) error {
 
 // nonNilFiles writes an empty array rather than NULL, so a copy's file list is
 // always a list.
+// NonNilFiles returns a copy's file list as a list, never nil, for storage
+// adapters. An empty list is stored as [] instead of NULL.
+func NonNilFiles(files []string) []string { return nonNilFiles(files) }
+
 func nonNilFiles(files []string) []string {
 	if files == nil {
 		return []string{}
 	}
 	return files
 }
+
+// ExpectLabel validates a bounded label for a storage adapter.
+func ExpectLabel(value, name string, max int) error { return expectLabel(value, name, max) }
 
 func expectLabel(value, name string, max int) error {
 	if value == "" || len(value) > max || !utf8.ValidString(value) {
@@ -703,6 +759,10 @@ func expectLabel(value, name string, max int) error {
 	}
 	return nil
 }
+
+// ValidCursor checks an opaque source cursor for a storage adapter. Newlines
+// are allowed (a cursor may be a JSON blob), a NUL and invalid UTF-8 are not.
+func ValidCursor(cursor string) error { return validCursor(cursor) }
 
 // validCursor checks an opaque source cursor. Newlines are allowed (a cursor
 // may be a JSON blob), a NUL and invalid UTF-8 are not.
