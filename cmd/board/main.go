@@ -36,6 +36,7 @@ import (
 	"github.com/jixoai/keel-board/metrics"
 	"github.com/jixoai/keel-board/pgadapter"
 	"github.com/jixoai/keel-board/server"
+	"github.com/jixoai/keel-board/storage"
 	"github.com/jixoai/keel-board/store"
 	boardsync "github.com/jixoai/keel-board/sync"
 )
@@ -119,7 +120,24 @@ func openStore(ctx context.Context, dsn string) (events store.EventStore, closeS
 	if err != nil {
 		return nil, nil, "", err
 	}
+	if err := requireAdapterCapabilities(postgres); err != nil {
+		postgres.Close()
+		return nil, nil, "", err
+	}
 	return postgres, postgres.Close, "postgres", nil
+}
+
+// requireAdapterCapabilities refuses a storage adapter that does not declare
+// the guarantees the PostgreSQL-backed serve path is assembled for. Memory is
+// selected explicitly and does not pass through here.
+func requireAdapterCapabilities(adapter storage.Reporter) error {
+	capabilities := adapter.Capabilities()
+	for _, capability := range []storage.Capability{storage.Durable, storage.CrossProcessLeases, storage.Migrations} {
+		if err := capabilities.Require(capability); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // openBlobs returns the attachment store a serve process uses: memory by
@@ -172,6 +190,10 @@ func openAudit(ctx context.Context, dsn string) (audit.Store, func(), string, er
 	}
 	postgres, err := pgadapter.OpenAudit(ctx, pgadapter.AuditOptions{DSN: dsn})
 	if err != nil {
+		return nil, nil, "", err
+	}
+	if err := requireAdapterCapabilities(postgres); err != nil {
+		postgres.Close()
 		return nil, nil, "", err
 	}
 	return postgres, postgres.Close, "postgres", nil

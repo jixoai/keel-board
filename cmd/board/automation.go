@@ -112,6 +112,10 @@ func buildAutomation(ctx context.Context, flags *automationFlags, boardDSN strin
 		if err != nil {
 			return nil, err
 		}
+		if err := requireAdapterCapabilities(postgres); err != nil {
+			postgres.Close()
+			return nil, err
+		}
 		store, closeStore = postgres, postgres.Close
 	}
 	registry, err := automation.NewRegistryWith(automation.PostAction{})

@@ -361,6 +361,10 @@ func buildSyncOptions(ctx context.Context, flags *syncFlags, boardTenant string)
 		if err != nil {
 			return nil, err
 		}
+		if err := requireAdapterCapabilities(postgres); err != nil {
+			postgres.Close()
+			return nil, err
+		}
 		store, closeStore = postgres, postgres.Close
 	}
 	tenant := strings.TrimSpace(flags.tenant)

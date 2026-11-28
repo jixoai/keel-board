@@ -62,5 +62,14 @@ go list -deps ./store ./syncstore ./audit ./automation ./server ./sync/... ./log
 ```
 
 The command prints nothing. The same check is enforced by
-`TestStorageBoundary` in `pgadapter/boundary_test.go`, which also asserts that
-`pgadapter` still owns the driver.
+`TestStorageBoundary` in `pgadapter/boundary_test.go`: it discovers every module
+package (so new subpackages cannot be missed), skips only `pgadapter`, `cmd` and
+`scripts`, and asserts `pgadapter` still owns the driver.
+
+## Assembly gate
+
+`cmd/board` and keel's `internal/boardintegration` call
+`Capabilities.Require(Durable, CrossProcessLeases, Migrations)` after opening a
+PostgreSQL adapter. A deployment that selects a weaker adapter fails at startup
+with a typed `storage.ErrUnsupported` instead of serving with less durability
+than the PostgreSQL path expects.

@@ -168,6 +168,19 @@ func testStorageSync(t *testing.T, opts StorageOptions) {
 	if err != nil || len(jobs) != 1 || jobs[0].Lease == "" {
 		t.Fatalf("lease outbox = %+v, %v", jobs, err)
 	}
+	// Cross-process leases are an operation, not a label: a second handle must
+	// not hand out the job the first one holds when the adapter declares the
+	// capability. A bundle that does not declare it is refused by Require.
+	if opts.Capabilities != nil {
+		if opts.Capabilities.CrossProcessLeases {
+			second := opts.SyncStore(t)
+			if again, err := second.LeaseOutbox(ctx, tenant, []boardsync.Key{key}, 1, "worker-b"); err != nil || len(again) != 0 {
+				t.Fatalf("second handle leased a live job = %+v, %v", again, err)
+			}
+		} else if err := opts.Capabilities.Require(storage.CrossProcessLeases); !errors.Is(err, storage.ErrUnsupported) {
+			t.Fatalf("undeclared cross-process lease = %v, want ErrUnsupported", err)
+		}
+	}
 	if acked, err := ss.AckOutbox(ctx, tenant, jobs[0].ID, jobs[0].Lease, nil, nil); err != nil || !acked.Acked {
 		t.Fatalf("ack outbox = %+v, %v", acked, err)
 	}

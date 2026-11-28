@@ -6,36 +6,32 @@ import (
 	"testing"
 )
 
-// TestStorageBoundary proves the domain, server and sync packages depend on the
-// storage interfaces, not on the PostgreSQL driver. The PostgreSQL adapter is
-// the only production dependency on pgx; this test fails if a domain import
-// starts pulling it in again.
+// TestStorageBoundary proves every non-adapter package in the module depends on
+// the storage interfaces, not on the PostgreSQL driver. The package list is
+// discovered, not hand-maintained, so a new subpackage cannot slip past it.
+// `cmd` and `scripts` are deployment/test harnesses, not the domain; they may
+// assemble the adapter directly and are excluded with the adapter itself.
 func TestStorageBoundary(t *testing.T) {
-	domain := []string{
-		"github.com/jixoai/keel-board/store",
-		"github.com/jixoai/keel-board/syncstore",
-		"github.com/jixoai/keel-board/audit",
-		"github.com/jixoai/keel-board/automation",
-		"github.com/jixoai/keel-board/server",
-		"github.com/jixoai/keel-board/sync",
-		"github.com/jixoai/keel-board/sync/github",
-		"github.com/jixoai/keel-board/sync/linear",
-		"github.com/jixoai/keel-board/sync/slack",
-		"github.com/jixoai/keel-board/sync/chatsdk",
-		"github.com/jixoai/keel-board/log",
-		"github.com/jixoai/keel-board/board",
-		"github.com/jixoai/keel-board/protocol",
-		"github.com/jixoai/keel-board/access",
-		"github.com/jixoai/keel-board/blob",
-		"github.com/jixoai/keel-board/metrics",
-		"github.com/jixoai/keel-board/conformance",
+	out, err := exec.Command("go", "list", "github.com/jixoai/keel-board/...").Output()
+	if err != nil {
+		t.Fatalf("go list module packages: %v", err)
 	}
-	for _, pkg := range domain {
-		out, err := exec.Command("go", "list", "-deps", pkg).Output()
+	packages := strings.Fields(string(out))
+	if len(packages) < 10 {
+		t.Fatalf("discovered only %d packages; the module list looks wrong", len(packages))
+	}
+	for _, pkg := range packages {
+		if pkg == "github.com/jixoai/keel-board/pgadapter" ||
+			strings.HasPrefix(pkg, "github.com/jixoai/keel-board/pgadapter/") ||
+			strings.Contains(pkg, "/cmd/") ||
+			strings.Contains(pkg, "/scripts/") {
+			continue
+		}
+		deps, err := exec.Command("go", "list", "-deps", pkg).Output()
 		if err != nil {
 			t.Fatalf("go list -deps %s: %v", pkg, err)
 		}
-		for _, line := range strings.Split(string(out), "\n") {
+		for _, line := range strings.Split(string(deps), "\n") {
 			if strings.Contains(line, "github.com/jackc/pgx") {
 				t.Errorf("%s depends on %s; the PostgreSQL driver belongs only in pgadapter", pkg, line)
 			}
@@ -43,7 +39,7 @@ func TestStorageBoundary(t *testing.T) {
 	}
 
 	// The adapter itself must still be the package that owns pgx.
-	out, err := exec.Command("go", "list", "-deps", "github.com/jixoai/keel-board/pgadapter").Output()
+	out, err = exec.Command("go", "list", "-deps", "github.com/jixoai/keel-board/pgadapter").Output()
 	if err != nil {
 		t.Fatalf("go list -deps pgadapter: %v", err)
 	}
